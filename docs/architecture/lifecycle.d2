@@ -1,0 +1,14 @@
+direction: right
+
+queued: "queued" { shape: rectangle }
+claimed: "claimed" { shape: rectangle }
+building: "building" { shape: rectangle }
+done: "done" { shape: rectangle }
+blocked: "blocked" { shape: rectangle }
+parked: "parked" { shape: rectangle }
+
+queued -> claimed: "claim"
+claimed -> building: "status change"
+building -> done: "complete"
+building -> blocked: "block"
+building -> parked: "park"

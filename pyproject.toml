@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pinax"
+version = "0.1.1"
+description = "Git-native, deterministic build tracker"
+requires-python = ">=3.10"
+# Runtime has no third-party dependencies.
+
+[project.scripts]
+pinax = "pinax.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pinax*"]
+
+[project.optional-dependencies]
+# Test-only tooling.
+test = ["pytest", "pytest-timeout"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+# The default lane excludes Git-heavy tests; run them with `pytest -m deep`.
+addopts = "--timeout=120 --timeout-method=thread -m \"not deep\""
+markers = [
+    "deep: slow production-construct tests that shell out to git/subprocesses or use heavy temp-repo filesystem fixtures",
+]

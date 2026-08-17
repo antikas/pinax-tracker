@@ -1,0 +1,13 @@
+direction: down
+
+cli: "Pinax CLI" { shape: rectangle }
+log: "append-only event log" { shape: rectangle }
+fold: "deterministic fold" { shape: rectangle }
+projection: "Markdown projection" { shape: rectangle }
+graph: "dependency graph" { shape: rectangle }
+
+cli -> log: "append"
+log -> fold: "read"
+fold -> projection: "render"
+fold -> graph: "derive ready work"
+graph -> cli: "ready and next"

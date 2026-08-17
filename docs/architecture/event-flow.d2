@@ -1,0 +1,10 @@
+direction: right
+
+events: "JSONL event shards" { shape: rectangle }
+fold: "deterministic fold" { shape: rectangle }
+projection: "generated board and item pages" { shape: rectangle }
+verify: "pinax verify" { shape: rectangle }
+
+events -> fold: "parse, validate, sort, deduplicate"
+fold -> projection: "render"
+projection -> verify: "compare"

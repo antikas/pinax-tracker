@@ -1,0 +1,26 @@
+{
+  "ergon": {
+    "actor": "operator@example.test",
+    "created_at": "2026-06-29T10:00:00Z"
+  },
+  "items": {
+    "pnx-aaa1": {
+      "created_at": "2026-06-29T10:00:01Z",
+      "created_by": "operator@example.test",
+      "event_id": "vaizewobjch523nnimzrqzrcofzr67hpftejx5tggchgyb7l2fna",
+      "id": "pnx-aaa1",
+      "prefix": "pnx",
+      "status": "queued",
+      "title": "First item"
+    },
+    "pnx-bbb2": {
+      "created_at": "2026-06-29T10:00:02Z",
+      "created_by": "reviewer@example.test",
+      "event_id": "vkn2bbh64d3n2c6owad3yjhxeyhjd2snrv2ismir4siuhap5vp5a",
+      "id": "pnx-bbb2",
+      "prefix": "pnx",
+      "status": "queued",
+      "title": "Second item"
+    }
+  }
+}

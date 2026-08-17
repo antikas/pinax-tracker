@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="180" viewBox="0 0 900 180" role="img" aria-label="Pinax item lifecycle">
+  <style>text{font-family:Arial,sans-serif;font-size:18px;fill:#172033}.box{fill:#edf4ff;stroke:#3567a8;stroke-width:2}.line{stroke:#3567a8;stroke-width:2}</style>
+  <rect class="box" x="20" y="55" width="120" height="70" rx="8"/><text x="43" y="95">Queued</text>
+  <line class="line" x1="140" y1="90" x2="205" y2="90"/><polygon points="205,90 193,84 193,96" fill="#3567a8"/>
+  <rect class="box" x="215" y="55" width="120" height="70" rx="8"/><text x="234" y="95">Claimed</text>
+  <line class="line" x1="335" y1="90" x2="400" y2="90"/><polygon points="400,90 388,84 388,96" fill="#3567a8"/>
+  <rect class="box" x="410" y="55" width="120" height="70" rx="8"/><text x="424" y="95">Building</text>
+  <line class="line" x1="530" y1="90" x2="595" y2="90"/><polygon points="595,90 583,84 583,96" fill="#3567a8"/>
+  <rect class="box" x="605" y="55" width="120" height="70" rx="8"/><text x="645" y="95">Done</text>
+</svg>

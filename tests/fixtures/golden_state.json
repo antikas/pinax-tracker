@@ -1,0 +1,68 @@
+{
+  "deps": [
+    [
+      "pnx-aaa1",
+      "pnx-bbb2"
+    ]
+  ],
+  "edges": {
+    "blocks": [
+      [
+        "pnx-aaa1",
+        "pnx-bbb2"
+      ]
+    ]
+  },
+  "ergon": {
+    "actor": "operator@example.test",
+    "created_at": "2026-06-29T10:00:00Z"
+  },
+  "items": {
+    "pnx-aaa1": {
+      "created_at": "2026-06-29T10:00:01Z",
+      "created_by": "operator@example.test",
+      "event_id": "vaizewobjch523nnimzrqzrcofzr67hpftejx5tggchgyb7l2fna",
+      "id": "pnx-aaa1",
+      "prefix": "pnx",
+      "status": "queued",
+      "status_changed_at": "2026-06-29T10:00:04Z",
+      "status_changed_by": "operator@example.test",
+      "title": "First item"
+    },
+    "pnx-bbb2": {
+      "created_at": "2026-06-29T10:00:02Z",
+      "created_by": "reviewer@example.test",
+      "event_id": "vkn2bbh64d3n2c6owad3yjhxeyhjd2snrv2ismir4siuhap5vp5a",
+      "id": "pnx-bbb2",
+      "prefix": "pnx",
+      "status": "queued",
+      "title": "Second item"
+    },
+    "pnx-tie1": {
+      "created_at": "2026-06-29T10:00:05Z",
+      "created_by": "aaaa@host",
+      "event_id": "tx2yubpnrjzonfs5zlgx33kfryfygp3rmwf6jma2k7dg55m5rmra",
+      "id": "pnx-tie1",
+      "prefix": "pnx",
+      "status": "queued",
+      "title": "Tie-break actor1"
+    },
+    "pnx-tie2": {
+      "created_at": "2026-06-29T10:00:05Z",
+      "created_by": "zzzz@host",
+      "event_id": "wz7eebbc2jjfh53uex3d55in34y3llh7qcyatvzovmofzy3r5yka",
+      "id": "pnx-tie2",
+      "prefix": "pnx",
+      "status": "queued",
+      "title": "Tie-break actor2"
+    }
+  },
+  "phases": {
+    "phase-1": {
+      "opened_at": "2026-06-29T10:00:06Z",
+      "opened_by": "operator@example.test",
+      "opened_seq": 6,
+      "status": "open"
+    }
+  }
+}

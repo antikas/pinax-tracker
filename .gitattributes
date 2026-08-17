@@ -1,0 +1,7 @@
+# Pinax uses LF-normalised text and Git's union merge driver for JSONL logs.
+
+* text=auto eol=lf
+*.jsonl text eol=lf merge=union
+.ergon/** text eol=lf
+*.py text eol=lf
+*.md text eol=lf

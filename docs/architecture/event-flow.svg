@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="180" viewBox="0 0 900 180" role="img" aria-label="Pinax event flow">
+  <style>text{font-family:Arial,sans-serif;font-size:18px;fill:#172033}.box{fill:#edf4ff;stroke:#3567a8;stroke-width:2}.line{stroke:#3567a8;stroke-width:2}</style>
+  <rect class="box" x="20" y="55" width="180" height="70" rx="8"/><text x="45" y="95">JSONL event shards</text>
+  <line class="line" x1="200" y1="90" x2="330" y2="90"/><polygon points="330,90 318,84 318,96" fill="#3567a8"/>
+  <rect class="box" x="340" y="55" width="180" height="70" rx="8"/><text x="370" y="95">Deterministic fold</text>
+  <line class="line" x1="520" y1="90" x2="650" y2="90"/><polygon points="650,90 638,84 638,96" fill="#3567a8"/>
+  <rect class="box" x="660" y="55" width="220" height="70" rx="8"/><text x="680" y="95">Generated Markdown views</text>
+</svg>

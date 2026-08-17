@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="180" viewBox="0 0 900 180" role="img" aria-label="Pinax solution architecture">
+  <style>text{font-family:Arial,sans-serif;font-size:18px;fill:#172033}.box{fill:#edf4ff;stroke:#3567a8;stroke-width:2}.line{stroke:#3567a8;stroke-width:2}</style>
+  <rect class="box" x="20" y="55" width="130" height="70" rx="8"/><text x="55" y="95">CLI</text>
+  <line class="line" x1="150" y1="90" x2="210" y2="90"/><polygon points="210,90 198,84 198,96" fill="#3567a8"/>
+  <rect class="box" x="220" y="55" width="170" height="70" rx="8"/><text x="250" y="95">Event log</text>
+  <line class="line" x1="390" y1="90" x2="450" y2="90"/><polygon points="450,90 438,84 438,96" fill="#3567a8"/>
+  <rect class="box" x="460" y="55" width="170" height="70" rx="8"/><text x="488" y="95">Fold and graph</text>
+  <line class="line" x1="630" y1="90" x2="690" y2="90"/><polygon points="690,90 678,84 678,96" fill="#3567a8"/>
+  <rect class="box" x="700" y="55" width="180" height="70" rx="8"/><text x="722" y="95">Markdown views</text>
+</svg>
