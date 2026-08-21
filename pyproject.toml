@@ -3,8 +3,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pinax"
-version = "0.1.1"
+name = "pinax-tracker"
+version = "0.1.2"
 description = "Git-native, deterministic build tracker"
 requires-python = ">=3.10"
 # Runtime has no third-party dependencies.

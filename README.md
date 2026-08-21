@@ -14,8 +14,14 @@ create.
 Pinax requires Python 3.10 or later and Git.
 
 ```bash
-pipx install "git+https://github.com/antikas/pinax-tracker.git@v0.1.1"
+pipx install pinax-tracker
 pinax --help
+```
+
+The same package installs with pip:
+
+```bash
+python -m pip install pinax-tracker
 ```
 
 To work from a checkout:
