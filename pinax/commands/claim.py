@@ -1,30 +1,31 @@
 """
-pinax claim <id> [--actor …] [--json]
+pinax claim <id> [--actor <actor>] [--json]
 
-Appends an item.claimed event to the log.  The fold materialises claim
-ownership via fold-time reconciliation (ADR-003): if two item.claimed events
-exist for the same item, the earliest (ts, actor, id) wins; the loser folds
-to claim.superseded + a report warning.  No cross-worktree lock needed.
+Records an item.claimed event through the publish sequence (pinax.sync):
+fetch, fold the union with the remote default branch, append, commit and
+push.  The fold materialises claim ownership via fold-time reconciliation
+(ADR-003): if two item.claimed events exist for the same item, the earliest
+(ts, actor, id) wins; the loser folds to claim.superseded + a report warning.
+No cross-worktree lock needed.
+
+A claim exists so the other machines see the item as taken, so this command
+requires the remote: it fails when the sequence published nothing.
+
+It is also the one command that asks the sequence to guard the clock: a
+claim whose own timestamp sits behind the newest published event by more
+than the tolerance is refused with exit 6 before anything is minted, and a
+claim the fold reports superseded after its push ends with exit 3. Both
+rules live in pinax.sync; this module only asks for the first and reports
+what the sequence decided.
 """
 
 from __future__ import annotations
 
-import datetime
 import json
+import os
 import sys
 
-from ..append import append_event
-from ..event import mint_event
-from ..fold import fold, read_events
-
-
-def _utc_now_iso() -> str:
-    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _default_actor() -> str:
-    import socket
-    return f"operator@{socket.gethostname()}"
+from .. import sync
 
 
 def run(
@@ -32,14 +33,19 @@ def run(
     item_id: str,
     actor: str | None = None,
     as_json: bool = False,
+    runner=None,
 ) -> None:
     """
     Execute pinax claim in repo_root.
 
-    Appends item.claimed event; prints result (plain or --json).
-    Does NOT resolve the claim here — the fold is the single source of truth.
+    Mints the item.claimed event and hands it to the publish sequence, which
+    owns the fetch, the union fold, the append, the projection, the commit
+    and the push, and which ends the command on any outcome that published
+    nothing.  Does NOT resolve the claim here - the fold is the single
+    source of truth.
+
+    runner is injectable for tests only; the CLI passes none.
     """
-    import os
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
 
@@ -47,39 +53,37 @@ def run(
         print("pinax: .ergon/log/ not found - run 'pinax init' first.", file=sys.stderr)
         sys.exit(1)
 
-    events = read_events(log_dir)
-    next_seq = (max(e["seq"] for e in events) + 1) if events else 0
+    # pinax.doctor owns the actor and timestamp helpers every mutating
+    # command shares; the import is deferred here for the same reason the
+    # log-ignored probe below is, to stay clear of the projection import
+    # chain this module already sits on.
+    from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 
-    _actor = actor or _default_actor()
-    ts = _utc_now_iso()
+    _actor = actor or default_actor()
 
-    actor_events = [e for e in events if e.get("actor") == _actor]
-    prev = actor_events[-1]["id"] if actor_events else ""
-
-    payload = {"item_id": item_id}
-    event = mint_event(
-        seq=next_seq,
-        ts=ts,
+    outcome = sync.run_sequence(
+        repo_root,
+        event_type="item.claimed",
+        payload={"item_id": item_id},
         actor=_actor,
-        etype="item.claimed",
-        payload=payload,
-        prev=prev,
+        ts=utc_now_iso(),
+        item_id=item_id,
+        requires_remote=True,
+        guard_clock=True,
+        runner=runner,
     )
-    append_event(log_dir, event, actor=_actor)
+    sync.conclude(outcome)
 
-    # Regenerate the projection atomically after the append (ADR-002).
-    from ..projection import regenerate
-    regenerate(repo_root)
+    event = outcome.event
 
-    from ..doctor import warn_if_log_ignored
     warn_if_log_ignored(repo_root)
 
     result = {
         "item_id": item_id,
         "event_id": event["id"],
-        "seq": next_seq,
+        "seq": event["seq"],
         "actor": _actor,
-        "ts": ts,
+        "ts": event["ts"],
         "type": "item.claimed",
         "root": ergon_dir,
     }
@@ -89,4 +93,4 @@ def run(
     else:
         # visible the moment it happens.
         print(f"pinax: claimed item {item_id} by {_actor} in {ergon_dir}")
-        print(f"       event_id={event['id'][:12]}... seq={next_seq}")
+        print(f"       event_id={event['id'][:12]}... seq={event['seq']}")

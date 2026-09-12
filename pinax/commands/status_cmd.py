@@ -1,10 +1,15 @@
 """
-pinax status [--json] [--repo <path>|--portfolio]
+pinax status [--json] [--repo <path>|--portfolio] [--under ITEM_ID]
 pinax status <id> <state> [--actor ...] [--json]
 
 Zero positional args render the live status view.  Two positional args keep
 the historical setter form: append item.status_changed and regenerate the
 projection.  Exactly one positional arg is an explicit usage error.
+
+--under ITEM_ID restricts the view's building/shipped/parked lists and its
+next/queue_depth figures to the transitive `parent-child` descendants of
+that item; it requires repo scope and is rejected together with
+--portfolio or the setter form.
 """
 
 from __future__ import annotations
@@ -125,9 +130,15 @@ def _print_repo(repo: dict, *, indent: str = "") -> None:
         for item in building:
             owner = item.get("owner") or "unowned"
             since = item.get("since") or "?"
+            age = item.get("age_hours")
+            age_str = f"; claimed {age}h ago" if age is not None else ""
+            # rollup is additive: present only on an item that carries one
+            # (see fold._compute_rollups) - a leaf item's row is unchanged.
+            rollup = item.get("rollup")
+            rollup_str = f"; rollup {rollup}" if rollup else ""
             print(
                 f"{indent}    {item['id']}  {item.get('title', '')}  "
-                f"[{item.get('stage', '')}; {owner}; since {since}]"
+                f"[{item.get('stage', '')}{rollup_str}; {owner}; since {since}{age_str}]"
             )
     else:
         print(f"{indent}    (none)")
@@ -138,7 +149,12 @@ def _print_repo(repo: dict, *, indent: str = "") -> None:
     if shipped:
         for item in shipped:
             done_at = item.get("done_at") or "?"
-            print(f"{indent}    {item['id']}  {item.get('title', '')}  done {done_at}")
+            rollup = item.get("rollup")
+            rollup_str = f"; rollup {rollup}" if rollup else ""
+            print(
+                f"{indent}    {item['id']}  {item.get('title', '')}  "
+                f"done {done_at}{rollup_str}"
+            )
     else:
         print(f"{indent}    (none)")
     if earlier:
@@ -149,9 +165,11 @@ def _print_repo(repo: dict, *, indent: str = "") -> None:
     if parked:
         for item in parked:
             reason = item.get("reason") or "(no reason)"
+            rollup = item.get("rollup")
+            rollup_str = f"; rollup {rollup}" if rollup else ""
             print(
                 f"{indent}    {item['id']}  {item.get('title', '')}  "
-                f"{item.get('kind', '')}: {reason}"
+                f"{item.get('kind', '')}{rollup_str}: {reason}"
             )
     else:
         print(f"{indent}    (none)")
@@ -176,6 +194,9 @@ def _print_repo(repo: dict, *, indent: str = "") -> None:
 
 def _print_status(payload: dict) -> None:
     print("pinax status")
+    under = payload.get("under")
+    if under:
+        print(f"scope: under {under}")
     print()
     if payload.get("scope") == "repo":
         _print_repo(payload["repo"])
@@ -202,6 +223,7 @@ def run(
     scope: str = "auto",
     since_days: int | None = 7,
     all_branches: bool = False,
+    under: str | None = None,
 ) -> None:
     """Execute either the status view or the historical setter form."""
     if (item_id is None) != (new_status is None):
@@ -215,6 +237,9 @@ def run(
     if item_id is not None and new_status is not None:
         if scope == "portfolio":
             print("pinax status: setter form cannot use --portfolio.", file=sys.stderr)
+            sys.exit(2)
+        if under is not None:
+            print("pinax status: setter form cannot use --under.", file=sys.stderr)
             sys.exit(2)
         _set_status(
             repo_root=repo_root,
@@ -231,6 +256,7 @@ def run(
             scope=scope,
             since_days=since_days,
             all_branches=all_branches,
+            under=under,
         )
     except ValueError as exc:
         print(f"pinax status: {exc}", file=sys.stderr)

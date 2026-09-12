@@ -145,6 +145,10 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
       # Board
       ## <Status Lane>
       - <id> · <title> · <status> · <owner|—> · <blockers|—>
+      - <id> · <title> · <status> · rollup:<bucket> · <owner|—> · <blockers|—>
+        (the "rollup:<bucket>" segment appears only for an item that has
+        children through a parent-child edge; every other line is
+        byte-identical to the layout above)
       ...
       ## Parked / needs human
       - <id> · <title> · <reason|gate>
@@ -199,11 +203,15 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
         blocker_str = ", ".join(blockers) if blockers else "—"
         status = item.get("status", "queued")
         marker = " [next]" if iid == next_id else ""
+        # rollup is additive: present only on an item with children (see
+        # fold._compute_rollups) - a leaf item's line is unchanged.
+        rollup = item.get("rollup")
+        rollup_str = f" · rollup:{rollup}" if rollup else ""
         source_marker = ""
         if item_sources and iid in item_sources:
             source_marker = f" [from: {', '.join(item_sources[iid])}]"
         return (
-            f"- {iid} · {item.get('title', '')} · {status}{marker} · "
+            f"- {iid} · {item.get('title', '')} · {status}{marker}{rollup_str} · "
             f"{owner} · {blocker_str}{source_marker}"
         )
 
@@ -482,6 +490,7 @@ def render_item(item_id: str, item: dict, state: dict) -> str:
       phase: <prefix>
       owner: <owner>
       status: <status>
+      rollup: <rollup, only when this item has children>
       gate: <gate>
       deps: [<blockers>]
       cycle_home: <cycle-home if set>
@@ -536,6 +545,11 @@ def render_item(item_id: str, item: dict, state: dict) -> str:
         _fm("owner", owner),
         _fm("status", item.get("status", "queued")),
     ]
+    # rollup is additive: present only on an item with children (see
+    # fold._compute_rollups) - a leaf item's frontmatter is unchanged.
+    rollup = item.get("rollup")
+    if rollup:
+        fm_lines.append(_fm("rollup", rollup))
     if gate:
         fm_lines.append(_fm("gate", gate))
     if blockers:

@@ -1,7 +1,10 @@
 """
-pinax note add <item_id> --ref <ref> [--caption <text>] [--actor <actor>] [--json]
+pinax note add <item_id> --ref <ref> [--caption <text>] [--actor <actor>] [--offline] [--json]
 
-Appends a note.added event to the log.
+Runs the publish sequence (pinax.sync) exactly as claim and done do: mint
+a note.added event, then fetch (unless offline), fold, append, commit and
+push. Refuses an actor handle that is not role@host before minting
+anything; see pinax.sync for the exit codes and offline rules.
 
 ADR-004 / DESIGN.md enforcement (hard error at CLI write-time, not warning):
 - ref MUST match ^(koine://|~/knowledge/|projects/|docs/) — it is a pointer to a
@@ -20,23 +23,18 @@ import os
 import re
 import sys
 
-from ..append import append_event
-from ..doctor import warn_if_log_ignored
-from ..event import mint_event
+from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 from ..fold import fold
-from ..projection import regenerate
+
+# pinax.sync imports pinax.projection, which imports pinax.commands.dep at
+# its own top level; deferred to run() below rather than imported here, to
+# stay clear of that chain the way pinax.commands.dep itself now must.
 
 # ADR-004: the typed ref pattern — pointer to a knowledge-plane document.
 _REF_PATTERN = re.compile(r"^(koine://|~/knowledge/|projects/|docs/)")
 
 # ADR-004 / DESIGN.md: caption cap.
 _CAPTION_MAX = 200
-
-
-def _default_actor() -> str:
-    import socket
-    hostname = socket.gethostname()
-    return f"operator@{hostname}"
 
 
 def run(
@@ -46,6 +44,8 @@ def run(
     caption: str | None,
     actor: str | None = None,
     as_json: bool = False,
+    offline: bool = False,
+    runner=None,
 ) -> None:
     """
     Execute pinax note add in repo_root.
@@ -54,7 +54,9 @@ def run(
     - ref that does not match the typed-ref pattern (ADR-004)
     - caption that exceeds 200 characters (ADR-004 / DESIGN.md)
 
-    On success: appends a note.added event and regenerates the projection.
+    On success: hands a note.added event to the publish sequence.
+
+    runner is injectable for tests only; the CLI passes none.
     """
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
@@ -95,45 +97,29 @@ def run(
         )
         sys.exit(1)
 
-    # --- EMIT EVENT ---
+    # --- HAND OFF TO THE PUBLISH SEQUENCE ---
 
-    _actor = actor or _default_actor()
+    from .. import sync
 
-    # Compute seq: max seq in log + 1 (simple per-actor monotonic counter).
-    import glob as _glob
-    all_events_seq = [
-        e.get("seq", 0)
-        for shard in _glob.glob(os.path.join(log_dir, "*.jsonl"))
-        for e in _read_shard_seq(shard)
-    ]
-    seq = max(all_events_seq, default=-1) + 1
-
-    import datetime
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    _actor = actor or default_actor()
 
     payload: dict = {"item_id": item_id, "ref": ref}
     if caption is not None:
         payload["caption"] = caption
 
-    # prev: last event id in this actor's shard (or '' if none).
-    import re as _re
-    shard_name = _actor.replace("@", "-").replace("/", "-").replace("\\", "-").replace(" ", "-")
-    shard_path = os.path.join(log_dir, f"{shard_name}.jsonl")
-    prev_id = _last_event_id(shard_path)
-
-    event = mint_event(
-        seq=seq,
-        ts=ts,
-        actor=_actor,
-        etype="note.added",
+    outcome = sync.run_sequence(
+        repo_root,
+        event_type="note.added",
         payload=payload,
-        prev=prev_id,
+        actor=_actor,
+        ts=utc_now_iso(),
+        item_id=item_id,
+        offline=offline,
+        runner=runner,
     )
-    append_event(log_dir, event, actor=_actor)
+    sync.conclude(outcome)
 
-    # Regenerate projection atomically (ADR-002).
-    regenerate(repo_root)
-
+    event = outcome.event
     warn_if_log_ignored(repo_root)
 
     if as_json:
@@ -147,37 +133,3 @@ def run(
         # visible the moment it happens.
         caption_str = f" ({caption!r})" if caption else ""
         print(f"pinax: note.added on {item_id} -> {ref}{caption_str} in {ergon_dir}")
-
-
-def _read_shard_seq(shard_path: str) -> list[dict]:
-    """Read seq values from a shard file (minimal parse — seq field only needed)."""
-    events = []
-    try:
-        with open(shard_path, "rb") as fh:
-            raw = fh.read()
-        normalised = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-        for line in normalised.split(b"\n"):
-            if not line:
-                continue
-            try:
-                obj = json.loads(line.decode("utf-8"))
-                if isinstance(obj, dict):
-                    events.append(obj)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
-    except OSError:
-        pass
-    return events
-
-
-def _last_event_id(shard_path: str) -> str:
-    """Return the id of the last event in a shard, or '' if the shard is empty/absent."""
-    events = _read_shard_seq(shard_path)
-    if not events:
-        return ""
-    # Return the last valid id.
-    for event in reversed(events):
-        eid = event.get("id", "")
-        if eid:
-            return eid
-    return ""

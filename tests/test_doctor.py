@@ -28,6 +28,7 @@ pinned far-future --now, and non-stale against a huge --stale-hours).
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import shutil
@@ -36,7 +37,11 @@ import sys
 
 import pytest
 
-from pinax.fold import fold
+from pinax.append import append_event
+from pinax.event import mint_event
+from pinax.fold import fold, read_events
+from pinax.ids import mint_item_id
+from pinax.projection import regenerate
 
 pytestmark = pytest.mark.deep
 
@@ -45,6 +50,8 @@ _GITATTRIBUTES = "*.jsonl text eol=lf merge=union\n.ergon/** text eol=lf\n"
 
 _FAR_FUTURE = "2036-01-01T00:00:00Z"     # any real claim ts is >> 24h older
 _HUGE_HOURS = "9000000"                  # ~1000 years — nothing is that stale
+_WIDE_EXPIRY_HOURS = "900000"            # ~100 years — no claim expires inside it
+_DEFAULT_HOURS = "24"                    # the threshold when no policy is folded
 
 
 def _build_env() -> dict:
@@ -192,14 +199,77 @@ def repo(tmp_path):
     return root
 
 
+@pytest.fixture()
+def repo_with_origin(clone_wired_to_hub):
+    """
+    Same shape as 'repo', but with 'origin' wired to a reachable bare hub,
+    for a test whose subject needs 'claim' (the one command the publish
+    sequence always requires the remote for) to succeed rather than exit
+    4.
+
+    The clone, its own empty hooks directory and the first push belong to
+    the shared factory in tests/conftest.py; this file's own git and CLI
+    helpers do the work.
+    """
+    return clone_wired_to_hub(
+        init_repo=_init_repo,
+        git=_git,
+        pinax=_pinax,
+        commit_all=_commit_all,
+        actor="operator@hub",
+    )
+
+
+def _append_uncommitted_item(repo_root: str, title: str, actor: str = "t@h") -> str:
+    """
+    Append an item.created event straight to the working-tree log and
+    regenerate the projection, without committing either -- the
+    orphaned-trail shape doctor's class 1 (uncommitted shard events)
+    detects.
+
+    Before ADR-006, every mutating command appended and regenerated the
+    projection, and only ever left the commit itself for later; a session
+    that ended before that commit left exactly this shape behind. Now that
+    the CLI's own 'add' runs the publish sequence and commits itself
+    (pinax/sync.py), this helper reproduces the shape directly through the
+    same primitives 'add' calls, bypassing the CLI so the appended event
+    and its projection stay uncommitted on purpose. Regenerating matters:
+    a commit here still runs the repository's pre-commit hook (never
+    bypassed), and that hook's own 'pinax verify' refuses a commit whose
+    projection has drifted from the log (ADR-002), so a helper that only
+    appended without regenerating would make every guided-reconcile commit
+    fail on drift rather than on the orphaned trail this helper exists to
+    construct.
+    """
+    log_dir = _log_dir(repo_root)
+    state = fold(log_dir)
+    existing_ids = set(state.get("items", {}).keys())
+    local_events = read_events(log_dir)
+    next_seq = (max(e["seq"] for e in local_events) + 1) if local_events else 0
+    item_id = mint_item_id(
+        seq=next_seq, title=title, actor=actor, prefix="pnx", existing_ids=existing_ids,
+    )
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    event = mint_event(
+        seq=next_seq, ts=ts, actor=actor, etype="item.created",
+        payload={"item_id": item_id, "title": title, "prefix": "pnx", "status": "queued"},
+        prev="",
+    )
+    append_event(log_dir, event, actor=actor)
+    regenerate(repo_root)
+    return item_id
+
+
 # ---------------------------------------------------------------------------
 # (1) uncommitted shard events
 # ---------------------------------------------------------------------------
 
 @requires_git
 def test_clean_repo_no_findings(repo):
+    # No follow-up commit here: 'add' now runs the publish sequence
+    # (pinax/sync.py), which commits the shard and the projection itself
+    # (ADR-006); the working tree is already clean by the time it returns.
     _add_item(repo, "committed item")
-    _commit_all(repo, "item committed")
 
     result = _pinax(repo, "doctor", "--json", "--now", _FAR_FUTURE,
                     "--stale-hours", _HUGE_HOURS)
@@ -219,7 +289,10 @@ def test_clean_repo_no_findings(repo):
 
 @requires_git
 def test_uncommitted_shard_events_detected(repo):
-    item_id = _add_item(repo, "orphaned item")  # NOT committed
+    # 'add' now commits itself (ADR-006), so an orphaned (appended, never
+    # committed) trail is built directly through the primitives 'add'
+    # calls rather than through the CLI; see _append_uncommitted_item.
+    item_id = _append_uncommitted_item(repo, "orphaned item")  # NOT committed
 
     result = _pinax(repo, "doctor", "--json", "--now", _FAR_FUTURE,
                     "--stale-hours", _HUGE_HOURS)
@@ -248,11 +321,15 @@ def test_uncommitted_shard_events_detected(repo):
 # ---------------------------------------------------------------------------
 
 @requires_git
-def test_stale_claim_detected_and_threshold_respected(repo):
+def test_stale_claim_detected_and_threshold_respected(repo_with_origin):
+    # 'claim' always requires the remote (pinax/sync.py), so this fixture
+    # wires a reachable bare-hub origin rather than 'repo'.
+    repo = repo_with_origin
     item_id = _add_item(repo, "claimed then abandoned")
-    r = _pinax(repo, "claim", item_id, "--actor", "worker@example.test")
+    r = _pinax(repo, "claim", item_id, "--actor", "worker@hub")
     assert r.returncode == 0, r.stderr
-    _commit_all(repo, "claimed")
+    # No follow-up commit here: 'claim' already committed (and published)
+    # the event through the publish sequence.
 
     # Against a far-future now, the claim is years old — stale at 24h default.
     result = _pinax(repo, "doctor", "--json", "--now", _FAR_FUTURE)
@@ -261,7 +338,7 @@ def test_stale_claim_detected_and_threshold_respected(repo):
     claims = report["stale_claims"]
     assert len(claims) == 1
     assert claims[0]["item_id"] == item_id
-    assert claims[0]["owner"] == "worker@example.test"
+    assert claims[0]["owner"] == "worker@hub"
     assert claims[0]["age_hours"] > 24
 
     # Same repo, huge threshold — not stale, no findings.
@@ -272,7 +349,10 @@ def test_stale_claim_detected_and_threshold_respected(repo):
 
 
 @requires_git
-def test_stale_claim_excludes_settled_items(repo):
+def test_stale_claim_excludes_settled_items(repo_with_origin):
+    # 'claim' always requires the remote (pinax/sync.py), so this fixture
+    # wires a reachable bare-hub origin rather than 'repo'.
+    repo = repo_with_origin
     done_id = _add_item(repo, "claimed then done")
     parked_id = _add_item(repo, "claimed then parked")
     r = _pinax(repo, "claim", done_id, "--actor", "a@h")
@@ -287,9 +367,12 @@ def test_stale_claim_excludes_settled_items(repo):
     assert r.returncode == 0, r.stderr
     r = _pinax(repo, "park", parked_id, "--reason", "later", "--actor", "a@h")
     assert r.returncode == 0, r.stderr
-    _commit_all(repo, "settled items")
+    # No follow-up commit here: each of claim/done/park already committed
+    # (and published) its own event through the publish sequence.
+    # briefing.txt was never staged by any of them (the sequence stages
+    # only the shard and the projection), so it stays a scratch file, not
+    # a tracked one -- just remove it, nothing to commit.
     os.remove(briefing)
-    _commit_all(repo, "drop briefing file")
 
     result = _pinax(repo, "doctor", "--json", "--now", _FAR_FUTURE)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -360,7 +443,10 @@ def test_legacy_skipped_when_absent(repo):
 
 @requires_git
 def test_reconcile_commits_orphaned_shards_without_touching_bytes(repo):
-    _add_item(repo, "orphaned trail")  # uncommitted
+    # 'add' now commits itself (ADR-006); build the orphaned trail
+    # directly so it stays genuinely uncommitted (see
+    # _append_uncommitted_item).
+    _append_uncommitted_item(repo, "orphaned trail")  # uncommitted
     shards_before = _read_shards(repo)
     head_before = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
@@ -381,7 +467,10 @@ def test_reconcile_commits_orphaned_shards_without_touching_bytes(repo):
 
 @requires_git
 def test_reconcile_declined_leaves_everything_in_place(repo):
-    _add_item(repo, "orphaned trail")
+    # 'add' now commits itself (ADR-006); build the orphaned trail
+    # directly so it stays genuinely uncommitted (see
+    # _append_uncommitted_item).
+    _append_uncommitted_item(repo, "orphaned trail")
     head_before = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
     result = _pinax(repo, "doctor", "--reconcile", "--now", _FAR_FUTURE,
@@ -394,14 +483,29 @@ def test_reconcile_declined_leaves_everything_in_place(repo):
 
 
 @requires_git
-def test_reconcile_prompts_done_park_skip_on_stale_claims(repo):
+def test_reconcile_prompts_done_park_skip_on_stale_claims(repo_with_origin):
+    # 'claim' always requires the remote (pinax/sync.py), so this fixture
+    # wires a reachable bare-hub origin rather than 'repo'; every actor
+    # driven against it carries no "test" substring (docs/items/
+    # CONSTRAINTS.md).
+    repo = repo_with_origin
+    # A claim expiry wide enough to cover the far-future reference time
+    # below, recorded before the claims so it is the policy in force for
+    # them: the doctor's own resolutions are dated at that reference time,
+    # and under a narrower policy the fold would end every claim they
+    # follow, including the one skipped here. The threshold each pass uses
+    # is given explicitly, so a skipped claim is still reported stale.
+    r = _pinax(repo, "policy", "claim-expiry", "--hours", _WIDE_EXPIRY_HOURS,
+               "--actor", "operator@hub")
+    assert r.returncode == 0, r.stderr
     id_a = _add_item(repo, "stale a")
     id_b = _add_item(repo, "stale b")
     id_c = _add_item(repo, "stale c")
     for iid in (id_a, id_b, id_c):
-        r = _pinax(repo, "claim", iid, "--actor", "worker@example.test")
+        r = _pinax(repo, "claim", iid, "--actor", "worker@hub")
         assert r.returncode == 0, r.stderr
-    _commit_all(repo, "three stale claims")  # class 1 empty -> no commit prompt
+    # No follow-up commit here: each claim already committed (and
+    # published) its own event through the publish sequence.
 
     # Prompts arrive sorted by item id: map answers accordingly.
     answers = {
@@ -412,7 +516,8 @@ def test_reconcile_prompts_done_park_skip_on_stale_claims(repo):
     stdin = "".join(answers[iid] for iid in sorted([id_a, id_b, id_c]))
 
     result = _pinax(repo, "doctor", "--reconcile", "--now", _FAR_FUTURE,
-                    "--actor", "operator@example.test", stdin=stdin)
+                    "--stale-hours", _DEFAULT_HOURS,
+                    "--actor", "operator@hub", stdin=stdin)
     assert result.returncode == 0, result.stdout + result.stderr
 
     state = fold(_log_dir(repo))
@@ -424,22 +529,22 @@ def test_reconcile_prompts_done_park_skip_on_stale_claims(repo):
     assert items[second]["park_reason"] == "session died mid-build"
     # Skipped item untouched — still claimed, not done/parked.
     assert items[third]["status"] not in ("done", "parked")
-    assert items[third]["owner"] == "worker@example.test"
+    assert items[third]["owner"] == "worker@hub"
 
     # Resolutions went through the normal event path with provenance, authored
     # by the operator, and are integrity-valid (ids verify on re-fold).
-    from pinax.fold import read_events
     events = read_events(_log_dir(repo))
     resolved = [e for e in events
                 if e.get("payload", {}).get("source") == "pinax-doctor"]
     assert len(resolved) == 2
     assert {e["type"] for e in resolved} == {"item.completed", "item.parked"}
     for e in resolved:
-        assert e["actor"] == "operator@example.test"
-        assert e["payload"]["stale_owner"] == "worker@example.test"
+        assert e["actor"] == "operator@hub"
+        assert e["payload"]["stale_owner"] == "worker@hub"
 
     # A second doctor pass sees no stale claims for the two resolved items.
-    again = _pinax(repo, "doctor", "--json", "--now", _FAR_FUTURE)
+    again = _pinax(repo, "doctor", "--json", "--now", _FAR_FUTURE,
+                   "--stale-hours", _DEFAULT_HOURS)
     report = json.loads(again.stdout)
     stale_ids = {c["item_id"] for c in report["stale_claims"]}
     assert first not in stale_ids
@@ -448,11 +553,15 @@ def test_reconcile_prompts_done_park_skip_on_stale_claims(repo):
 
 
 @requires_git
-def test_reconcile_eof_takes_safe_default(repo):
+def test_reconcile_eof_takes_safe_default(repo_with_origin):
+    # 'claim' always requires the remote (pinax/sync.py), so this fixture
+    # wires a reachable bare-hub origin rather than 'repo'.
+    repo = repo_with_origin
     item_id = _add_item(repo, "stale, unattended")
-    r = _pinax(repo, "claim", item_id, "--actor", "worker@example.test")
+    r = _pinax(repo, "claim", item_id, "--actor", "worker@hub")
     assert r.returncode == 0, r.stderr
-    _commit_all(repo, "stale claim")
+    # No follow-up commit here: 'claim' already committed (and published)
+    # the event through the publish sequence.
 
     # No stdin at all: every prompt EOFs -> safe defaults, exit 0, no change.
     result = _pinax(repo, "doctor", "--reconcile", "--now", _FAR_FUTURE,
@@ -467,7 +576,10 @@ def test_reconcile_eof_takes_safe_default(repo):
 # ---------------------------------------------------------------------------
 
 @requires_git
-def test_json_deterministic_and_ascii(repo):
+def test_json_deterministic_and_ascii(repo_with_origin):
+    # 'claim' always requires the remote (pinax/sync.py), so this fixture
+    # wires a reachable bare-hub origin rather than 'repo'.
+    repo = repo_with_origin
     item_id = _add_item(repo, "titulo apendice éé")  # non-ASCII title
     r = _pinax(repo, "claim", item_id, "--actor", "a@h")
     assert r.returncode == 0, r.stderr
@@ -573,8 +685,10 @@ def test_init_heals_preexisting_blanket_jsonl_gitignore_on_reinit(tmp_path):
 
 @requires_git
 def test_doctor_and_verify_fail_loudly_when_log_ignored(repo):
+    # No follow-up commit here: 'add' now runs the publish sequence
+    # (pinax/sync.py), which commits the shard and the projection itself
+    # (ADR-006); the working tree is already clean by the time it returns.
     _add_item(repo, "an item")
-    _commit_all(repo, "item committed")
 
     # Sanity: clean, tracked repo passes both before we break it.
     pre_doctor = _pinax(repo, "doctor", "--json", "--now", _FAR_FUTURE,
@@ -649,7 +763,7 @@ def test_doctor_and_verify_fail_safe_when_git_unavailable(repo):
     assert "OK" in verify_result.stdout
 
 
-# --- (c) warn-once, non-blocking, in state-changing commands ---------------
+# --- (c) the swallowed-log warning, and the commit a hook refuses ----------
 
 @requires_git
 def test_state_changing_commands_silent_when_log_tracked(repo):
@@ -659,36 +773,72 @@ def test_state_changing_commands_silent_when_log_tracked(repo):
 
 
 @requires_git
-def test_state_changing_commands_warn_once_but_never_abort_when_log_ignored(repo):
+def test_state_changing_commands_exit_seven_when_the_hook_refuses_a_swallowed_log(
+    repo_with_origin,
+):
+    """
+    A swallowed event log follows the publish rule, not warn-once.
+
+    The pre-commit hook's own 'pinax verify' refuses any commit while a
+    .gitignore rule swallows the log, and a state-changing command commits
+    its own shard and projection. The command therefore ends the way any
+    other hook refusal ends it: the event is appended and left
+    uncommitted, the warning names the shard and the event id, the hook's
+    output is reported, and the exit is 7. No hook is worked around, so
+    the operator fixes the .gitignore and commits the shard.
+
+    The command's own one-line swallowed-log notice is not reached here:
+    the sequence ends the command at the refusal, and the hook's verify
+    reports the same swallow in its own words, with the same repair.
+    """
+    # 'claim' always requires the remote (pinax/sync.py), so this fixture
+    # wires a reachable bare-hub origin rather than 'repo'.
+    repo = repo_with_origin
+
+    # Seed a tracked shard for actor a@h, and for the default t@h actor
+    # _add_item falls back to below, BEFORE the swallow: 'git add' refuses
+    # to stage a brand-new path that matches a gitignore rule, but happily
+    # stages a modification to a path already tracked at HEAD, gitignore
+    # rule or not. Seeding keeps every append below a modification to an
+    # already-tracked shard, so this test exercises the refused commit
+    # itself rather than the unrelated staging refusal a never-before-
+    # committed shard would hit under ADR-006's own commit.
+    _add_item(repo, "seeds the a@h shard before the swallow", actor="a@h")
+    _add_item(repo, "seeds the t@h shard before the swallow")
+
     _break_log_tracking(repo)
+    head_before = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
-    add_result = _pinax(repo, "add", "--title", "still works", "--actor", "a@h", "--json")
-    assert add_result.returncode == 0, add_result.stderr
-    assert add_result.stderr.count("pinax: WARNING") == 1
-    assert "gitignore" in add_result.stderr.lower()
-    item_id = json.loads(add_result.stdout)["item_id"]
+    add_result = _pinax(repo, "add", "--title", "still appended", "--actor", "a@h", "--json")
+    assert add_result.returncode == 7, add_result.stderr
 
-    claim_result = _pinax(repo, "claim", item_id, "--actor", "a@h")
-    assert claim_result.returncode == 0, claim_result.stderr
-    assert claim_result.stderr.count("pinax: WARNING") == 1
+    report = json.loads(add_result.stdout.strip().splitlines()[-1])
+    assert report["status"] == "commit_refused"
+    assert report["committed"] is False
 
-    briefing = os.path.join(repo, "briefing.txt")
-    with open(briefing, "w", newline="\n") as fh:
-        fh.write("done despite the swallow\n")
-    done_result = _pinax(repo, "done", item_id, "--briefing", briefing, "--actor", "a@h")
-    assert done_result.returncode == 0, done_result.stderr
-    assert done_result.stderr.count("pinax: WARNING") == 1
-    os.remove(briefing)
+    # The warning names the shard and the event id, and the hook's own
+    # output travels with it.
+    assert "appended and not committed" in add_result.stderr
+    assert report["event_id"] in add_result.stderr
+    assert os.path.basename(report["shard"]) in add_result.stderr
+    assert "LOG SWALLOWED BY GITIGNORE" in add_result.stderr
 
+    # Appended and uncommitted: the working-tree fold carries the item,
+    # the committed shard does not carry the event, and HEAD has not moved.
+    item_id = report["item_id"]
     state = fold(_log_dir(repo))
-    assert state["items"][item_id]["status"] == "done", (
-        "the warn-once guard must never block the state-changing command it decorates"
-    )
+    assert item_id in state["items"]
+    committed_shard = _git(repo, "show", "HEAD:.ergon/log/a-h.jsonl").stdout
+    assert report["event_id"] not in committed_shard
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == head_before
 
-    park_id = _add_item(repo, "will be parked despite the swallow")
-    park_result = _pinax(repo, "park", park_id, "--reason", "later", "--actor", "a@h")
-    assert park_result.returncode == 0, park_result.stderr
-    assert park_result.stderr.count("pinax: WARNING") == 1
-
-    state2 = fold(_log_dir(repo))
-    assert state2["items"][park_id]["status"] == "parked"
+    # Not particular to 'add': a command that requires the remote reaches
+    # the same refusal, and reports it as a refusal rather than as an
+    # unreachable remote.
+    claim_result = _pinax(repo, "claim", item_id, "--actor", "a@h")
+    assert claim_result.returncode == 7, claim_result.stderr
+    claim_report = json.loads(claim_result.stdout.strip().splitlines()[-1])
+    assert claim_report["status"] == "commit_refused"
+    assert claim_report["committed"] is False
+    assert "LOG SWALLOWED BY GITIGNORE" in claim_result.stderr
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == head_before

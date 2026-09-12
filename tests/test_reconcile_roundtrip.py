@@ -178,9 +178,12 @@ def test_offline_reconcile_two_clone_roundtrip():
         _make_git_repo(repo_a)
         _init_ergon(repo_a, actor="operator@example.test")
 
+        # No follow-up commit here: 'add' runs the publish sequence
+        # (pinax/sync.py), which commits the shard and the projection
+        # itself (ADR-006); each call is already committed by the time it
+        # returns.
         _pinax(repo_a, "add", "--title", "Item X", "--prefix", "pnx", "--actor", "operator@example.test")
         _pinax(repo_a, "add", "--title", "Item Y", "--prefix", "pnx", "--actor", "operator@example.test")
-        _commit_all(repo_a, "hub: add items X and Y")
 
         state = _fold_repo(repo_a)
         items = state.get("items", {})
@@ -200,8 +203,8 @@ def test_offline_reconcile_two_clone_roundtrip():
         _commit_all(repo_b, "laptop (no CLI): log offline completions in BACKLOG-OFFLINE.md")
 
         # --- 3. repo_a diverges (a real merge, not a fast-forward) ---
+        # No follow-up commit here: 'add' already commits itself (ADR-006).
         _pinax(repo_a, "add", "--title", "Item Z", "--prefix", "pnx", "--actor", "operator@example.test")
-        _commit_all(repo_a, "hub: add item Z (diverges from the laptop clone)")
 
         # --- 4. repo_a pulls repo_b's commit: a real two-clone merge ---
         # (fetch + merge rather than `git pull -m` -- pull's CLI does not take

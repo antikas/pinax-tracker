@@ -145,23 +145,30 @@ def _build_fixture(tmpdir: str):
     repo = _make_git_repo(tmpdir)
     _init_ergon(repo, actor="operator@example.test")
 
+    # No follow-up commit here: 'add' runs the publish sequence
+    # (pinax/sync.py), which commits the shard and the projection itself
+    # (ADR-006); the working tree is already clean by the time it returns.
     _pinax(repo, "add", "--title", "Alpha", "--prefix", "pnx", "--actor", "operator@example.test")
-    _commit_all(repo, "c1: add Alpha")
     _git(repo, "tag", "replay-c1")
     c1_sha = _head_sha(repo)
 
     state_c1 = _fold_repo(repo)
     alpha_id = _item_id_by_title(state_c1, "Alpha")
 
+    # 'add' commits Beta itself; 'status' (the historical setter form) does
+    # not go through the publish sequence and leaves its own event
+    # uncommitted, so this commit covers only that status change.
     _pinax(repo, "add", "--title", "Beta", "--prefix", "pnx", "--actor", "operator@example.test")
     _pinax(repo, "status", alpha_id, "building", "--actor", "operator@example.test")
-    _commit_all(repo, "c2: add Beta, Alpha -> building")
+    _commit_all(repo, "c2: Alpha -> building")
     _git(repo, "tag", "replay-c2")
     c2_sha = _head_sha(repo)
 
+    # Same shape as c2: 'add' commits Gamma itself, this commit covers only
+    # the status change.
     _pinax(repo, "add", "--title", "Gamma", "--prefix", "pnx", "--actor", "operator@example.test")
     _pinax(repo, "status", alpha_id, "done", "--actor", "operator@example.test")
-    _commit_all(repo, "c3: add Gamma, Alpha -> done")
+    _commit_all(repo, "c3: Alpha -> done")
     _git(repo, "tag", "replay-c3")
     c3_sha = _head_sha(repo)
 

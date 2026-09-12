@@ -1,10 +1,15 @@
 """Console interface for read-only tracker diagnosis and guided reconciliation.
 
-Default mode reports uncommitted event shards, stale claims, legacy-board
-contradictions, and ignored event-log paths. `--reconcile` offers normal Git
-commits for uncommitted shards and append-only completion or park actions for
-stale claims. JSON output is deterministic for identical repository state and
-reference time.
+Default mode reports uncommitted event shards, unsynced shards, stale
+claims, legacy-board contradictions, and ignored event-log paths.
+`--reconcile` offers normal Git commits for uncommitted shards and
+append-only completion, park or claim-release actions for stale claims.
+JSON output is deterministic for identical repository state and reference
+time.
+
+The staleness threshold defaults to the expiry policy the log folds to,
+and to the module default when the log sets none; an explicit
+--stale-hours still wins.
 """
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ import subprocess
 import sys
 
 from ..append import append_event
-from ..doctor import DEFAULT_STALE_HOURS, diagnose, parse_ts
+from ..doctor import default_actor, diagnose, parse_ts
 from ..event import mint_event
 from ..fold import read_events
 
@@ -24,11 +29,6 @@ _TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 def _utc_now() -> datetime.datetime:
     return datetime.datetime.utcnow()
-
-
-def _default_actor() -> str:
-    import socket
-    return f"operator@{socket.gethostname()}"
 
 
 def _prompt(text: str) -> str | None:
@@ -130,6 +130,29 @@ def _print_report(repo_root: str, report: dict) -> None:
             f"({n_tracked}/{n_disk} on-disk shard file(s) git-tracked)"
         )
 
+    unsynced = report.get("unsynced", {})
+    if not unsynced.get("available"):
+        print("  [5] unsynced shards: UNAVAILABLE (the remote could not be read)")
+    elif not unsynced.get("events"):
+        branch = unsynced.get("remote_branch")
+        where = f"origin/{branch}" if branch else "no remote default branch"
+        print(f"  [5] unsynced shards: none ahead of {where}")
+    else:
+        branch = unsynced.get("remote_branch")
+        where = f"origin/{branch}" if branch else "no remote default branch"
+        events = unsynced["events"]
+        shards = sorted({ev["shard"] for ev in events if ev.get("shard")})
+        print(
+            f"  [5] unsynced shards: {len(events)} event(s) committed locally "
+            f"but not yet on {where}, across {len(shards)} shard file(s)"
+        )
+        for shard in shards:
+            print(f"        {shard}")
+        for ev in events:
+            item = f" item={ev['item_id']}" if ev.get("item_id") else ""
+            print(f"        event {ev['id'][:12]}... {ev['type']}{item} "
+                  f"ts={ev['ts']} actor={ev['actor']}")
+
     if report["findings"]:
         print(f"pinax doctor: {report['findings']} finding(s).")
     else:
@@ -171,6 +194,14 @@ def _reconcile_uncommitted(repo_root: str, report: dict) -> None:
     print(f"doctor: committed {len(paths)} file(s).")
 
 
+# What each resolution event is called on the console, in one place.
+_RESOLUTION_VERBS = {
+    "item.completed": "done",
+    "item.parked": "parked",
+    "item.claim_released": "released",
+}
+
+
 def _reconcile_stale_claims(
     repo_root: str,
     log_dir: str,
@@ -179,9 +210,15 @@ def _reconcile_stale_claims(
     now_iso: str,
 ) -> int:
     """
-    Guided fix, class 2: prompt done/park/skip per stale claim; append
-    resolutions through the normal event path.  Returns the number of
-    events appended.
+    Guided fix, class 2: prompt done/park/release/skip per stale claim;
+    append resolutions through the normal event path.  Returns the number
+    of events appended.
+
+    Release is the answer for a claim in a quiet log: the fold expires a
+    claim only against a later event, so a log that has recorded nothing
+    since the claim never expires it on its own (ADR-007) and this is the
+    way out. Done and park settle the work as well as the claim; release
+    ends the claim alone and leaves the item's status where it stands.
     """
     claims = report["stale_claims"]
     if not claims:
@@ -199,7 +236,7 @@ def _reconcile_stale_claims(
                else f"{c['age_hours']}h old")
         answer = _prompt(
             f"doctor: {item_id} claimed by {c['owner']} ({age}, "
-            f"status={c['status']}) -- [d]one / [p]ark / [s]kip: "
+            f"status={c['status']}) -- [d]one / [p]ark / [r]elease / [s]kip: "
         )
         if answer is None:
             print("doctor: input ended - skipping remaining stale claims.")
@@ -229,6 +266,18 @@ def _reconcile_stale_claims(
                 "source": "pinax-doctor",
                 "stale_owner": c["owner"],
             }
+        elif choice in ("r", "release"):
+            reason = _prompt(f"doctor: release reason for {item_id}: ")
+            if reason is None or not reason.strip():
+                print(f"doctor: no reason given - skipping {item_id}.")
+                continue
+            etype = "item.claim_released"
+            payload = {
+                "item_id": item_id,
+                "reason": reason.strip(),
+                "source": "pinax-doctor",
+                "stale_owner": c["owner"],
+            }
         else:
             print(f"doctor: skipped {item_id}.")
             continue
@@ -245,7 +294,7 @@ def _reconcile_stale_claims(
         prev = event["id"]
         next_seq += 1
         appended += 1
-        verb = "done" if etype == "item.completed" else "parked"
+        verb = _RESOLUTION_VERBS[etype]
         print(f"doctor: {item_id} marked {verb} "
               f"(event_id={event['id'][:12]}... seq={event['seq']}).")
 
@@ -289,13 +338,13 @@ def run(
     else:
         now = _utc_now()
 
-    threshold = stale_hours if stale_hours is not None else DEFAULT_STALE_HOURS
-
+    # An explicit threshold wins; otherwise diagnose() takes the expiry
+    # policy the log folds to, and its own default when the log sets none.
     report = diagnose(
         repo_root=repo_root,
         log_dir=log_dir,
         now=now,
-        stale_hours=threshold,
+        stale_hours=stale_hours,
         legacy_board=legacy_board,
     )
 
@@ -309,7 +358,7 @@ def run(
         sys.exit(1 if report["findings"] else 0)
 
     # --- guided action -------------------------------------------------------
-    _actor = actor or _default_actor()
+    _actor = actor or default_actor()
     _reconcile_uncommitted(repo_root, report)
     _reconcile_stale_claims(
         repo_root, log_dir, report, _actor, now.strftime(_TS_FMT)

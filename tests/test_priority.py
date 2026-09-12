@@ -429,10 +429,12 @@ def cli_repo(tmp_path):
     assert r.returncode == 0, r.stderr
     _commit_all(root, "init: pinax ergon base")
 
+    # No follow-up commit here: 'add' runs the publish sequence
+    # (pinax/sync.py), which commits the shard and the projection itself
+    # (ADR-006); the working tree is already clean by the time it returns.
     r = _pinax(root, "add", "--title", "Item X", "--prefix", "pnx", "--actor", ACTOR, "--json")
     assert r.returncode == 0, r.stderr
     item_id = json.loads(r.stdout)["item_id"]
-    _commit_all(root, "add Item X")
     return root, item_id
 
 
@@ -453,9 +455,9 @@ def test_replay_at_ref_reconstructs_priority_history(cli_repo):
     _git(root, "tag", "prio-c1")
     c1_sha = _head_sha(root)
 
+    # No follow-up commit here: 'priority' already commits itself (ADR-006).
     r = _pinax(root, "priority", item_id, "7", "--actor", ACTOR, "--json")
     assert r.returncode == 0, r.stderr
-    _commit_all(root, "set priority 7")
     _git(root, "tag", "prio-c2")
     c2_sha = _head_sha(root)
 
@@ -570,6 +572,8 @@ def test_all_branches_honours_branch_only_priority_over_depth():
         assert r.returncode == 0, r.stderr
         _commit_all(root, "init: pinax ergon base")
 
+        # No follow-up commit below: 'add' and 'dep add' already commit
+        # themselves (ADR-006).
         # DEEP0 -> DEEP1 blocks chain (depth(DEEP0) = 1); SHALLOW has no edges (depth 0).
         r = _pinax(root, "add", "--title", "DEEP0", "--prefix", "pnx", "--actor", ACTOR, "--json")
         deep0 = json.loads(r.stdout)["item_id"]
@@ -579,7 +583,6 @@ def test_all_branches_honours_branch_only_priority_over_depth():
         shallow = json.loads(r.stdout)["item_id"]
         r = _pinax(root, "dep", "add", deep0, "--blocks", deep1, "--actor", ACTOR)
         assert r.returncode == 0, r.stderr
-        _commit_all(root, "add DEEP0/DEEP1/SHALLOW + blocks edge")
 
         # Baseline (no priority anywhere yet): DEEP0 wins (depth 1 > 0).
         r = _pinax(root, "next", "--json")
@@ -587,9 +590,10 @@ def test_all_branches_honours_branch_only_priority_over_depth():
 
         # Branch-only: prioritise SHALLOW, committed on an unmerged branch only.
         _git(root, "checkout", "-b", "run/spine")
+        # No follow-up commit here: 'priority' already commits itself
+        # (ADR-006).
         r = _pinax(root, "priority", shallow, "0", "--actor", ACTOR, "--json")
         assert r.returncode == 0, r.stderr
-        _commit_all(root, "prioritise SHALLOW")
         _git(root, "checkout", "main")
 
         # Plain fold: branch-only priority is invisible -> depth still decides.

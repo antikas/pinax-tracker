@@ -71,10 +71,14 @@ def repo(tmp_path):
         "item.created",
         {"item_id": "pnx-done", "title": "Done thing", "prefix": "pnx"},
     )
+    # Noon on the claim's own day: comfortably inside the claim expiry
+    # policy window, since an event dated further ahead than the policy
+    # ends the live claim above, and comfortably inside the seven-day
+    # recent window the shipped list below asserts.
     _append(
         str(log_dir),
         6,
-        "2026-07-07T00:00:00Z",
+        "2026-07-01T12:00:00Z",
         "item.completed",
         {"item_id": "pnx-done", "briefing": "done"},
     )

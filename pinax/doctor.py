@@ -1,9 +1,18 @@
 """Read-only diagnosis for common tracker consistency conditions.
 
-The doctor reports uncommitted event shards, stale claims, contradictions with
-an optional legacy board, and event-log paths ignored by Git. It derives each
-result from the repository and an explicit reference time, returns stable
-ordering, and does not modify the log or projection.
+The doctor reports uncommitted event shards, unsynced (committed but
+unpublished) shards, stale claims, contradictions with an optional legacy
+board, and event-log paths ignored by Git. It derives each result from the
+repository and an explicit reference time, returns stable ordering, and
+does not modify the log or projection.
+
+utc_now_iso and default_actor also live here. They are the one shared copy
+every mutating command imports for its event timestamp and its fallback
+actor handle, instead of each command carrying its own copy. This module
+is the home for them, not pinax.sync, because pinax.sync and pinax.fold
+are the two modules a source gate (tests/test_sync_sequence.py) checks for
+a clock read; every command already imports from this module for
+warn_if_log_ignored, so no new import path is needed to reach them here.
 """
 from __future__ import annotations
 
@@ -17,12 +26,28 @@ import shutil
 import subprocess
 import sys
 
-from .fold import fold, read_raw_events, _sort_key
+from .fold import (
+    DEFAULT_CLAIM_EXPIRY_HOURS,
+    claim_expiry_policy_hours,
+    fold,
+    read_raw_events,
+    _sort_key,
+)
 from .replay import ReplayRefError, read_raw_events_at_ref
+
+# pinax.sync imports pinax.projection, which imports pinax.commands.dep,
+# which imports this module for default_actor/utc_now_iso/
+# warn_if_log_ignored -- a top-level "from .sync import ..." here would
+# close that back into a circular import. unsynced_shard_events is the
+# only user, so the import is deferred to that one function instead.
 
 _TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
-DEFAULT_STALE_HOURS = 24
+# The threshold a repository whose log sets no expiry policy falls back to.
+# The same number the fold expires a claim on, from its one owner there, so
+# a claim this module calls stale is a claim the fold would have expired had
+# the log carried any event to expire it against (ADR-007).
+DEFAULT_STALE_HOURS = DEFAULT_CLAIM_EXPIRY_HOURS
 
 # Statuses that mean the claim trail is NOT dangling:
 # - done/parked: terminal — the trail was closed out.
@@ -32,6 +57,17 @@ _SETTLED_STATUSES = frozenset({"done", "parked", "blocked"})
 
 _DEFAULT_LOG_SUBPATH = ".ergon/log"
 _DEFAULT_ERGON_SUBPATH = ".ergon"
+
+
+def utc_now_iso() -> str:
+    """The current UTC time in the event timestamp format every command mints with."""
+    return datetime.datetime.utcnow().strftime(_TS_FMT)
+
+
+def default_actor() -> str:
+    """The actor handle a command falls back to when none is given explicitly."""
+    import socket
+    return f"operator@{socket.gethostname()}"
 
 
 def hook_resolution_mode() -> str:
@@ -207,6 +243,82 @@ def uncommitted_events(
             }
         )
     return out
+
+
+def unsynced_shard_events(repo_root: str, runner=None) -> dict:
+    """
+    Events committed at HEAD that are not on the remote's default branch,
+    as last fetched - the locally-committed, not-yet-published trail (a
+    command may run offline, or the remote may be briefly unreachable,
+    and still commit locally before it is ever published).
+
+    Distinct from uncommitted_events above: that class is appended but
+    never committed at all; this class is committed to HEAD but its
+    commit has not reached the remote default branch. The two never
+    overlap and the caller reports them as two separate sections.
+
+    Read-only: this never fetches. It reads the remote-tracking ref this
+    repository already has, through the same GitRunner.raw_events_at_ref
+    and _default_branch pinax.sync uses for the publish sequence itself,
+    so "what counts as the remote default branch" is answered in exactly
+    one place. A stale remote-tracking ref under-reports what is still
+    unpublished until the next fetch or push; that is an accepted limit
+    of a diagnosis that never touches the network.
+
+    Returns {"available": bool, "remote_branch": str|None, "events": [...]}
+      - available=False only when the remote branch is published but its
+        committed events could not be read at all (fail-safe: the caller
+        reports the class as unavailable instead of guessing).
+      - remote_branch=None means no remote default branch is published,
+        or there is no origin at all; every HEAD-committed event is then
+        unsynced by definition, so no diff is needed.
+      - events sorted by the fold's total-order key, deduped by id, each
+        shaped like uncommitted_events' entries plus a "shard" path.
+
+    runner is injectable for tests only; production callers pass none.
+    """
+    from .sync import GitRunner, RemoteReadError, _default_branch
+
+    git = runner if runner is not None else GitRunner(repo_root)
+
+    try:
+        head_raw = git.raw_events_at_ref("HEAD")
+    except RemoteReadError:
+        return {"available": False, "remote_branch": None, "events": []}
+    head_events = head_raw or []
+
+    remote_branch = _default_branch(git)
+    remote_ids: set[str] = set()
+    if remote_branch is not None:
+        remote_ref = "refs/remotes/origin/" + remote_branch
+        try:
+            remote_raw = git.raw_events_at_ref(remote_ref)
+        except RemoteReadError:
+            return {"available": False, "remote_branch": remote_branch, "events": []}
+        remote_ids = {e["id"] for e in (remote_raw or []) if e.get("id")}
+
+    seen: set[str] = set()
+    out: list[dict] = []
+    for event in sorted(head_events, key=_sort_key):
+        eid = event.get("id")
+        if eid is None or eid in remote_ids or eid in seen:
+            continue
+        seen.add(eid)
+        shard = event.get("_shard", "")
+        if shard:
+            shard = os.path.relpath(shard, repo_root).replace(os.sep, "/")
+        out.append(
+            {
+                "id": eid,
+                "seq": event.get("seq"),
+                "ts": event.get("ts", ""),
+                "actor": event.get("actor", ""),
+                "type": event.get("type", ""),
+                "item_id": event.get("payload", {}).get("item_id"),
+                "shard": shard,
+            }
+        )
+    return {"available": True, "remote_branch": remote_branch, "events": out}
 
 
 def stale_claims(
@@ -444,11 +556,17 @@ def diagnose(
     repo_root: str,
     log_dir: str,
     now: datetime.datetime,
-    stale_hours: float = DEFAULT_STALE_HOURS,
+    stale_hours: float | None = None,
     legacy_board: str | None = None,
 ) -> dict:
     """
-    Run all three diagnosis classes; read-only.
+    Run every diagnosis class; read-only.
+
+    `stale_hours`: the claim-staleness threshold. When None (the default,
+    and what the command passes unless the operator gave one), it is the
+    expiry policy the log folds to, and DEFAULT_STALE_HOURS when the log
+    sets none - so the threshold and the fold's own expiry read the same
+    number (ADR-007). An explicit value still wins.
 
     `legacy_board`: explicit path (file or dir) enables class 3; when None,
     the conventional frozen legacy location `<repo_root>/board` is checked
@@ -459,14 +577,22 @@ def diagnose(
         "now": <ISO ts of the reference time used>,
         "stale_hours": <threshold>,
         "uncommitted": {"available": bool, "files": [...], "events": [...]},
+        "unsynced": {"available": bool, "remote_branch": str|None, "events": [...]},
         "stale_claims": [...],
         "legacy": {"checked": bool, "path": str|None, "contradictions": [...]},
         "log_tracking": {"available": bool, "ignored": bool, "probe_path": str,
                           "shards_on_disk": int, "shards_tracked": int},
-        "findings": <total finding count across all four classes>,
+        "findings": <total finding count across the classes below>,
       }
+
+    "unsynced" is reported for visibility only and never adds to
+    "findings": a repository legitimately carries committed-but-unpublished
+    work whenever it runs offline, so it is never itself a trail needing
+    repair the way an orphaned uncommitted event is.
     """
     state = fold(log_dir)
+    if stale_hours is None:
+        stale_hours = claim_expiry_policy_hours(state)
 
     files = uncommitted_ergon_files(repo_root)
     if files is None:
@@ -474,6 +600,8 @@ def diagnose(
     else:
         events = uncommitted_events(repo_root, log_dir) if files else []
         uncommitted = {"available": True, "files": files, "events": events}
+
+    unsynced = unsynced_shard_events(repo_root)
 
     claims = stale_claims(state, now, stale_hours)
 
@@ -504,6 +632,7 @@ def diagnose(
         "stale_hours": stale_hours,
         "install_health": install_health(),
         "uncommitted": uncommitted,
+        "unsynced": unsynced,
         "stale_claims": claims,
         "legacy": legacy,
         "log_tracking": log_tracking,

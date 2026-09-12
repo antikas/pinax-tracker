@@ -1,5 +1,5 @@
 """
-pinax next [--json]
+pinax next [--json] [--under ITEM_ID]
 
 Prints the single next item from the ready set, ordered by:
   (phase order, priority tier/rank, -critical_path_depth,
@@ -11,8 +11,12 @@ An explicit item priority (`pinax priority`) outranks
 critical-path depth; absent any priority events, ordering is unchanged.  See
 pinax.fold.compute_next for the full ordering tuple and semantics.
 
---json prints {"item_id": ..., "title": ..., "status": ..., "phase": ...}
-or {"item_id": null} if the ready queue is empty.
+--under ITEM_ID restricts the candidate set to the transitive
+`parent-child` descendants of that item.
+
+--json prints {"item_id": ..., "title": ..., "status": ..., "prefix": ...,
+"under": ...} or {"item_id": null, "under": ...} if the ready queue is
+empty.
 """
 
 from __future__ import annotations
@@ -28,11 +32,16 @@ def run(
     repo_root: str,
     actor: str | None = None,
     as_json: bool = False,
+    under: str | None = None,
 ) -> None:
     """
     Execute pinax next in repo_root.
 
-    Folds the log, computes the ready set, and returns the single next item.
+    Folds the log, computes the ready set, and returns the single next
+    item. `under`, when given, restricts the candidate set to the
+    transitive `parent-child` descendants of that item (see
+    pinax.fold.descendants); an id naming no item in the fold ends this
+    command with a message on stderr and exit 1.
     """
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
@@ -42,11 +51,15 @@ def run(
         sys.exit(1)
 
     state = fold(log_dir)
-    next_id = compute_next(state)
+    try:
+        next_id = compute_next(state, under=under)
+    except ValueError as exc:
+        print(f"pinax: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if as_json:
         if next_id is None:
-            print(json.dumps({"item_id": None}, ensure_ascii=True))
+            result = {"item_id": None, "under": under}
         else:
             item = state.get("items", {}).get(next_id, {})
             result = {
@@ -54,8 +67,9 @@ def run(
                 "title": item.get("title", ""),
                 "status": item.get("status", ""),
                 "prefix": item.get("prefix", ""),
+                "under": under,
             }
-            print(json.dumps(result, sort_keys=True, ensure_ascii=True))
+        print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     else:
         if next_id is None:
             print("pinax: ready queue is empty - no next item.")

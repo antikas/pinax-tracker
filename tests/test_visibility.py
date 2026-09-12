@@ -172,16 +172,21 @@ def test_cli_warns_on_stderr_stdout_clean(tmp_path, command):
     _init_repo(root)
     result = _pinax(root, "init")
     assert result.returncode == 0, result.stderr
+    # 'init' does not commit itself: bring the .ergon base to a clean commit
+    # before any mutating command runs (same discipline as tests/
+    # test_root_guard.py and tests/test_doctor.py).
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "init: pinax ergon base")
+
+    # No follow-up commit here or below: 'add' runs the publish sequence
+    # (pinax/sync.py), which commits the shard and the projection itself
+    # (ADR-006); the working tree is already clean by the time it returns.
     result = _pinax(root, "add", "--title", "seed item", "--actor", "t@h")
     assert result.returncode == 0, result.stderr
-    _git(root, "add", "-A")
-    _git(root, "commit", "-m", "seed")
 
     _git(root, "checkout", "-b", "run/spine")
     result = _pinax(root, "add", "--title", "run-branch item", "--actor", "t@h")
     assert result.returncode == 0, result.stderr
-    _git(root, "add", "-A")
-    _git(root, "commit", "-m", "run-branch event")
     _git(root, "checkout", "main")
 
     result = _pinax(root, *command)
