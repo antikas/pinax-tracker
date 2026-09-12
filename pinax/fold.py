@@ -6,10 +6,12 @@ items, phases, typed dependency edges, registry entries, notes, priorities,
 claims, and annulment records without consulting time, randomness, locale, or
 hash iteration order.
 
-Claims are reconciled from the ordered stream. Dependencies use last-write-wins
-semantics under the same total order. Readiness uses `blocks` edges and next-item
-selection combines phase order, explicit priority, critical-path depth, age, and
-item id.
+Claims are reconciled from the ordered stream, and a claim ends where the log
+says it ends: at a release for its item, or at the first event past the expiry
+policy in force for it. Both are read from event timestamps, never from a clock.
+Dependencies use last-write-wins semantics under the same total order. Readiness
+uses `blocks` edges and next-item selection combines phase order, explicit
+priority, critical-path depth, age, and item id.
 
 An `event.annulled` record identifies one hash-valid event by id. Annulment
 suppresses that target's handler effects and integrity warning while retaining
@@ -18,6 +20,7 @@ suppress any target.
 """
 from __future__ import annotations
 
+import datetime
 import glob
 import json
 import logging
@@ -25,9 +28,27 @@ import os
 from collections import OrderedDict, defaultdict
 from typing import Iterator
 
-from .event import parse_line, valid_annulment, verify_id
+from .event import (
+    declared_expiry_hours,
+    parse_line,
+    released_item,
+    valid_annulment,
+    verify_id,
+)
 
 logger = logging.getLogger(__name__)
+
+# The claim expiry a repository runs on until a policy event sets another.
+# The one place the number lives: the fold's expiry rule and the diagnosis
+# command's staleness threshold both read it from here.
+DEFAULT_CLAIM_EXPIRY_HOURS = 24
+
+# Statuses that mark an item as actively mid build-cycle: being built, in
+# blind review, or under adjudication. The one place the set lives: the
+# status view's building bucket and the parent-child roll-up's child
+# classification below both read it from here, so a build-cycle stage added
+# or renamed in one place is seen by both readers.
+BUILDING_STATUSES = frozenset({"building", "blind-verify", "adjudicate"})
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +512,51 @@ def _handle_item_claimed(state: dict, event: dict) -> None:
     pending.setdefault(item_id, []).append(event)
 
 
+def _handle_item_claim_released(state: dict, event: dict) -> None:
+    """
+    Record an item.claim_released event.
+
+    Collects the releases for each item into state["_pending_releases"] so
+    that _reconcile_claims() can end the claim that was live when the
+    release was recorded, after the full event stream has been folded. Like
+    a claim, a release changes nothing here: the walk over the claim order
+    is the one place a claim starts and ends.
+
+    A record whose payload is not a release (see event.released_item: an
+    item and a non-empty reason) ends nothing and is warned about once.
+    """
+    item_id = released_item(event)
+    if item_id is None:
+        logger.warning(
+            "item.claim_released event without an item and a reason: %s",
+            event.get("id"),
+        )
+        return
+    pending = state.setdefault("_pending_releases", {})
+    pending.setdefault(item_id, []).append(event)
+
+
+def _handle_policy_claim_expiry_set(state: dict, event: dict) -> None:
+    """
+    Record a policy.claim_expiry_set event.
+
+    The event is repository-level: it names no item and applies to every
+    claim from its own position in claim order onward. Collected into
+    state["_pending_policies"] for _reconcile_claims(), which resolves both
+    the policy in force for each claim and the repository's current policy.
+
+    A record that declares no positive number of hours (see
+    event.declared_expiry_hours) sets no policy and is warned about once.
+    """
+    if declared_expiry_hours(event) is None:
+        logger.warning(
+            "policy.claim_expiry_set event without a positive hours value: %s",
+            event.get("id"),
+        )
+        return
+    state.setdefault("_pending_policies", []).append(event)
+
+
 def _handle_item_blocked(state: dict, event: dict) -> None:
     """
     Apply item.blocked to an item's status — sets status='blocked' and gate.
@@ -873,6 +939,8 @@ _HANDLERS = {
     "item.created": _handle_item_created,
     "item.status_changed": _handle_item_status_changed,
     "item.claimed": _handle_item_claimed,
+    "item.claim_released": _handle_item_claim_released,
+    "policy.claim_expiry_set": _handle_policy_claim_expiry_set,
     "item.blocked": _handle_item_blocked,
     "item.completed": _handle_item_completed,
     "item.parked": _handle_item_parked,
@@ -897,39 +965,231 @@ def _claim_sort_key(event: dict) -> tuple:
     ts is the primary key (wall-clock-first — ADR-003 is explicit that claim
     is wall-clock-first, NOT seq-first).  actor and id are tiebreakers.
     This is DIFFERENT from the fold total-order key (seq, ts, actor, id).
+
+    ADR-007 orders release and policy events against claims in this same
+    order, so every event the claim rules compare is keyed here and nowhere
+    else.  Missing envelope fields read as the empty string rather than
+    raising: the key orders whatever the log holds, and integrity checking
+    belongs to finalise_events.
     """
-    return (event["ts"], event["actor"], event["id"])
+    return (event.get("ts", ""), event.get("actor", ""), event.get("id", ""))
 
 
-def _reconcile_claims(state: dict) -> None:
+def _resolve_expiry_policy(state: dict, policy_events: list[dict]) -> None:
     """
-    Fold-time claim reconciliation (ADR-003).
+    Build state["policy"] from the repository-level policy events (ADR-007).
 
-    After the full event stream has been folded, resolve any double-claims.
-    For each item with multiple item.claimed events:
-    - The earliest by (ts, actor, id) wins → sets items[id]["owner"].
-    - Every later claim produces a claim.superseded outcome stored in
-      state["claim_superseded"] (a list of dicts, each with item_id,
-      superseded_event_id, superseded_actor, winner_event_id, winner_actor).
-    - A report warning is added for each superseded claim.
+    The repository's current expiry is the LAST policy event in claim order.
+    That is a different question from the policy in force for one claim
+    (_expiry_hours_in_force), which reads the last policy event at or before
+    that claim; this one is what the repository runs on now and what the
+    diagnosis command's threshold defaults to.
+
+    Only set when the log carries at least one well-formed policy event, so
+    a log without one produces no "policy" key at all.
+    """
+    if not policy_events:
+        return
+    latest = policy_events[-1]
+    state["policy"] = {
+        "claim_expiry_hours": declared_expiry_hours(latest),
+        "set_at": latest["ts"],
+        "set_by": latest["actor"],
+        "event_id": latest["id"],
+    }
+
+
+def claim_expiry_policy_hours(state: dict) -> float:
+    """
+    The claim expiry the folded repository runs on, in hours (ADR-007).
+
+    The folded policy when the log carries one, and
+    DEFAULT_CLAIM_EXPIRY_HOURS otherwise.  The one place that question is
+    answered from fold state: the diagnosis command's staleness threshold
+    defaults to it so the threshold and the fold's own expiry read the same
+    number.
+    """
+    policy = state.get("policy")
+    if isinstance(policy, dict):
+        hours = policy.get("claim_expiry_hours")
+        if isinstance(hours, (int, float)) and not isinstance(hours, bool):
+            return hours
+    return DEFAULT_CLAIM_EXPIRY_HOURS
+
+
+def _expiry_hours_in_force(policy_events: list[dict], claim_key: tuple) -> float:
+    """
+    The expiry policy in force for one claim, in hours (ADR-007).
+
+    The last policy event at or before that claim in claim order, and
+    DEFAULT_CLAIM_EXPIRY_HOURS when the log carries none before it.  The one
+    place that lookup happens.  `policy_events` arrives sorted in claim
+    order and holds only well-formed policy events, so the walk stops at the
+    first event past the claim.
+
+    Pure: the comparison is between recorded keys, so a policy set later
+    never changes how an earlier claim folds, on any machine or at any
+    replayed commit.
+    """
+    hours: float = DEFAULT_CLAIM_EXPIRY_HOURS
+    for event in policy_events:
+        if _claim_sort_key(event) > claim_key:
+            break
+        hours = declared_expiry_hours(event)
+    return hours
+
+
+def _claim_end(
+    claim: dict,
+    item_releases: list[dict],
+    timeline: list[dict],
+    timeline_ts: list,
+    policy_events: list[dict],
+) -> dict | None:
+    """
+    Where a live claim ends in claim order, or None while it still holds.
+
+    A claim ends at the EARLIER of two points (ADR-007):
+      - the first item.claim_released for its item after it, or
+      - the first event of any type after it whose timestamp is at or past
+        the claim's own timestamp plus the policy in force for that claim.
+
+    Returns {"kind": "released"|"expired", "key": <claim-order key>,
+    "event": <the ending event>, "hours": <policy in force, expiry only>}.
+
+    `timeline` is every event the fold applied, in claim order, and
+    `timeline_ts` holds each one's parsed timestamp (None when it does not
+    parse) at the same index.  Because the timeline is ordered by ts first,
+    the first entry at or past the deadline is the first such event in claim
+    order, and its ts is later than the claim's own, so it always sits after
+    the claim.
+
+    The expiry compares one recorded timestamp with another: the log's
+    events are its clock.  A claim whose own timestamp does not parse never
+    expires here, the same way an unparseable claim age is reported as
+    unknown rather than guessed.
+
+    Pure: no wall-clock, no RNG, no iteration-order dependence.
+    """
+    claim_key = _claim_sort_key(claim)
+    ends: list[dict] = []
+
+    for release in item_releases:
+        key = _claim_sort_key(release)
+        if key > claim_key:
+            ends.append({"kind": "released", "key": key, "event": release})
+            break
+
+    hours = _expiry_hours_in_force(policy_events, claim_key)
+    claimed_at = _parse_event_ts(claim.get("ts", ""))
+    if claimed_at is not None:
+        deadline = claimed_at + datetime.timedelta(hours=hours)
+        for event, moment in zip(timeline, timeline_ts):
+            if moment is None or moment < deadline:
+                continue
+            key = _claim_sort_key(event)
+            if key > claim_key:
+                ends.append(
+                    {"kind": "expired", "key": key, "event": event, "hours": hours}
+                )
+            break
+
+    if not ends:
+        return None
+    # The release is collected first, so a release that is itself the first
+    # event past the deadline ends the claim as a release: the reason a
+    # person recorded is not lost to an expiry that landed on the same
+    # event.
+    return min(ends, key=lambda end: end["key"])
+
+
+def _record_claim_end(state: dict, item_id: str, claim: dict, end: dict) -> None:
+    """
+    Record how one claim ended, in state["claim_released"] or
+    state["claim_expired"] (ADR-007).
+
+    The one place either outcome is written.  Each entry names the claim it
+    ended, the actor that held it, and the event that ended it, so a reader
+    can see from the fold alone why an item came free.  Only created when
+    something actually ended, so a log with no release and no expiry
+    produces neither key.
+    """
+    ending = end["event"]
+    entry = {
+        "item_id": item_id,
+        "claim_event_id": claim["id"],
+        "claim_actor": claim["actor"],
+        "claimed_at": claim["ts"],
+    }
+    if end["kind"] == "released":
+        entry.update(
+            {
+                "release_event_id": ending["id"],
+                "release_actor": ending["actor"],
+                "released_at": ending["ts"],
+                "reason": ending.get("payload", {}).get("reason", ""),
+            }
+        )
+        state.setdefault("claim_released", []).append(entry)
+        return
+    entry.update(
+        {
+            "expiry_hours": end["hours"],
+            "expired_at": ending["ts"],
+            "expiring_event_id": ending["id"],
+        }
+    )
+    state.setdefault("claim_expired", []).append(entry)
+
+
+def _reconcile_claims(state: dict, timeline: list[dict]) -> None:
+    """
+    Fold-time claim reconciliation (ADR-003), with release and expiry
+    (ADR-007).
+
+    After the full event stream has been folded, walk each item's claims in
+    claim order `(ts, actor, id)` keeping ONE live claim at a time:
+    - The first claim is live: it sets items[id]["owner"],
+      ["claimed_at"] and ["claim_event_id"].
+    - A claim that arrives while another is live produces a claim.superseded
+      outcome stored in state["claim_superseded"] (a list of dicts, each with
+      item_id, superseded_event_id, superseded_actor, winner_event_id,
+      winner_actor) and a report warning.
+    - A live claim ends where _claim_end() says it does: released, or expired
+      against the policy in force. The end is recorded in
+      state["claim_released"] or state["claim_expired"], the three fields
+      above are left unset, and the item's status is untouched. The next
+      claim after that point is live in its turn, so a released or expired
+      item is claimable again and its next claim wins.
+
+    `timeline` is every event the fold applied, in claim order: the expiry
+    reads it to find the first event past a claim's deadline.
 
     This is:
-    - ORDER-INDEPENDENT: we sort the accumulated claim events by (ts, actor, id)
-      regardless of the order they appeared in the event stream.
+    - ORDER-INDEPENDENT: every list is sorted by claim order here, regardless
+      of the order the events appeared in the stream.
     - IDEMPOTENT: the input is the already-deduped event stream; re-running
       _reconcile_claims on the same state produces the same result.
-    - PURE: no wall-clock, no RNG — deterministic from the event content alone.
+    - PURE: no wall-clock, no RNG: deterministic from the event content
+      alone. The expiry compares recorded timestamps with recorded
+      timestamps.
 
-    Items with exactly one claim: owner set, no superseded.
+    Items with exactly one live claim: owner set, no superseded.
     Items with zero claims: no owner field set (unowned).
     """
     pending = state.pop("_pending_claims", {})
+    releases = state.pop("_pending_releases", {})
+    policy_events = sorted(state.pop("_pending_policies", []), key=_claim_sort_key)
+    # The repository's current policy is folded even when no item was ever
+    # claimed: the diagnosis command's threshold reads it either way.
+    _resolve_expiry_policy(state, policy_events)
     if not pending:
         return
 
     items = state.setdefault("items", {})
     superseded_list = state.setdefault("claim_superseded", [])
     warnings = state.setdefault("report", {}).setdefault("warnings", [])
+    timeline_ts = [_parse_event_ts(event.get("ts", "")) for event in timeline]
 
     for item_id, claim_events in pending.items():
         if item_id not in items:
@@ -940,14 +1200,38 @@ def _reconcile_claims(state: dict) -> None:
 
         # Sort by (ts, actor, id) — ADR-003 claim order.
         sorted_claims = sorted(claim_events, key=_claim_sort_key)
+        item_releases = sorted(releases.get(item_id, []), key=_claim_sort_key)
 
-        winner = sorted_claims[0]
-        items[item_id]["owner"] = winner["actor"]
-        items[item_id]["claimed_at"] = winner["ts"]
-        items[item_id]["claim_event_id"] = winner["id"]
+        live: dict | None = None
+        end: dict | None = None
+        losers: list[tuple[dict, dict]] = []
+        for claim in sorted_claims:
+            claim_key = _claim_sort_key(claim)
+            if live is not None and end is not None and claim_key >= end["key"]:
+                # The live claim ended before this one was made, so this
+                # claim is not competing with it.
+                _record_claim_end(state, item_id, live, end)
+                live, end = None, None
+            if live is None:
+                live = claim
+                end = _claim_end(
+                    claim, item_releases, timeline, timeline_ts, policy_events
+                )
+                continue
+            losers.append((claim, live))
 
-        # Every subsequent claim is superseded.
-        for loser in sorted_claims[1:]:
+        if live is not None and end is not None:
+            _record_claim_end(state, item_id, live, end)
+            live = None
+
+        if live is not None:
+            items[item_id]["owner"] = live["actor"]
+            items[item_id]["claimed_at"] = live["ts"]
+            items[item_id]["claim_event_id"] = live["id"]
+
+        # Every claim that arrived while another was live is superseded by
+        # the claim that was live at that moment.
+        for loser, winner in losers:
             superseded_entry = {
                 "item_id": item_id,
                 "superseded_event_id": loser["id"],
@@ -967,6 +1251,49 @@ def _reconcile_claims(state: dict) -> None:
     # Clean up empty report if no warnings were added by other code.
     # (We leave report.warnings as an empty list if no warnings — the field is
     # expected by the double-claim test even when there are superseded claims.)
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+_CLAIM_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _parse_event_ts(ts: str) -> datetime.datetime | None:
+    """
+    One event timestamp, read in the form every command mints with, or None
+    when it does not parse.
+
+    The one place this module turns a recorded timestamp into a value it can
+    do arithmetic on: the claim age below and the expiry rule above both go
+    through it. Reading recorded text is not a clock read; nothing here asks
+    the machine what time it is.
+    """
+    try:
+        return datetime.datetime.strptime(ts, _CLAIM_TS_FMT)
+    except (TypeError, ValueError):
+        return None
+
+
+def claim_age_hours(claimed_at: str, now: datetime.datetime) -> float | None:
+    """
+    Hours between `now` and `claimed_at` (an event timestamp in the format
+    every command mints with), rounded to one decimal place.
+
+    `now` is supplied by the caller on every call - this function never
+    reads the wall clock itself; no clock read belongs in this module.
+    `pinax status` reads the reference time once, in the clock helper
+    statusview already threads through the whole command, and passes that
+    one value into every claim age it reports, so two ages computed in the
+    same command run are never split across two different reference times.
+
+    Returns None when `claimed_at` does not parse - an unparseable
+    timestamp is a visible gap in the report, not a silently wrong age.
+    """
+    parsed = _parse_event_ts(claimed_at)
+    if parsed is None:
+        return None
+    return round((now - parsed).total_seconds() / 3600.0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1263,6 +1590,54 @@ def _strongly_connected_cycle_nodes(deps: set) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Ancestor scoping (parent-child descendants)
+# ---------------------------------------------------------------------------
+
+def descendants(state: dict, ancestor_id: str) -> set[str]:
+    """
+    The set of item ids reachable from ancestor_id by one or more
+    transitive `parent-child` edges (from_id=parent -> to_id=child).  Does
+    NOT include ancestor_id itself.
+
+    `pinax ready --under`, `pinax next --under` and `pinax status --under`
+    all read this one walk (SSOT): each filters its own output against the
+    returned set and never re-walks parent-child edges on its own.
+
+    Raises ValueError when ancestor_id names no item in state["items"] - a
+    closed refusal the calling command turns into a message and a non-zero
+    exit; nothing is appended either way, since ready/next/status are
+    read-only commands to begin with.
+
+    Cycle-safe: a single visited set stops the walk from revisiting a node
+    reached by more than one path, so a parent-child cycle (already warned
+    separately by fold_events, see _detect_parent_child_cycles) cannot hang
+    this walk.
+
+    Pure: no wall-clock, no RNG, no PYTHONHASHSEED dependence - the result
+    is a set, so the order edges are visited in never affects membership.
+    """
+    items = state.get("items", {})
+    if ancestor_id not in items:
+        raise ValueError(f"unknown ancestor item '{ancestor_id}'")
+
+    children_of: dict[str, set[str]] = defaultdict(set)
+    for (from_id, to_id) in state.get("edges", {}).get("parent-child", set()):
+        children_of[from_id].add(to_id)
+
+    found: set[str] = set()
+    visited: set[str] = {ancestor_id}
+    frontier: list[str] = [ancestor_id]
+    while frontier:
+        node = frontier.pop()
+        for child in children_of.get(node, set()):
+            if child not in visited:
+                visited.add(child)
+                found.add(child)
+                frontier.append(child)
+    return found
+
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
 # Statuses that make an item ineligible for the ready set.
@@ -1273,32 +1648,51 @@ _INELIGIBLE_STATUSES = frozenset({"blocked", "parked", "building", "done",
 _CANDIDATE_STATUSES = frozenset({"queued", "ready"})
 
 
-def compute_ready(state: dict) -> list[str]:
+def compute_ready(state: dict, under: str | None = None) -> list[str]:
     """
     Compute the deterministic set of ready item IDs.
 
     An item is ready iff:
     1. Its status is 'queued' or 'ready'.
     2. It is NOT in any _INELIGIBLE_STATUSES (redundant with #1 but explicit).
-    3. All items that BLOCK it (i.e. from_id blocks it) are status='done'.
+    3. It carries no live claim: state["items"][id]["owner"] is unset. A
+       reconciled claim (ADR-003) makes an item ineligible on every machine
+       that folds it, from the moment the fold sees the winning
+       item.claimed event, regardless of the item's status field - a claim
+       and a status change are two different events, so an item can be
+       claimed while still 'queued'. Claim release and expiry are a later
+       item's concern; today a claim holds an item until it is marked
+       done or parked, same as any other candidate status.
+    4. All items that BLOCK it (i.e. from_id blocks it) are status='done'.
        If from_id is not known to the fold, it is treated as NOT done (conservative).
-    4. The dep graph has no cycles that involve this item (cycles are warned and
+    5. The dep graph has no cycles that involve this item (cycles are warned and
        the item is excluded from the ready set).
 
-    Returns a SORTED list of item IDs (sorted for determinism — no set-iteration
+    `under`, when given, restricts the candidate set to the transitive
+    `parent-child` descendants of that item (see descendants()); an id
+    naming no item raises ValueError, propagated from descendants().
+    Cycle detection and the blocks-edge rule above are still evaluated over
+    the FULL graph before this restriction is applied - a blocks edge may
+    legitimately cross a scope boundary (one use case's segment blocking on
+    another use case's product) - only the final candidate item is
+    required to fall inside the scope.
+
+    Returns a SORTED list of item IDs (sorted for determinism - no set-iteration
     order dependence).  The sort is by id string (lexicographic); callers that
     need a different order apply their own sort (e.g. compute_next).
 
     Side effect: if cycles are detected, a WARNING is emitted via the logger and
     a "deps_cycle_warning" list is added to state["report"]["warnings"].  The
-    function NEVER hangs — cycle detection is finite (iterative DFS).
+    function NEVER hangs - cycle detection is finite (iterative DFS).
 
     Pure: no wall-clock, no RNG, no PYTHONHASHSEED dependence.
     """
     items = state.get("items", {})
     deps: set = state.get("deps", set())
 
-    # Detect cycles — warn but do not hang.
+    scope: set[str] | None = descendants(state, under) if under is not None else None
+
+    # Detect cycles - warn but do not hang.
     cycles = _detect_dep_cycles(deps, items)
     cycle_nodes: set[str] = set()
     if cycles:
@@ -1318,8 +1712,14 @@ def compute_ready(state: dict) -> list[str]:
 
     ready_ids: list[str] = []
     for item_id, item in items.items():
+        if scope is not None and item_id not in scope:
+            # Outside the requested ancestor's descendants - not a candidate.
+            continue
         status = item.get("status", "queued")
         if status not in _CANDIDATE_STATUSES:
+            continue
+        if item.get("owner"):
+            # A live claim: ineligible on every machine until it is settled.
             continue
         if item_id in cycle_nodes:
             # Exclude items involved in a dep cycle.
@@ -1476,21 +1876,26 @@ def _compute_critical_path_depths(state: dict) -> dict[str, int]:
     return depth_memo
 
 
-def compute_next(state: dict) -> str | None:
+def compute_next(state: dict, under: str | None = None) -> str | None:
     """Return the highest-ranked ready item, or None when none is ready.
 
     Items are ordered by phase opening sequence, explicit item priority,
     negated `blocks`-path depth, creation metadata, and id. Readiness itself
     is determined separately by `compute_ready` and uses only `blocks` edges.
+
+    `under` is passed straight through to `compute_ready` (see there for the
+    scoping and unknown-ancestor contract) - this function applies no
+    second scope check of its own; it just picks the winner from whatever
+    candidate set `compute_ready` returns.
     """
-    ready_ids = compute_ready(state)
+    ready_ids = compute_ready(state, under=under)
     if not ready_ids:
         return None
 
     items = state.get("items", {})
 
     # Derive phase ordering from state["phases"] sorted by
-    # (opened_seq, opened_at, opened_by) — seq is the total-order primary key.
+    # (opened_seq, opened_at, opened_by) - seq is the total-order primary key.
     # Missing sequence values use zero for a deterministic fallback.
     phases = state.get("phases", {})
     sorted_phase_names = sorted(
@@ -1541,6 +1946,169 @@ def compute_next(state: dict) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Parent-child roll-up (post-pass, after claim reconciliation and the
+# release/expiry pass)
+# ---------------------------------------------------------------------------
+
+def _child_effective_state(child_id: str, items: dict, rollups: dict[str, str]) -> str:
+    """
+    The state a parent's roll-up sees for one direct child: "done",
+    "building", "blocked", or "queued".
+
+    When the child itself carries a roll-up (already resolved in
+    `rollups` because the child has its own children), that roll-up IS
+    the child's effective state -- the child's own status and claim are
+    not separately consulted. This is what makes a parent of parents
+    roll up correctly: a grandchild reaches its grandparent through the
+    child's own already-resolved bucket, never by re-reading raw status
+    a second time.
+
+    A leaf child (no roll-up of its own) is classified from its own
+    fold state: done by status, building by a live claim (owner set,
+    reconciled above) or a build-cycle status (BUILDING_STATUSES),
+    blocked by status, queued otherwise.
+
+    A child id absent from state["items"] (its own creating event was
+    itself annulled) has no status to read; it is classified "queued"
+    here, which keeps it out of both "every child done" and "any child
+    building" -- see _child_is_open for how it is excluded from the
+    open set too.
+    """
+    if child_id in rollups:
+        return rollups[child_id]
+    item = items.get(child_id)
+    if item is None:
+        return "queued"
+    status = item.get("status", "queued")
+    if status == "done":
+        return "done"
+    if item.get("owner") or status in BUILDING_STATUSES:
+        return "building"
+    if status == "blocked":
+        return "blocked"
+    return "queued"
+
+
+def _child_is_open(child_id: str, items: dict, rollups: dict[str, str]) -> bool:
+    """
+    Whether a child counts as "open" for the blocked bucket's "every open
+    child is blocked" rule: not done and not annulled.
+
+    A child with its own roll-up is open unless that roll-up is "done" --
+    a roll-up is never "annulled" (only a leaf's own status field ever
+    reads that literal value), so the annulled exemption only ever
+    applies to a leaf child. A child id absent from state["items"] is
+    treated the same as an annulled child: neither is something a parent
+    can ever be said to be waiting on.
+    """
+    if child_id in rollups:
+        return rollups[child_id] != "done"
+    item = items.get(child_id)
+    if item is None:
+        return False
+    status = item.get("status", "queued")
+    return status not in ("done", "annulled")
+
+
+def _rollup_bucket(children: set, items: dict, rollups: dict[str, str]) -> str:
+    """
+    The roll-up bucket for one parent, given its direct children and every
+    child-that-is-itself-a-parent's own bucket already resolved in
+    `rollups`.
+
+    Precedence matches the acceptance rule's own listed order: done first
+    (every child done), then building (any child claimed or building),
+    then blocked (every open child blocked, and at least one child is
+    open -- a parent with no open child at all, because every child is
+    done or annulled but not literally every child done, reads as
+    queued rather than a vacuous blocked), else queued.
+
+    Pure: children are always walked in sorted order so the result never
+    depends on set-iteration order, though the bucket itself (a
+    precedence chain over booleans) does not depend on child order
+    either way.
+    """
+    ordered = sorted(children)
+    child_states = [_child_effective_state(c, items, rollups) for c in ordered]
+
+    if child_states and all(s == "done" for s in child_states):
+        return "done"
+    if any(s == "building" for s in child_states):
+        return "building"
+    open_children = [c for c in ordered if _child_is_open(c, items, rollups)]
+    if open_children and all(
+        _child_effective_state(c, items, rollups) == "blocked" for c in open_children
+    ):
+        return "blocked"
+    return "queued"
+
+
+def _compute_rollups(state: dict) -> dict[str, str]:
+    """
+    Compute the roll-up bucket for every item that has at least one direct
+    child through a `parent-child` edge (state["edges"]["parent-child"],
+    already resolved by _resolve_dep_ops above).
+
+    Runs after _reconcile_claims: "claimed" reads state["items"][id]["owner"]
+    as reconciliation and the release/expiry pass above leave it, so a
+    released or expired claim is never read as a live one here.
+
+    An item on a parent-child cycle carries no roll-up. _detect_parent_child_cycles
+    already warns about the cycle (called earlier in fold_events); a
+    roll-up computed by walking through a cycle is not a well-defined
+    function of a finite child set, the same reasoning that excludes a
+    node on a blocks cycle from the critical-path depth walk
+    (_strongly_connected_cycle_nodes, reused here unchanged for the
+    parent-child edge set) rather than assigning it a guessed value.
+
+    Returns item_id -> bucket for exactly the items with a well-defined
+    roll-up (children_of has at least one entry and the item is not on a
+    cycle); an item with no children, or on a cycle, is simply absent.
+
+    Iterative post-order: a parent's bucket needs every child-that-is-
+    itself-a-parent's bucket resolved first, walked without recursion (the
+    same discipline _compute_critical_path_depths uses) so an arbitrarily
+    deep hierarchy cannot hit Python's recursion limit. Order-independent
+    and idempotent: re-running on the same state produces the same
+    mapping, and a node reached through more than one path (a diamond,
+    not a tree) is simply resolved once and skipped on every later visit.
+    """
+    items = state.get("items", {})
+    pc_edges = state.get("edges", {}).get("parent-child", set())
+    if not pc_edges:
+        return {}
+
+    children_of: dict[str, set[str]] = defaultdict(set)
+    for (from_id, to_id) in pc_edges:
+        children_of[from_id].add(to_id)
+
+    cyclic = _strongly_connected_cycle_nodes(pc_edges)
+
+    rollups: dict[str, str] = {}
+
+    for root in sorted(children_of.keys()):
+        if root in rollups or root in cyclic:
+            continue
+        stack: list[str] = [root]
+        while stack:
+            node = stack[-1]
+            if node in rollups:
+                stack.pop()
+                continue
+            pending = [
+                c for c in sorted(children_of.get(node, set()))
+                if c in children_of and c not in cyclic and c not in rollups
+            ]
+            if pending:
+                stack.extend(pending)
+                continue
+            rollups[node] = _rollup_bucket(children_of[node], items, rollups)
+            stack.pop()
+
+    return rollups
+
+
+# ---------------------------------------------------------------------------
 # Public fold API
 # ---------------------------------------------------------------------------
 
@@ -1557,7 +2125,8 @@ def fold_events(events: list[dict]) -> dict:
 
     Before claim reconciliation, runs
     _resolve_dep_ops() to build state["deps"] via last-write-wins by total-order
-    key.  Private keys (_dep_ops, _pending_claims) are consumed by their
+    key.  Private keys (_dep_ops, _pending_claims, _pending_releases,
+    _pending_policies) are consumed by their
     respective post-passes and are not present in the returned state.
     compute_ready() and compute_next() derive all ordering from the public fold
     state (state["phases"], state["items"], state["deps"]) — no private keys.
@@ -1573,6 +2142,11 @@ def fold_events(events: list[dict]) -> dict:
     """
     state: dict = {}
     annulled_ids = _collect_annulled_ids(events)
+    # Every event whose effects the fold actually applies, collected here and
+    # handed to _reconcile_claims in claim order: a claim expires against the
+    # log's own events (ADR-007), and an event whose effects are suppressed
+    # never was one of them.
+    applied: list[dict] = []
 
     for event in events:
         etype = event.get("type", "")
@@ -1581,6 +2155,7 @@ def fold_events(events: list[dict]) -> dict:
             # Raw bytes stay in the shard untouched; only fold-time application
             # of THIS specific event's handler is skipped.
             continue
+        applied.append(event)
         handler = _HANDLERS.get(etype)
         if handler:
             handler(state, event)
@@ -1605,7 +2180,17 @@ def fold_events(events: list[dict]) -> dict:
                 logger.warning(msg)
                 warnings.append(msg)
 
-    _reconcile_claims(state)
+    _reconcile_claims(state, sorted(applied, key=_claim_sort_key))
+
+    # Roll-up runs last: a post-pass over the fully reconciled state, after
+    # claims (and their release/expiry) and the parent-child edges are both
+    # settled, so "claimed" and "child" here read the same state every
+    # other reader of this fold sees. Additive only: an item's own "status"
+    # key is never touched, only a new "rollup" key is added.
+    items = state.get("items", {})
+    for item_id, bucket in _compute_rollups(state).items():
+        if item_id in items:
+            items[item_id]["rollup"] = bucket
 
     return state
 

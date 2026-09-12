@@ -12,11 +12,22 @@ import datetime
 import os
 import subprocess
 
-from .fold import compute_next, compute_ready, fold
+from .fold import (
+    BUILDING_STATUSES,
+    claim_age_hours,
+    compute_next,
+    compute_ready,
+    descendants,
+    fold,
+)
 from .visibility import unmerged_tracker_refs
 
 _SCHEMA = "pinax.status.v1"
-_BUILDING_STATUSES = frozenset({"building", "blind-verify", "adjudicate"})
+# Statuses where a claim is no longer "live" for display purposes even if
+# state["items"][id]["owner"] is still set - the item has moved past being
+# actively worked (done) or is explicitly gated pending a human (parked,
+# blocked); either way it belongs in its own bucket below, not "building".
+_CLAIM_SETTLED_STATUSES = frozenset({"done", "parked", "blocked"})
 _TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -108,6 +119,7 @@ def _summarise_repo(
     since_days: int | None,
     all_branches: bool,
     now: datetime.datetime,
+    under: str | None = None,
 ) -> dict:
     root = os.path.abspath(os.path.expanduser(repo_root))
     log_dir = os.path.join(root, ".ergon", "log")
@@ -144,6 +156,13 @@ def _summarise_repo(
     items: dict = state.get("items", {})
     base["notices"] = _notice_count(state)
 
+    # `under`, when given, restricts every list below (building, shipped,
+    # parked) and the next/queue_depth figures to the transitive
+    # parent-child descendants of that item. Raises ValueError on an
+    # unknown ancestor - propagated to status_view()'s caller, which
+    # already turns a ValueError into a message and a non-zero exit.
+    scope: set[str] | None = descendants(state, under) if under is not None else None
+
     building = []
     shipped_recent = []
     shipped_earlier = 0
@@ -152,21 +171,40 @@ def _summarise_repo(
     threshold = None if since_days is None else now - datetime.timedelta(days=since_days)
 
     for item_id in sorted(items):
+        if scope is not None and item_id not in scope:
+            continue
         item = items[item_id]
         status = item.get("status", "queued")
         title = item.get("title", "")
+        owner = item.get("owner")
         changed_at = item.get("status_changed_at", item.get("created_at", ""))
 
-        if status in _BUILDING_STATUSES:
-            building.append(
-                {
-                    "id": item_id,
-                    "title": title,
-                    "stage": status,
-                    "owner": item.get("owner", ""),
-                    "since": changed_at,
-                }
-            )
+        # A live claim puts the item in the building list even before its
+        # status field itself moves to 'building' - a claim and a status
+        # change are two different events (see fold.compute_ready).
+        claimed_active = bool(owner) and status not in _CLAIM_SETTLED_STATUSES
+        if status in BUILDING_STATUSES or claimed_active:
+            claimed_at = item.get("claimed_at", "")
+            # An owned row is labelled by when the claim was made, not by
+            # status_changed_at/created_at: age_hours is computed from the
+            # same claimed_at, so the row reads one way instead of pairing
+            # a creation time with a claim age. A building row with no
+            # owner (status forced to 'building' without ever being
+            # claimed) keeps the status/creation fallback -- it has no
+            # claimed_at to show.
+            row = {
+                "id": item_id,
+                "title": title,
+                "stage": status,
+                "owner": owner or "",
+                "since": claimed_at if owner else changed_at,
+                "age_hours": claim_age_hours(claimed_at, now) if owner else None,
+            }
+            # rollup is additive: present only on an item that carries one
+            # (see fold._compute_rollups) - a leaf item's row is unchanged.
+            if item.get("rollup"):
+                row["rollup"] = item["rollup"]
+            building.append(row)
         elif status == "done":
             entry = {
                 "id": item_id,
@@ -174,31 +212,34 @@ def _summarise_repo(
                 "done_at": changed_at,
                 "actor": item.get("status_changed_by", ""),
             }
+            if item.get("rollup"):
+                entry["rollup"] = item["rollup"]
             parsed = _parse_ts(changed_at)
             if threshold is None or (parsed is not None and parsed >= threshold):
                 shipped_recent.append(entry)
             else:
                 shipped_earlier += 1
         elif status in ("parked", "blocked"):
-            parked.append(
-                {
-                    "id": item_id,
-                    "title": title,
-                    "kind": status,
-                    "reason": (
-                        item.get("park_reason", "")
-                        if status == "parked"
-                        else item.get("gate", "")
-                    ),
-                }
-            )
+            row = {
+                "id": item_id,
+                "title": title,
+                "kind": status,
+                "reason": (
+                    item.get("park_reason", "")
+                    if status == "parked"
+                    else item.get("gate", "")
+                ),
+            }
+            if item.get("rollup"):
+                row["rollup"] = item["rollup"]
+            parked.append(row)
 
     building.sort(key=lambda it: (it.get("since", ""), it["id"]))
     shipped_recent.sort(key=lambda it: (it.get("done_at", ""), it["id"]), reverse=True)
     parked.sort(key=lambda it: (it["kind"], it["id"]))
 
-    next_id = compute_next(state)
-    ready = compute_ready(state)
+    next_id = compute_next(state, under=under)
+    ready = compute_ready(state, under=under)
 
     base["initialised"] = True
     base["building"] = building
@@ -240,6 +281,7 @@ def status_view(
     since_days: int | None = 7,
     all_branches: bool = False,
     now: datetime.datetime | str | None = None,
+    under: str | None = None,
 ) -> dict:
     """
     Return the versioned status-view payload.
@@ -249,6 +291,15 @@ def status_view(
       - "portfolio": scan configured roots and summarise each local Pinax repo.
       - "auto": repo scope when cwd/repo_root is inside a Pinax repo, else
         portfolio scope.
+
+    `under`, when given, restricts the repo view's building/shipped/parked
+    lists and its next/queue_depth figures to the transitive `parent-child`
+    descendants of that item (see pinax.fold.descendants); an id naming no
+    item in the resolved repo's fold raises ValueError. `under` requires
+    repo scope: combining it with portfolio scope, explicit or
+    auto-resolved, also raises ValueError, since a portfolio spans more
+    than one tracker and an ancestor id is only meaningful inside one of
+    them.
     """
     if scope not in {"auto", "repo", "portfolio"}:
         raise ValueError("scope must be one of: auto, repo, portfolio")
@@ -257,7 +308,12 @@ def status_view(
     pinned_now = _coerce_now(now)
     repo_match = find_pinax_repo_root(start)
 
-    if scope == "repo" or (scope == "auto" and repo_match is not None):
+    is_repo_scope = scope == "repo" or (scope == "auto" and repo_match is not None)
+
+    if under is not None and not is_repo_scope:
+        raise ValueError("--under requires repo scope, not --portfolio")
+
+    if is_repo_scope:
         root = repo_match
         if root is None:
             raise ValueError(
@@ -266,12 +322,14 @@ def status_view(
         return {
             "schema": _SCHEMA,
             "scope": "repo",
+            "under": under,
             "repo": _summarise_repo(
                 _repo_id(root),
                 root,
                 since_days=since_days,
                 all_branches=all_branches,
                 now=pinned_now,
+                under=under,
             ),
         }
 
@@ -279,6 +337,7 @@ def status_view(
     payload = {
         "schema": _SCHEMA,
         "scope": "portfolio",
+        "under": None,
         "repos": [
             _summarise_repo(
                 repo_id,

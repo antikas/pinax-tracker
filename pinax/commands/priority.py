@@ -5,11 +5,16 @@ pinax priority <id> top          -- append item.priority_set at the front of eve
 pinax priority <id> bump         -- append item.priority_set one step ahead of the
                                      item's own current rank (or 'top' if the item
                                      has no rank yet)
+[--actor ...] [--offline] [--json]
 
-Appends an item.priority_set event to the log.  compute_next (pinax.fold)
-honours the resulting priority ABOVE critical-path depth: lower rank = more
-urgent.  An item with no item.priority_set event at all is unaffected and
-falls back to today's (phase, -depth, age, id) ordering.
+Runs the publish sequence (pinax.sync) exactly as claim and done do: mint
+an item.priority_set event with the resolved integer, then fetch (unless
+offline), fold, append, commit and push. compute_next (pinax.fold) honours
+the resulting priority ABOVE critical-path depth: lower rank = more
+urgent. An item with no item.priority_set event at all is unaffected and
+falls back to today's (phase, -depth, age, id) ordering. Refuses an actor
+handle that is not role@host before minting anything; see pinax.sync for
+the exit codes and offline rules.
 
 Rank resolution (top/bump) reads the CURRENT LOCAL fold once to compute a
 value; the semantics from there on are identical to an explicit numeric
@@ -20,26 +25,19 @@ mechanism.
 
 from __future__ import annotations
 
-import datetime
 import json
 import os
 import sys
 
-from ..append import append_event
-from ..event import mint_event
-from ..fold import fold, read_events
+from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
+from ..fold import fold
+
+# pinax.sync imports pinax.projection, which imports pinax.commands.dep at
+# its own top level; deferred to run() below rather than imported here, to
+# stay clear of that chain the way pinax.commands.dep itself now must.
 
 _BUMP = "bump"
 _TOP = "top"
-
-
-def _utc_now_iso() -> str:
-    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _default_actor() -> str:
-    import socket
-    return f"operator@{socket.gethostname()}"
 
 
 def _min_existing_priority(items: dict) -> int | None:
@@ -91,14 +89,18 @@ def run(
     rank_arg: str,
     actor: str | None = None,
     as_json: bool = False,
+    offline: bool = False,
+    runner=None,
 ) -> None:
     """
     Execute pinax priority in repo_root.
 
     Validates the item exists (validate-before-append, same discipline as
     pinax dep), resolves rank_arg (explicit int / bump / top) against the
-    current local fold, then appends item.priority_set with the resolved
-    integer.
+    current local fold, then hands an item.priority_set event with the
+    resolved integer to the publish sequence.
+
+    runner is injectable for tests only; the CLI passes none.
     """
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
@@ -123,31 +125,23 @@ def run(
         print(str(exc), file=sys.stderr)
         sys.exit(1)
 
-    events = read_events(log_dir)
-    next_seq = (max(e["seq"] for e in events) + 1) if events else 0
+    from .. import sync
 
-    _actor = actor or _default_actor()
-    ts = _utc_now_iso()
+    _actor = actor or default_actor()
 
-    actor_events = [e for e in events if e.get("actor") == _actor]
-    prev = actor_events[-1]["id"] if actor_events else ""
-
-    payload = {"item_id": item_id, "priority": priority}
-    event = mint_event(
-        seq=next_seq,
-        ts=ts,
+    outcome = sync.run_sequence(
+        repo_root,
+        event_type="item.priority_set",
+        payload={"item_id": item_id, "priority": priority},
         actor=_actor,
-        etype="item.priority_set",
-        payload=payload,
-        prev=prev,
+        ts=utc_now_iso(),
+        item_id=item_id,
+        offline=offline,
+        runner=runner,
     )
-    append_event(log_dir, event, actor=_actor)
+    sync.conclude(outcome)
 
-    # Regenerate the projection atomically after the append (ADR-002).
-    from ..projection import regenerate
-    regenerate(repo_root)
-
-    from ..doctor import warn_if_log_ignored
+    event = outcome.event
     warn_if_log_ignored(repo_root)
 
     result = {
@@ -155,9 +149,9 @@ def run(
         "priority": priority,
         "rank_arg": rank_arg,
         "event_id": event["id"],
-        "seq": next_seq,
+        "seq": event["seq"],
         "actor": _actor,
-        "ts": ts,
+        "ts": event["ts"],
         "type": "item.priority_set",
         "root": ergon_dir,
     }
@@ -170,4 +164,4 @@ def run(
             f"pinax: item {item_id} priority set to {priority} (from {rank_arg!r}) "
             f"by {_actor} in {ergon_dir}"
         )
-        print(f"       event_id={event['id'][:12]}... seq={next_seq}")
+        print(f"       event_id={event['id'][:12]}... seq={event['seq']}")

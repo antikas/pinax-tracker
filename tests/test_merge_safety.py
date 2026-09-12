@@ -69,21 +69,32 @@ _GITATTRIBUTES = "*.jsonl text eol=lf merge=union\n.ergon/** text eol=lf\n"
 _PINAX_SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _make_git_repo(tmpdir: str) -> str:
+def _init_repo(repo: str) -> str:
     """
-    Create a bare git repo (no worktree init of pinax itself).
+    Initialise one git repository at repo and configure it.
 
-    Returns the repo root path.
+    One owner for the git configuration every repository in this file
+    needs, whether the directory is made here or by the shared clone
+    factory in tests/conftest.py.
     """
-    repo = os.path.join(tmpdir, "repo")
-    os.makedirs(repo)
+    os.makedirs(repo, exist_ok=True)
 
     # Configure git identity so commits work without ~/.gitconfig.
     _git(repo, "init", "-b", "main")
-    _git(repo, "config", "user.email", "test@pinax.test")
-    _git(repo, "config", "user.name", "Pinax Test")
+    _git(repo, "config", "user.email", "clone@pinax.example")
+    _git(repo, "config", "user.name", "Pinax Clone")
     # Disable autocrlf to ensure our eol= in .gitattributes controls line endings.
     _git(repo, "config", "core.autocrlf", "false")
+    return repo
+
+
+def _make_git_repo(tmpdir: str) -> str:
+    """
+    Create a git repo under tmpdir (no worktree init of pinax itself).
+
+    Returns the repo root path.
+    """
+    repo = _init_repo(os.path.join(tmpdir, "repo"))
     # NOTE: do NOT override merge.union.driver here.  Production uses the built-in
     # git union driver (registered under the name "union" by git itself, activated
     # by `merge=union` in .gitattributes).  Overriding with `merge.union.driver=true`
@@ -95,7 +106,7 @@ def _make_git_repo(tmpdir: str) -> str:
     return repo
 
 
-def _init_ergon(repo: str, actor: str = "operator@example.test") -> None:
+def _init_ergon(repo: str, actor: str = "operator@alpha") -> None:
     """
     Initialise .ergon/ in the repo and commit.
 
@@ -126,14 +137,19 @@ def _init_ergon(repo: str, actor: str = "operator@example.test") -> None:
     _git(repo, "commit", "-m", "init: pinax ergon base")
 
 
-def _pinax(repo: str, *args: str, env=None) -> subprocess.CompletedProcess:
-    """Run a pinax CLI command in repo."""
+def _pinax(repo: str, *args: str, env=None, check: bool = True) -> subprocess.CompletedProcess:
+    """
+    Run a pinax CLI command in repo.
+
+    check=False returns the result instead of raising, for a case whose
+    subject is the exit code the publish sequence assigns.
+    """
     _env = env or _build_env()
     r = subprocess.run(
         [sys.executable, "-m", "pinax", *args],
         cwd=repo, capture_output=True, text=True, env=_env,
     )
-    if r.returncode != 0:
+    if check and r.returncode != 0:
         raise RuntimeError(
             f"pinax {' '.join(args)} failed in {repo}:\n"
             f"stdout: {r.stdout}\nstderr: {r.stderr}"
@@ -150,7 +166,13 @@ def _build_env() -> dict:
 
 
 def _commit_all(repo: str, message: str) -> None:
-    """Stage all changes and commit."""
+    """
+    Stage all changes and commit.
+
+    Used where this file makes a change of its own. A mutating pinax
+    command commits its own shard and projection, so a scenario never
+    commits again after one of those.
+    """
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", message)
 
@@ -179,8 +201,8 @@ def test_two_branch_merge_log_folds_clean():
     """
     Two branches each append events; git merge (union driver); log folds clean.
 
-    Branch A (actor=operator@example.test): adds item -a.
-    Branch B (actor=reviewer@example.test): adds item -b.
+    Branch A (actor=operator@alpha): adds item -a.
+    Branch B (actor=reviewer@beta): adds item -b.
 
     After merge:
     - Log contains events from both branches (union-merged).
@@ -190,20 +212,18 @@ def test_two_branch_merge_log_folds_clean():
     tmpdir = tempfile.mkdtemp()
     try:
         repo = _make_git_repo(tmpdir)
-        _init_ergon(repo, actor="operator@example.test")
+        _init_ergon(repo, actor="operator@alpha")
 
         # Branch A.
         _git(repo, "checkout", "-b", "branch-a")
         _pinax(repo, "add", "--title", "Branch A item",
-               "--prefix", "pnx", "--actor", "operator@example.test")
-        _commit_all(repo, "branch-a: add item")
+               "--prefix", "pnx", "--actor", "operator@alpha")
 
         # Back to main, create branch B.
         _git(repo, "checkout", "main")
         _git(repo, "checkout", "-b", "branch-b")
         _pinax(repo, "add", "--title", "Branch B item",
-               "--prefix", "pnx", "--actor", "reviewer@example.test")
-        _commit_all(repo, "branch-b: add item")
+               "--prefix", "pnx", "--actor", "reviewer@beta")
 
         # Merge branches into main.  The log shards are per-actor (different files),
         # so the JSONL union driver produces zero log conflicts.  The projection
@@ -302,20 +322,18 @@ def test_projection_resolved_by_regeneration():
     tmpdir = tempfile.mkdtemp()
     try:
         repo = _make_git_repo(tmpdir)
-        _init_ergon(repo, actor="operator@example.test")
+        _init_ergon(repo, actor="operator@alpha")
 
         # Branch A.
         _git(repo, "checkout", "-b", "branch-a")
         _pinax(repo, "add", "--title", "Projection test A",
-               "--prefix", "pnx", "--actor", "operator@example.test")
-        _commit_all(repo, "branch-a: add item A")
+               "--prefix", "pnx", "--actor", "operator@alpha")
 
         # Branch B from main.
         _git(repo, "checkout", "main")
         _git(repo, "checkout", "-b", "branch-b")
         _pinax(repo, "add", "--title", "Projection test B",
-               "--prefix", "pnx", "--actor", "reviewer@example.test")
-        _commit_all(repo, "branch-b: add item B")
+               "--prefix", "pnx", "--actor", "reviewer@beta")
 
         # Merge both into main.
         _git(repo, "checkout", "main")
@@ -381,107 +399,132 @@ def test_projection_resolved_by_regeneration():
 # ---------------------------------------------------------------------------
 
 @requires_git
-def test_cross_worktree_double_claim():
+def test_cross_worktree_double_claim(clone_wired_to_hub):
     """
     Two branches claim the same item.
 
-    Branch A (operator@example.test) claims the item at ts_a.
-    Branch B (reviewer@example.test) claims the item at ts_b > ts_a.
+    Branch A (operator@alpha) claims the item at ts_a.
+    Branch B (reviewer@beta) claims the item at ts_b > ts_a.
 
     After a real git merge (union driver on the log):
     - The union-merged log has BOTH claim events.
-    - The fold reconciles: operator@example.test wins (earlier ts_a).
+    - The fold reconciles: operator@alpha wins (earlier ts_a).
     - A claim.superseded outcome is stored in state["claim_superseded"].
     - A warning is in state["report"]["warnings"].
 
     This is order-independent (the log line order after union merge is
     arbitrary; the fold always sorts by (seq, ts, actor, id) first).
+
+    A claim runs the publish sequence, which publishes exactly the remote
+    default branch: on a side branch it appends and commits the claim
+    locally and then reports that it published nothing, which is exit 4.
+    That is what leaves both claim events in the log for the merge, and
+    the fold is still the only thing that resolves them.  The repository,
+    its empty hooks directory and its reachable origin belong to the
+    shared factory in tests/conftest.py; this file's own helpers do the
+    work.
     """
-    tmpdir = tempfile.mkdtemp()
-    try:
-        repo = _make_git_repo(tmpdir)
-        _init_ergon(repo, actor="operator@example.test")
+    repo = clone_wired_to_hub(
+        init_repo=_init_repo, git=_git, pinax=_pinax, commit_all=_commit_all,
+        actor="operator@alpha",
+    )
 
-        # Create the shared item on main before branching.
-        _pinax(repo, "add", "--title", "Shared item",
-               "--prefix", "pnx", "--actor", "operator@example.test")
-        _commit_all(repo, "main: add shared item")
+    # Create the shared item on main before branching.
+    _pinax(repo, "add", "--title", "Shared item",
+           "--prefix", "pnx", "--actor", "operator@alpha")
 
-        # Discover the item ID from the fold.
-        state = _fold_repo(repo)
-        items = state.get("items", {})
-        shared_items = [iid for iid, item in items.items()
-                        if "Shared" in item.get("title", "")]
-        assert shared_items, f"Shared item not found; items={list(items.keys())}"
-        shared_id = shared_items[0]
+    # Discover the item ID from the fold.
+    state = _fold_repo(repo)
+    items = state.get("items", {})
+    shared_items = [iid for iid, item in items.items()
+                    if "Shared" in item.get("title", "")]
+    assert shared_items, f"Shared item not found; items={list(items.keys())}"
+    shared_id = shared_items[0]
 
-        _git(repo, "checkout", "-b", "claim-a")
-        _pinax(repo, "claim", shared_id, "--actor", "operator@example.test")
-        _commit_all(repo, "claim-a: operator@example.test claims shared item")
-
+    for branch, claimant in (
+        ("claim-a", "operator@alpha"), ("claim-b", "reviewer@beta")
+    ):
         _git(repo, "checkout", "main")
-        _git(repo, "checkout", "-b", "claim-b")
-        _pinax(repo, "claim", shared_id, "--actor", "reviewer@example.test")
-        _commit_all(repo, "claim-b: reviewer@example.test claims shared item")
-
-        # Merge both into main.
-        _git(repo, "checkout", "main")
-        _git(repo, "merge", "--no-ff", "-m", "merge: claim-a", "claim-a")
-
-        # Merge claim-b: the JSONL shards are different files (per-actor-session shard),
-        # so the union driver merges them cleanly — no conflict.
-        r = subprocess.run(
-            ["git", "merge", "--no-ff", "-m", "merge: claim-b", "claim-b"],
-            cwd=repo, capture_output=True, text=True,
+        _git(repo, "checkout", "-b", branch)
+        claimed = _pinax(repo, "claim", shared_id, "--actor", claimant, check=False)
+        assert claimed.returncode == 4, (
+            f"{branch}: a claim off the remote default branch appends and "
+            "commits locally and publishes nothing:\n"
+            f"stdout: {claimed.stdout}\nstderr: {claimed.stderr}"
         )
-        # If the projection conflicts (board.md), resolve with ours strategy.
-        if r.returncode != 0 and "CONFLICT" in r.stdout:
-            _git(repo, "merge", "--abort")
-            _git(repo, "merge", "--no-ff", "-s", "recursive",
-                 "-X", "ours", "-m", "merge: claim-b (ours for projection)", "claim-b")
-        elif r.returncode != 0:
-            raise RuntimeError(f"git merge claim-b failed: {r.stderr}")
-
-        # Fold the union-merged log.
-        state = _fold_repo(repo)
-        items = state.get("items", {})
-
-        assert shared_id in items, (
-            f"Shared item {shared_id!r} missing from fold state after merge"
-        )
-        item = items[shared_id]
-
-        winner = item.get("owner")
-        assert winner == "operator@example.test", (
-            f"Expected owner='operator@example.test' (earlier claimer), got {winner!r}.\n"
-            f"Claim reconciliation: earliest (ts, actor, id) wins."
+        assert _git(repo, "status", "--porcelain").stdout.strip() == "", (
+            f"{branch}: the claim left work uncommitted"
         )
 
-        # (2) A claim.superseded outcome is present.
-        superseded = state.get("claim_superseded", [])
-        assert len(superseded) >= 1, (
-            f"Expected at least 1 claim.superseded entry; got {len(superseded)}: {superseded}"
-        )
-        superseded_actors = {s["superseded_actor"] for s in superseded}
-        assert "reviewer@example.test" in superseded_actors, (
-            f"reviewer@example.test not in superseded_actors {superseded_actors!r}"
-        )
-        winner_actors = {s["winner_actor"] for s in superseded}
-        assert "operator@example.test" in winner_actors, (
-            f"operator@example.test not in winner_actors {winner_actors!r}"
-        )
+    # Merge both into main.
+    _git(repo, "checkout", "main")
+    _git(repo, "merge", "--no-ff", "-m", "merge: claim-a", "claim-a")
 
-        # (3) A report warning is present.
-        warnings = state.get("report", {}).get("warnings", [])
-        assert any("claim.superseded" in w for w in warnings), (
-            f"No claim.superseded warning in report.warnings: {warnings!r}"
+    # Merge claim-b: the JSONL shards are different files (per-actor-session
+    # shard), so the union driver merges them cleanly.  Only the generated
+    # projection can conflict, and that is resolved by regenerating it from
+    # the merged log (ADR-002), never by choosing one side of it.
+    merged = subprocess.run(
+        ["git", "merge", "--no-ff", "-m", "merge: claim-b", "claim-b"],
+        cwd=repo, capture_output=True, text=True, env=_build_env(),
+    )
+    if merged.returncode != 0:
+        reported = merged.stdout + "\n" + merged.stderr
+        assert "CONFLICT" in reported.upper(), (
+            f"git merge claim-b failed without a conflict:\n{reported}"
         )
-        assert any(shared_id in w for w in warnings), (
-            f"Item {shared_id!r} not in any warning: {warnings!r}"
+        jsonl_conflicts = [
+            line for line in reported.splitlines()
+            if "CONFLICT" in line and ".jsonl" in line
+        ]
+        assert not jsonl_conflicts, (
+            "UNEXPECTED conflict in a JSONL shard - the per-actor-session shard "
+            "key and the union driver rule that out.\n" + "\n".join(jsonl_conflicts)
         )
+    from pinax.projection import regenerate
+    regenerate(repo)
+    _git(repo, "add", "-A")
+    if _git(repo, "diff", "--cached", "--quiet", check=False).returncode != 0:
+        _git(repo, "commit", "-m",
+             "merge: claim-b (projection regenerated from the merged log)")
 
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    # Fold the union-merged log.
+    state = _fold_repo(repo)
+    items = state.get("items", {})
+
+    assert shared_id in items, (
+        f"Shared item {shared_id!r} missing from fold state after merge"
+    )
+    item = items[shared_id]
+
+    winner = item.get("owner")
+    assert winner == "operator@alpha", (
+        f"Expected owner='operator@alpha' (earlier claimer), got {winner!r}.\n"
+        f"Claim reconciliation: earliest (ts, actor, id) wins."
+    )
+
+    # (2) A claim.superseded outcome is present.
+    superseded = state.get("claim_superseded", [])
+    assert len(superseded) >= 1, (
+        f"Expected at least 1 claim.superseded entry; got {len(superseded)}: {superseded}"
+    )
+    superseded_actors = {s["superseded_actor"] for s in superseded}
+    assert "reviewer@beta" in superseded_actors, (
+        f"reviewer@beta not in superseded_actors {superseded_actors!r}"
+    )
+    winner_actors = {s["winner_actor"] for s in superseded}
+    assert "operator@alpha" in winner_actors, (
+        f"operator@alpha not in winner_actors {winner_actors!r}"
+    )
+
+    # (3) A report warning is present.
+    warnings = state.get("report", {}).get("warnings", [])
+    assert any("claim.superseded" in w for w in warnings), (
+        f"No claim.superseded warning in report.warnings: {warnings!r}"
+    )
+    assert any(shared_id in w for w in warnings), (
+        f"Item {shared_id!r} not in any warning: {warnings!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -496,27 +539,25 @@ def test_per_actor_shard_zero_conflict():
     only triggers on files that both branches modified).
 
     This test verifies the shard-key behavior in DESIGN.md:
-    - Branch A appends to 'operator-test.jsonl' (actor=operator@example.test).
-    - Branch B appends to 'reviewer-test.jsonl' (actor=reviewer@example.test).
+    - Branch A appends to 'operator-alpha.jsonl' (actor=operator@alpha).
+    - Branch B appends to 'reviewer-beta.jsonl' (actor=reviewer@beta).
     - The merge is a fast-forward / trivial union with NO CONFLICT in the log.
     """
     tmpdir = tempfile.mkdtemp()
     try:
         repo = _make_git_repo(tmpdir)
-        _init_ergon(repo, actor="operator@example.test")
+        _init_ergon(repo, actor="operator@alpha")
 
         # Branch A.
         _git(repo, "checkout", "-b", "shard-a")
         _pinax(repo, "add", "--title", "Shard A item",
-               "--prefix", "pnx", "--actor", "operator@example.test")
-        _commit_all(repo, "shard-a: add item as operator@example.test")
+               "--prefix", "pnx", "--actor", "operator@alpha")
 
         # Branch B.
         _git(repo, "checkout", "main")
         _git(repo, "checkout", "-b", "shard-b")
         _pinax(repo, "add", "--title", "Shard B item",
-               "--prefix", "pnx", "--actor", "reviewer@example.test")
-        _commit_all(repo, "shard-b: add item as reviewer@example.test")
+               "--prefix", "pnx", "--actor", "reviewer@beta")
 
         # Merge shard-a into main.
         _git(repo, "checkout", "main")
@@ -560,11 +601,11 @@ def test_per_actor_shard_zero_conflict():
         reviewer_shards = [s for s in shard_names if s.startswith("reviewer")]
         assert operator_shards, (
             f"No operator shard found. Shards: {shard_names}. "
-            f"The per-actor-session shard key must produce 'operator-test.jsonl'."
+            f"The per-actor-session shard key must produce 'operator-alpha.jsonl'."
         )
         assert reviewer_shards, (
             f"No reviewer shard found. Shards: {shard_names}. "
-            f"The per-actor-session shard key must produce 'reviewer-test.jsonl'."
+            f"The per-actor-session shard key must produce 'reviewer-beta.jsonl'."
         )
 
     finally:
@@ -592,10 +633,9 @@ def test_union_duplicate_lines_are_noop():
     tmpdir = tempfile.mkdtemp()
     try:
         repo = _make_git_repo(tmpdir)
-        _init_ergon(repo, actor="operator@example.test")
+        _init_ergon(repo, actor="operator@alpha")
         _pinax(repo, "add", "--title", "Dup test item",
-               "--prefix", "pnx", "--actor", "operator@example.test")
-        _commit_all(repo, "add dup test item")
+               "--prefix", "pnx", "--actor", "operator@alpha")
 
         # Fold once to get the expected state.
         state_before = _fold_repo(repo)
@@ -647,19 +687,17 @@ def test_same_actor_same_shard_union_fires_and_is_loss_free():
     try:
         repo = _make_git_repo(tmpdir)
         # Use a single actor for both branches — they will share a shard.
-        _init_ergon(repo, actor="operator@example.test")
+        _init_ergon(repo, actor="operator@alpha")
 
         _git(repo, "checkout", "-b", "same-actor-a")
         _pinax(repo, "add", "--title", "Same-actor item A",
-               "--prefix", "pnx", "--actor", "operator@example.test")
-        _commit_all(repo, "same-actor-a: add item A (operator@example.test)")
+               "--prefix", "pnx", "--actor", "operator@alpha")
 
         # the union driver must fire when these are merged.
         _git(repo, "checkout", "main")
         _git(repo, "checkout", "-b", "same-actor-b")
         _pinax(repo, "add", "--title", "Same-actor item B",
-               "--prefix", "pnx", "--actor", "operator@example.test")
-        _commit_all(repo, "same-actor-b: add item B (operator@example.test)")
+               "--prefix", "pnx", "--actor", "operator@alpha")
 
         # Confirm both branches modified the same shard (the proof that the
         # union driver will fire).
@@ -667,7 +705,7 @@ def test_same_actor_same_shard_union_fires_and_is_loss_free():
         shards = [f for f in os.listdir(log_dir) if f.endswith(".jsonl")]
         operator_shards = [s for s in shards if s.startswith("operator")]
         assert operator_shards, (
-            f"Expected a operator-test.jsonl shard; found: {shards}. "
+            f"Expected a operator-alpha.jsonl shard; found: {shards}. "
             "The same-actor scenario requires both branches to write to the same file."
         )
 
@@ -778,8 +816,8 @@ def test_typed_edge_merge():
     shards); after a real git merge, the fold over the union-merged log is identical
     to folding the union directly — no lost/double-applied edge.
 
-    Branch A (actor=operator@example.test): adds a 'blocks' edge and a 'parent-child' edge.
-    Branch B (actor=reviewer@example.test): adds a 'related' edge and a 'supersedes' edge.
+    Branch A (actor=operator@alpha): adds a 'blocks' edge and a 'parent-child' edge.
+    Branch B (actor=reviewer@beta): adds a 'related' edge and a 'supersedes' edge.
 
     After a real git merge (union driver on the log):
     - Both branches wrote to different shard files (per-actor-session sharding).
@@ -796,14 +834,13 @@ def test_typed_edge_merge():
     tmpdir = tempfile.mkdtemp()
     try:
         repo = _make_git_repo(tmpdir)
-        _init_ergon(repo, actor="operator@example.test")
+        _init_ergon(repo, actor="operator@alpha")
 
         # Create two shared items on main before branching.
         _pinax(repo, "add", "--title", "Item Alpha",
-               "--prefix", "pnx", "--actor", "operator@example.test")
+               "--prefix", "pnx", "--actor", "operator@alpha")
         _pinax(repo, "add", "--title", "Item Beta",
-               "--prefix", "pnx", "--actor", "operator@example.test")
-        _commit_all(repo, "main: add alpha and beta items")
+               "--prefix", "pnx", "--actor", "operator@alpha")
 
         # Discover the item IDs from the fold.
         state = _fold_repo(repo)
@@ -818,21 +855,19 @@ def test_typed_edge_merge():
         _git(repo, "checkout", "-b", "typed-edge-a")
         _pinax(repo, "dep", "add", alpha_id,
                "--to", beta_id, "--type", "blocks",
-               "--actor", "operator@example.test")
+               "--actor", "operator@alpha")
         _pinax(repo, "dep", "add", alpha_id,
                "--to", beta_id, "--type", "parent-child",
-               "--actor", "operator@example.test")
-        _commit_all(repo, "typed-edge-a: add blocks and parent-child edges (operator@example.test)")
+               "--actor", "operator@alpha")
 
         _git(repo, "checkout", "main")
         _git(repo, "checkout", "-b", "typed-edge-b")
         _pinax(repo, "dep", "add", alpha_id,
                "--to", beta_id, "--type", "related",
-               "--actor", "reviewer@example.test")
+               "--actor", "reviewer@beta")
         _pinax(repo, "dep", "add", alpha_id,
                "--to", beta_id, "--type", "supersedes",
-               "--actor", "reviewer@example.test")
-        _commit_all(repo, "typed-edge-b: add related and supersedes edges (reviewer@example.test)")
+               "--actor", "reviewer@beta")
 
         # Merge typed-edge-a into main, then typed-edge-b.
         _git(repo, "checkout", "main")
@@ -962,8 +997,8 @@ def test_add_vs_rm_same_edge_merge_convergence():
 
     Scenario:
       Base:     two items (item-x, item-y) exist on main.
-      Branch A (actor=operator@example.test): appends dep.added for (blocks, item-x, item-y).
-      Branch B (actor=reviewer@example.test): appends dep.removed for the same typed edge.
+      Branch A (actor=operator@alpha): appends dep.added for (blocks, item-x, item-y).
+      Branch B (actor=reviewer@beta): appends dep.removed for the same typed edge.
 
     Branch A uses a higher seq (so its event has a higher total-order key).
     After a real git merge:
@@ -985,14 +1020,13 @@ def test_add_vs_rm_same_edge_merge_convergence():
     tmpdir = tempfile.mkdtemp()
     try:
         repo = _make_git_repo(tmpdir)
-        _init_ergon(repo, actor="operator@example.test")
+        _init_ergon(repo, actor="operator@alpha")
 
         # Create two shared items on main before branching.
         _pinax(repo, "add", "--title", "Item X",
-               "--prefix", "pnx", "--actor", "operator@example.test")
+               "--prefix", "pnx", "--actor", "operator@alpha")
         _pinax(repo, "add", "--title", "Item Y",
-               "--prefix", "pnx", "--actor", "operator@example.test")
-        _commit_all(repo, "main: add item-x and item-y")
+               "--prefix", "pnx", "--actor", "operator@alpha")
 
         # Discover the item IDs.
         state = _fold_repo(repo)
@@ -1008,19 +1042,17 @@ def test_add_vs_rm_same_edge_merge_convergence():
         _git(repo, "checkout", "-b", "edge-rm-branch")
         _pinax(repo, "dep", "add", x_id,
                "--to", y_id, "--type", "blocks",
-               "--actor", "reviewer@example.test")
+               "--actor", "reviewer@beta")
         _pinax(repo, "dep", "rm", x_id,
                "--to", y_id, "--type", "blocks",
-               "--actor", "reviewer@example.test")
-        _commit_all(repo, "edge-rm-branch: add then remove blocks edge (reviewer@example.test)")
+               "--actor", "reviewer@beta")
 
         # Branch A's event will have a higher seq (written after branch B diverged from main).
         _git(repo, "checkout", "main")
         _git(repo, "checkout", "-b", "edge-add-branch")
         _pinax(repo, "dep", "add", x_id,
                "--to", y_id, "--type", "blocks",
-               "--actor", "operator@example.test")
-        _commit_all(repo, "edge-add-branch: add blocks edge (operator@example.test)")
+               "--actor", "operator@alpha")
 
         # Merge edge-rm-branch first, then edge-add-branch into main.
         # After the merge, the log contains:

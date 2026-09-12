@@ -217,10 +217,14 @@ class TestRemoteFoldRealGit:
         """THE FRESHNESS CONTRACT: only what is PUSHED to the remote exists
         in this view — committed-but-unpushed work is invisible BY DESIGN
         (git's own publish contract), and appears exactly on push."""
+        # No follow-up commit here: 'add' already commits itself through the
+        # publish sequence (pinax/sync.py, ADR-006). proj_a carries no
+        # 'origin' remote (only a direct URL push to bare_a in setup_method),
+        # so the sequence commits the event locally and does not push,
+        # leaving exactly the committed-but-unpushed state this test's
+        # subject needs.
         _pinax_ok(self.proj_a, "add", "--title", "Unpushed item",
                   "--actor", "operator@example.test")
-        _git(self.proj_a, "add", "-A")
-        _git(self.proj_a, "commit", "-m", "committed but NOT pushed")
 
         before = self._remote_json()
         by_id = {rep["id"]: rep for rep in before["repos"]}

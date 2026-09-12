@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from typing import Any
 
 
@@ -137,6 +138,57 @@ def verify_id(event: dict) -> bool:
         event["seq"], event["ts"], event["actor"], event["type"], event["payload"]
     )
     return event["id"] == expected
+
+
+CLAIM_RELEASED = "item.claim_released"
+CLAIM_EXPIRY_SET = "policy.claim_expiry_set"
+
+
+def released_item(event: dict) -> str | None:
+    """
+    The item id a well-formed item.claim_released event names, else None.
+
+    The one place the release payload's shape is stated: an item id and a
+    reason, both non-empty strings. A release without a reason says nothing
+    about why an item came free, so it is not a release at all. The command
+    refuses the same shape before it mints anything; this is what the fold
+    reads, so a hand-written or foreign record cannot end a claim by
+    accident.
+    """
+    if not isinstance(event, dict) or event.get("type") != CLAIM_RELEASED:
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    item_id = payload.get("item_id")
+    reason = payload.get("reason")
+    if not isinstance(item_id, str) or not item_id:
+        return None
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    return item_id
+
+
+def declared_expiry_hours(event: dict) -> float | None:
+    """
+    The hours a well-formed policy.claim_expiry_set event declares, else None.
+
+    The one place the policy payload's shape is stated: a finite, positive
+    number of hours, and never a boolean (True would otherwise read as one
+    hour). A record that declares anything else sets no policy, so the
+    claims it would have governed keep the default.
+    """
+    if not isinstance(event, dict) or event.get("type") != CLAIM_EXPIRY_SET:
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    hours = payload.get("hours")
+    if isinstance(hours, bool) or not isinstance(hours, (int, float)):
+        return None
+    if not math.isfinite(hours) or hours <= 0:
+        return None
+    return float(hours)
 
 
 def valid_annulment(event: dict) -> bool:

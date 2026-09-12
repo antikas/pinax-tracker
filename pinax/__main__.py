@@ -3,36 +3,68 @@ python -m pinax — Pinax CLI entry point.
 
 Supported commands:
     pinax init   [--actor <actor>]
-    pinax add    --title <title> [--prefix <prefix>] [--actor <actor>] [--json]
-                 [--allow-new-prefix]
+    pinax add    --title <title> [--prefix <prefix>] [--actor <actor>]
+                 [--offline] [--json] [--allow-new-prefix]
         (fails loudly if --prefix/default 'pnx' has never appeared
          among this tracker's existing item IDs -- a likely mis-bind, not a
          legitimate new prefix; --allow-new-prefix overrides. An empty
          tracker is exempt: first add always succeeds regardless of prefix)
     pinax claim  <id> [--actor <actor>] [--json]
+        (runs the publish sequence; a claim that publishes nothing fails,
+         and claim never runs offline -- see "Publishing a state change"
+         below)
     pinax status [--json] [--repo <path>|--portfolio] [--since Nd|--all] [--all-branches]
+                 [--under ITEM_ID]
     pinax status <id> <state> [--actor <actor>] [--json]
-    pinax done   <id> --briefing <file> [--actor <actor>] [--json]
-    pinax block  <id> --gate <gate> [--actor <actor>] [--json]
-    pinax park   <id> --reason <reason> [--actor <actor>] [--json]
-    pinax priority <id> <rank>|bump|top [--actor <actor>] [--json]
+        (--under ITEM_ID restricts the view to the transitive parent-child
+         descendants of that item; repo scope only, refused together with
+         --portfolio or the setter form above)
+    pinax done   <id> --briefing <file> [--actor <actor>] [--offline] [--json]
+        (runs the publish sequence; records the event locally when the
+         remote cannot be reached, or when --offline is given)
+    pinax block  <id> --gate <gate> [--actor <actor>] [--offline] [--json]
+    pinax park   <id> --reason <reason> [--actor <actor>] [--offline] [--json]
+    pinax release <id> --reason <reason> [--actor <actor>] [--offline] [--json]
+        (release an item's live claim: appends item.claim_released. Any
+         actor may release, with a reason; the fold then clears the item's
+         owner, claim time and claim event id, leaves the status alone, and
+         a later claim by another actor wins. Refuses an unknown item, an
+         item with no live claim, and an empty reason)
+    pinax policy claim-expiry --hours N [--actor <actor>] [--offline] [--json]
+        (repository-level: appends policy.claim_expiry_set, naming no item.
+         The policy in force for a claim is the last such event at or
+         before it in claim order, and 24 hours without one; the fold
+         expires a live claim as of the first event after it whose
+         timestamp passes that deadline, so a log that records nothing
+         after a claim never expires it)
+    pinax priority <id> <rank>|bump|top [--actor <actor>] [--offline] [--json]
         (priority control: appends item.priority_set;
          compute_next honours it ABOVE critical-path depth. <rank> is an
          explicit int, lower = more urgent; 'top' = ahead of every
          currently-prioritised item; 'bump' = one step ahead of the item's
          own current rank, or 'top' if it has none yet)
-    pinax annul  <event-id> --reason <reason> [--actor <actor>] [--json]
+    pinax annul  <event-id> --reason <reason> [--actor <actor>] [--offline] [--json]
         (tombstone a junk/tampered event id — appends event.annulled;
          fold suppresses ITS SPECIFIC tamper-evidence warning and payload
          effects on every future fold; raw bytes stay untouched, append-only)
-    pinax dep add <from_id> --to <to_id> --type <t> [--actor <actor>] [--json]
-    pinax dep add <from_id> --blocks <to_id> [--actor <actor>] [--json]  (back-compat alias)
-    pinax dep rm  <from_id> --to <to_id> --type <t> [--actor <actor>] [--json]
-    pinax dep rm  <from_id> --blocks <to_id> [--actor <actor>] [--json]  (back-compat alias)
+    pinax dep add <from_id> --to <to_id> --type <t> [--actor <actor>] [--offline] [--json]
+    pinax dep add <from_id> --blocks <to_id> [--actor <actor>] [--offline] [--json]  (back-compat alias)
+    pinax dep rm  <from_id> --to <to_id> --type <t> [--actor <actor>] [--offline] [--json]
+    pinax dep rm  <from_id> --blocks <to_id> [--actor <actor>] [--offline] [--json]  (back-compat alias)
       where <t> is one of the valid edge types (see 'pinax dep add --help' or VALID_EDGE_TYPES in dep.py)
-    pinax ready  [--actor <actor>] [--json] [--all-branches]
-    pinax next   [--actor <actor>] [--json]
-    pinax note add <item_id> --ref <ref> [--caption <text>] [--actor <actor>] [--json]
+    pinax ready  [--actor <actor>] [--json] [--all-branches] [--under ITEM_ID]
+    pinax next   [--actor <actor>] [--json] [--under ITEM_ID]
+        (--under ITEM_ID restricts ready/next to the transitive
+         parent-child descendants of that item; on both, and on status
+         below, an item carrying a live claim -- item.claimed reconciled
+         in the fold, ADR-003 -- is never eligible, on every machine that
+         has folded the claim, regardless of its status field.
+         'ready --json' keeps its released bare-array shape when --under
+         is not given; with --under it is the envelope
+         {"ready": [...], "under": "<id>"}. 'next --json' and
+         'status --json' were already objects, so they simply gain an
+         "under" key, the id or null, either way)
+    pinax note add <item_id> --ref <ref> [--caption <text>] [--actor <actor>] [--offline] [--json]
     pinax metrics [--json]
     pinax report  [--json] [--all-branches]
     pinax dispatch [--max N] [--claim] [--actor <actor>] [--json]
@@ -68,10 +100,32 @@ Supported commands:
          uncommitted working-tree .ergon shard events, stale claims older
          than N hours with no item.completed, and legacy-board frontmatter
          contradicting pinax facts on migrated items.  Exits 1 on findings,
-         0 when clean.  --reconcile adds the guided action: one ordinary git
-         commit for orphaned shards, and a done/park/skip prompt per stale
-         claim appended via the normal event path -- the append-only log is
-         never hand-edited)
+         0 when clean.  N defaults to the claim expiry policy the log folds
+         to, and to 24 when it sets none.  --reconcile adds the guided
+         action: one ordinary git commit for orphaned shards, and a
+         done/park/release/skip prompt per stale claim appended via the
+         normal event path -- the append-only log is never hand-edited)
+
+Publishing a state change: every command above that appends an event (add,
+claim, done, block, park, release, policy, priority, dep, note, annul) runs
+the one publish sequence in pinax.sync -- refuse an actor that is not role@host, fetch
+origin (unless offline mode applies), fold the union of the local log and
+the remote default branch's committed shards, append, regenerate the
+projection, commit the shard and the projection with the repository's hooks
+running, and push the remote default branch when it is the checked-out
+branch. All of them but claim accept --offline (or PINAX_OFFLINE=1) to skip
+the fetch and the push and commit locally only; claim never goes offline,
+since its whole purpose is making a claim visible on every other machine.
+Their exit codes are:
+
+    0  committed, and published when the remote default branch is checked out
+    2  the actor is not written as role@host; nothing was appended
+    4  the remote was required and the event could not be published, or the
+       repository at the resolved root is not the top level of its own git
+       repository (nothing was appended either way)
+    5  the push was rejected on every attempt
+    7  the shard and the projection could not be staged, or the commit was
+       refused; either way the appended event stays uncommitted
 
 All commands operate on the repository at the current working directory (CWD),
 resolved by walking up from CWD to the nearest ancestor .git directory.
@@ -190,6 +244,7 @@ def _cmd_add(args: argparse.Namespace) -> None:
         actor=args.actor,
         as_json=args.json,
         allow_new_prefix=args.allow_new_prefix,
+        offline=args.offline,
     )
 
 
@@ -216,18 +271,36 @@ def _cmd_status(args: argparse.Namespace) -> None:
         scope=scope,
         since_days=since_days,
         all_branches=args.all_branches,
+        under=args.under,
     )
 
 
 def _cmd_done(args: argparse.Namespace) -> None:
     from .commands.done import run
-    run(
-        repo_root=_find_repo_root(_resolve_root_pin(args)),
-        item_id=args.id,
-        briefing_path=args.briefing,
-        actor=args.actor,
-        as_json=args.json,
-    )
+
+    # done.run() has no offline= parameter of its own. pinax.sync reads the
+    # PINAX_OFFLINE=1 environment variable as an equally valid offline
+    # request (see pinax.sync.run_sequence), so --offline here sets that
+    # variable for the one call and restores whatever it found there
+    # afterwards, whether or not the call raised.
+    had_env = "PINAX_OFFLINE" in os.environ
+    prior = os.environ.get("PINAX_OFFLINE")
+    if args.offline:
+        os.environ["PINAX_OFFLINE"] = "1"
+    try:
+        run(
+            repo_root=_find_repo_root(_resolve_root_pin(args)),
+            item_id=args.id,
+            briefing_path=args.briefing,
+            actor=args.actor,
+            as_json=args.json,
+        )
+    finally:
+        if args.offline:
+            if had_env:
+                os.environ["PINAX_OFFLINE"] = prior
+            else:
+                os.environ.pop("PINAX_OFFLINE", None)
 
 
 def _cmd_block(args: argparse.Namespace) -> None:
@@ -238,6 +311,7 @@ def _cmd_block(args: argparse.Namespace) -> None:
         gate=args.gate,
         actor=args.actor,
         as_json=args.json,
+        offline=args.offline,
     )
 
 
@@ -249,6 +323,30 @@ def _cmd_park(args: argparse.Namespace) -> None:
         reason=args.reason,
         actor=args.actor,
         as_json=args.json,
+        offline=args.offline,
+    )
+
+
+def _cmd_release(args: argparse.Namespace) -> None:
+    from .commands.release import run
+    run(
+        repo_root=_find_repo_root(_resolve_root_pin(args)),
+        item_id=args.id,
+        reason=args.reason,
+        actor=args.actor,
+        as_json=args.json,
+        offline=args.offline,
+    )
+
+
+def _cmd_policy_claim_expiry(args: argparse.Namespace) -> None:
+    from .commands.policy import run_claim_expiry
+    run_claim_expiry(
+        repo_root=_find_repo_root(_resolve_root_pin(args)),
+        hours=args.hours,
+        actor=args.actor,
+        as_json=args.json,
+        offline=args.offline,
     )
 
 
@@ -260,6 +358,7 @@ def _cmd_priority(args: argparse.Namespace) -> None:
         rank_arg=args.rank,
         actor=args.actor,
         as_json=args.json,
+        offline=args.offline,
     )
 
 
@@ -271,6 +370,7 @@ def _cmd_annul(args: argparse.Namespace) -> None:
         reason=args.reason,
         actor=args.actor,
         as_json=args.json,
+        offline=args.offline,
     )
 
 
@@ -336,6 +436,7 @@ def _cmd_dep_add(args: argparse.Namespace) -> None:
         edge_type=edge_type,
         actor=args.actor,
         as_json=args.json,
+        offline=args.offline,
     )
 
 
@@ -349,6 +450,7 @@ def _cmd_dep_rm(args: argparse.Namespace) -> None:
         edge_type=edge_type,
         actor=args.actor,
         as_json=args.json,
+        offline=args.offline,
     )
 
 
@@ -359,6 +461,7 @@ def _cmd_ready(args: argparse.Namespace) -> None:
         actor=args.actor,
         as_json=args.json,
         all_branches=args.all_branches,
+        under=args.under,
     )
 
 
@@ -368,6 +471,7 @@ def _cmd_next(args: argparse.Namespace) -> None:
         repo_root=_find_repo_root(_resolve_root_pin(args)),
         actor=args.actor,
         as_json=args.json,
+        under=args.under,
     )
 
 
@@ -385,6 +489,7 @@ def _cmd_note_add(args: argparse.Namespace) -> None:
         caption=getattr(args, "caption", None),
         actor=args.actor,
         as_json=args.json,
+        offline=args.offline,
     )
 
 
@@ -532,6 +637,11 @@ def main(argv: list[str] | None = None) -> None:
     p_add.add_argument("--title", required=True, help="Item title")
     p_add.add_argument("--prefix", default="pnx", help="ID prefix (default: pnx)")
     p_add.add_argument("--actor", default=None, help="Actor string (role@handle)")
+    p_add.add_argument(
+        "--offline", action="store_true",
+        help="Skip fetch and push; append and commit locally only "
+             "(also settable via the PINAX_OFFLINE=1 environment variable)",
+    )
     p_add.add_argument("--json", action="store_true", help="Output JSON")
     p_add.add_argument(
         "--allow-new-prefix",
@@ -597,6 +707,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Fold in every unmerged local branch's committed .ergon shards "
              "(repo view only)",
     )
+    p_status.add_argument(
+        "--under", default=None, metavar="ITEM_ID",
+        help="Restrict the view to the transitive parent-child descendants "
+             "of ITEM_ID (repo view only; refused with --portfolio)",
+    )
     p_status.set_defaults(func=_cmd_status)
 
     # pinax done
@@ -604,6 +719,11 @@ def main(argv: list[str] | None = None) -> None:
     p_done.add_argument("id", help="Item ID")
     p_done.add_argument("--briefing", required=True, metavar="FILE", help="Path to briefing file")
     p_done.add_argument("--actor", default=None, help="Actor string (role@handle)")
+    p_done.add_argument(
+        "--offline", action="store_true",
+        help="Skip fetch and push; append and commit locally only "
+             "(also settable via the PINAX_OFFLINE=1 environment variable)",
+    )
     p_done.add_argument("--json", action="store_true", help="Output JSON")
     p_done.set_defaults(func=_cmd_done)
 
@@ -617,6 +737,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Gate type",
     )
     p_block.add_argument("--actor", default=None, help="Actor string (role@handle)")
+    p_block.add_argument(
+        "--offline", action="store_true",
+        help="Skip fetch and push; append and commit locally only "
+             "(also settable via the PINAX_OFFLINE=1 environment variable)",
+    )
     p_block.add_argument("--json", action="store_true", help="Output JSON")
     p_block.set_defaults(func=_cmd_block)
 
@@ -625,8 +750,61 @@ def main(argv: list[str] | None = None) -> None:
     p_park.add_argument("id", help="Item ID")
     p_park.add_argument("--reason", required=True, help="Park reason")
     p_park.add_argument("--actor", default=None, help="Actor string (role@handle)")
+    p_park.add_argument(
+        "--offline", action="store_true",
+        help="Skip fetch and push; append and commit locally only "
+             "(also settable via the PINAX_OFFLINE=1 environment variable)",
+    )
     p_park.add_argument("--json", action="store_true", help="Output JSON")
     p_park.set_defaults(func=_cmd_park)
+
+    # pinax release
+    p_release = sub.add_parser(
+        "release",
+        help="Release an item's live claim (appends item.claim_released)",
+    )
+    p_release.add_argument("id", help="Item ID")
+    p_release.add_argument("--reason", required=True, help="Release reason")
+    p_release.add_argument("--actor", default=None, help="Actor string (role@handle)")
+    p_release.add_argument(
+        "--offline", action="store_true",
+        help="Skip fetch and push; append and commit locally only "
+             "(also settable via the PINAX_OFFLINE=1 environment variable)",
+    )
+    p_release.add_argument("--json", action="store_true", help="Output JSON")
+    p_release.set_defaults(func=_cmd_release)
+
+    # pinax policy (sub-subcommand: claim-expiry)
+    p_policy = sub.add_parser(
+        "policy",
+        help="Set a repository-level tracker policy",
+    )
+    policy_sub = p_policy.add_subparsers(dest="policy_op", required=True)
+
+    p_policy_expiry = policy_sub.add_parser(
+        "claim-expiry",
+        help=(
+            "Set the claim expiry in hours (appends policy.claim_expiry_set; "
+            "applies to every claim from this event onward, 24 without one)"
+        ),
+    )
+    p_policy_expiry.add_argument(
+        "--hours",
+        required=True,
+        type=float,
+        help="Hours a claim holds an item before the fold expires it "
+             "(must be positive)",
+    )
+    p_policy_expiry.add_argument(
+        "--actor", default=None, help="Actor string (role@handle)",
+    )
+    p_policy_expiry.add_argument(
+        "--offline", action="store_true",
+        help="Skip fetch and push; append and commit locally only "
+             "(also settable via the PINAX_OFFLINE=1 environment variable)",
+    )
+    p_policy_expiry.add_argument("--json", action="store_true", help="Output JSON")
+    p_policy_expiry.set_defaults(func=_cmd_policy_claim_expiry)
 
     # pinax priority
     p_priority = sub.add_parser(
@@ -639,6 +817,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Explicit integer rank (lower = more urgent), or 'bump'/'top'",
     )
     p_priority.add_argument("--actor", default=None, help="Actor string (role@handle)")
+    p_priority.add_argument(
+        "--offline", action="store_true",
+        help="Skip fetch and push; append and commit locally only "
+             "(also settable via the PINAX_OFFLINE=1 environment variable)",
+    )
     p_priority.add_argument("--json", action="store_true", help="Output JSON")
     p_priority.set_defaults(func=_cmd_priority)
 
@@ -650,6 +833,11 @@ def main(argv: list[str] | None = None) -> None:
     p_annul.add_argument("event_id", help="The target event's content-hash id")
     p_annul.add_argument("--reason", required=True, help="Annulment reason")
     p_annul.add_argument("--actor", default=None, help="Actor string (role@handle)")
+    p_annul.add_argument(
+        "--offline", action="store_true",
+        help="Skip fetch and push; append and commit locally only "
+             "(also settable via the PINAX_OFFLINE=1 environment variable)",
+    )
     p_annul.add_argument("--json", action="store_true", help="Output JSON")
     p_annul.set_defaults(func=_cmd_annul)
 
@@ -687,6 +875,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Back-compat alias: equivalent to --to <TO_ID> --type blocks",
     )
     p_dep_add.add_argument("--actor", default=None, help="Actor string (role@handle)")
+    p_dep_add.add_argument(
+        "--offline", action="store_true",
+        help="Skip fetch and push; append and commit locally only "
+             "(also settable via the PINAX_OFFLINE=1 environment variable)",
+    )
     p_dep_add.add_argument("--json", action="store_true", help="Output JSON")
     p_dep_add.set_defaults(func=_cmd_dep_add)
 
@@ -715,6 +908,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Back-compat alias: equivalent to --to <TO_ID> --type blocks",
     )
     p_dep_rm.add_argument("--actor", default=None, help="Actor string (role@handle)")
+    p_dep_rm.add_argument(
+        "--offline", action="store_true",
+        help="Skip fetch and push; append and commit locally only "
+             "(also settable via the PINAX_OFFLINE=1 environment variable)",
+    )
     p_dep_rm.add_argument("--json", action="store_true", help="Output JSON")
     p_dep_rm.set_defaults(func=_cmd_dep_rm)
 
@@ -726,12 +924,22 @@ def main(argv: list[str] | None = None) -> None:
         "--all-branches", action="store_true", dest="all_branches",
         help="Fold in every unmerged local branch's committed .ergon shards.",
     )
+    p_ready.add_argument(
+        "--under", default=None, metavar="ITEM_ID",
+        help="Restrict the ready set to the transitive parent-child "
+             "descendants of ITEM_ID",
+    )
     p_ready.set_defaults(func=_cmd_ready)
 
     # pinax next
     p_next = sub.add_parser("next", help="Show single next item to dispatch")
     p_next.add_argument("--actor", default=None, help="Actor string (role@handle)")
     p_next.add_argument("--json", action="store_true", help="Output JSON")
+    p_next.add_argument(
+        "--under", default=None, metavar="ITEM_ID",
+        help="Restrict the candidate set to the transitive parent-child "
+             "descendants of ITEM_ID",
+    )
     p_next.set_defaults(func=_cmd_next)
 
     # pinax verify
@@ -770,6 +978,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Optional caption (<= 200 chars)",
     )
     p_note_add.add_argument("--actor", default=None, help="Actor string (role@handle)")
+    p_note_add.add_argument(
+        "--offline", action="store_true",
+        help="Skip fetch and push; append and commit locally only "
+             "(also settable via the PINAX_OFFLINE=1 environment variable)",
+    )
     p_note_add.add_argument("--json", action="store_true", help="Output JSON")
     p_note_add.set_defaults(func=_cmd_note_add)
 
@@ -947,7 +1160,8 @@ def main(argv: list[str] | None = None) -> None:
     p_doctor.add_argument(
         "--stale-hours", type=float, default=None, dest="stale_hours",
         metavar="N",
-        help="Claim-staleness threshold in hours (default: 24) -- a claimed, "
+        help="Claim-staleness threshold in hours (default: the claim expiry "
+             "policy the log folds to, or 24 when it sets none) -- a claimed, "
              "unfinished item older than this is flagged as claim-without-done",
     )
     p_doctor.add_argument(

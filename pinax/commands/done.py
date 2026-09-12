@@ -1,10 +1,12 @@
 """
-pinax done <id> --briefing <file> [--actor …] [--json]
+pinax done <id> --briefing <file> [--actor <actor>] [--json]
 
-Appends an item.completed event carrying the briefing content as a
-work-record in the log payload.
+Records an item.completed event carrying the briefing content as a
+work-record in the log payload, through the publish sequence (pinax.sync):
+fetch, fold the union with the remote default branch, append, commit and
+push.
 
-The briefing is operational provenance — it is NOT knowledge-plane content.
+The briefing is operational provenance - it is NOT knowledge-plane content.
 It is stored in the log/fold state only.  Durable knowledge is projected to
 the vault via 'capability-project' at a separate step (Discipline 12).
 
@@ -18,9 +20,7 @@ import json
 import os
 import sys
 
-from ..append import append_event
-from ..event import mint_event
-from ..fold import read_events
+from .. import sync
 
 
 def _utc_now_iso() -> str:
@@ -38,12 +38,17 @@ def run(
     briefing_path: str,
     actor: str | None = None,
     as_json: bool = False,
+    runner=None,
 ) -> None:
     """
     Execute pinax done in repo_root.
 
-    Reads the briefing file, appends item.completed event with briefing
-    as a work-record in the payload.
+    Reads the briefing file, mints the item.completed event with the
+    briefing as a work-record in the payload, and hands it to the publish
+    sequence, which owns the fetch, the union fold, the append, the
+    projection, the commit and the push.
+
+    runner is injectable for tests only; the CLI passes none.
     """
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
@@ -62,32 +67,20 @@ def run(
     with open(briefing_path, "r", encoding="utf-8") as fh:
         briefing_content = fh.read()
 
-    events = read_events(log_dir)
-    next_seq = (max(e["seq"] for e in events) + 1) if events else 0
-
     _actor = actor or _default_actor()
-    ts = _utc_now_iso()
 
-    actor_events = [e for e in events if e.get("actor") == _actor]
-    prev = actor_events[-1]["id"] if actor_events else ""
-
-    payload = {
-        "item_id": item_id,
-        "briefing": briefing_content,
-    }
-    event = mint_event(
-        seq=next_seq,
-        ts=ts,
+    outcome = sync.run_sequence(
+        repo_root,
+        event_type="item.completed",
+        payload={"item_id": item_id, "briefing": briefing_content},
         actor=_actor,
-        etype="item.completed",
-        payload=payload,
-        prev=prev,
+        ts=_utc_now_iso(),
+        item_id=item_id,
+        runner=runner,
     )
-    append_event(log_dir, event, actor=_actor)
+    sync.conclude(outcome)
 
-    # Regenerate the projection atomically after the append (ADR-002).
-    from ..projection import regenerate
-    regenerate(repo_root)
+    event = outcome.event
 
     from ..doctor import warn_if_log_ignored
     warn_if_log_ignored(repo_root)
@@ -95,9 +88,9 @@ def run(
     result = {
         "item_id": item_id,
         "event_id": event["id"],
-        "seq": next_seq,
+        "seq": event["seq"],
         "actor": _actor,
-        "ts": ts,
+        "ts": event["ts"],
         "type": "item.completed",
         "briefing_chars": len(briefing_content),
         "root": ergon_dir,
@@ -110,5 +103,5 @@ def run(
         print(f"pinax: item {item_id} marked done by {_actor} in {ergon_dir}")
         print(
             f"       briefing={len(briefing_content)} chars "
-            f"event_id={event['id'][:12]}... seq={next_seq}"
+            f"event_id={event['id'][:12]}... seq={event['seq']}"
         )

@@ -15,6 +15,12 @@ pytestmark = pytest.mark.deep
 
 ACTOR = "operator@example.test"
 
+# Actor handle for a fixture wired to a bare-hub origin (docs/items/
+# CONSTRAINTS.md): the hub and the repository pushing to it carry no
+# "test" substring in any actor handle they use, defensively, regardless
+# of the append guard's own isolated-temp-directory exemption.
+HUB_ACTOR = "operator@hub"
+
 _PINAX_SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GITATTRIBUTES = "*.jsonl text eol=lf merge=union\n.ergon/** text eol=lf\n"
 
@@ -121,7 +127,36 @@ def cli_repo(empty_repo):
     r = _pinax(root, "add", "--title", "Item X", "--prefix", "pnx", "--actor", ACTOR, "--json")
     assert r.returncode == 0, r.stderr
     item_id = json.loads(r.stdout)["item_id"]
-    _commit_all(root, "add Item X")
+    # No follow-up commit here: 'add' now runs the publish sequence
+    # (pinax/sync.py), which commits the shard and the projection itself
+    # (ADR-006); the working tree is already clean by the time this
+    # fixture returns.
+    return root, item_id
+
+
+@pytest.fixture()
+def cli_repo_with_origin(clone_wired_to_hub):
+    """
+    A committed pinax repo with one 'pnx-' item and its 'origin' remote
+    wired to a reachable bare hub, for a test whose subject needs 'claim'
+    (the one command the publish sequence always requires the remote for)
+    to succeed rather than exit 4.
+
+    Same shape as 'cli_repo' otherwise. The clone, its own empty hooks
+    directory and the first push belong to the shared factory in
+    tests/conftest.py; this file's own git and CLI helpers do the work.
+    """
+    root = clone_wired_to_hub(
+        init_repo=_init_repo,
+        git=_git,
+        pinax=_pinax,
+        commit_all=_commit_all,
+        actor=HUB_ACTOR,
+    )
+
+    r = _pinax(root, "add", "--title", "Item X", "--prefix", "pnx", "--actor", HUB_ACTOR, "--json")
+    assert r.returncode == 0, r.stderr
+    item_id = json.loads(r.stdout)["item_id"]
     return root, item_id
 
 
@@ -143,14 +178,18 @@ class TestConfirmationNamesRoot:
         r = _pinax(root, "add", "--title", "B", "--actor", ACTOR)
         assert self._ergon_root(root) in r.stdout
 
-    def test_claim_json_and_plain(self, cli_repo):
-        root, item_id = cli_repo
-        r = _pinax(root, "claim", item_id, "--actor", ACTOR, "--json")
+    def test_claim_json_and_plain(self, cli_repo_with_origin):
+        # 'claim' always requires the remote (pinax/sync.py), so this
+        # fixture wires a reachable bare-hub origin rather than reusing
+        # 'cli_repo' -- this test's subject is the printed 'root'
+        # confirmation, not the sync exit codes themselves.
+        root, item_id = cli_repo_with_origin
+        r = _pinax(root, "claim", item_id, "--actor", HUB_ACTOR, "--json")
         assert json.loads(r.stdout)["root"] == self._ergon_root(root)
 
-        r = _pinax(root, "add", "--title", "C2", "--actor", ACTOR, "--json")
+        r = _pinax(root, "add", "--title", "C2", "--actor", HUB_ACTOR, "--json")
         item2 = json.loads(r.stdout)["item_id"]
-        r = _pinax(root, "claim", item2, "--actor", ACTOR)
+        r = _pinax(root, "claim", item2, "--actor", HUB_ACTOR)
         assert self._ergon_root(root) in r.stdout
 
     def test_done_json_and_plain(self, cli_repo, tmp_path):
@@ -193,15 +232,18 @@ class TestConfirmationNamesRoot:
         r = _pinax(root, "priority", item_id, "3", "--actor", ACTOR)
         assert self._ergon_root(root) in r.stdout
 
-    def test_annul_json_and_plain(self, cli_repo):
-        root, item_id = cli_repo
-        r = _pinax(root, "claim", item_id, "--actor", ACTOR, "--json")
+    def test_annul_json_and_plain(self, cli_repo_with_origin):
+        # 'claim' is used only to produce a target event for 'annul' to
+        # name; it needs a reachable origin to succeed at all (it always
+        # requires the remote), so this fixture wires one.
+        root, item_id = cli_repo_with_origin
+        r = _pinax(root, "claim", item_id, "--actor", HUB_ACTOR, "--json")
         target_event_id = json.loads(r.stdout)["event_id"]
 
-        r = _pinax(root, "annul", target_event_id, "--reason", "test", "--actor", ACTOR, "--json")
+        r = _pinax(root, "annul", target_event_id, "--reason", "test", "--actor", HUB_ACTOR, "--json")
         assert json.loads(r.stdout)["root"] == self._ergon_root(root)
 
-        r = _pinax(root, "annul", target_event_id, "--reason", "test again", "--actor", ACTOR)
+        r = _pinax(root, "annul", target_event_id, "--reason", "test again", "--actor", HUB_ACTOR)
         assert self._ergon_root(root) in r.stdout
 
     def test_dep_add_and_rm_json_and_plain(self, cli_repo):
@@ -344,7 +386,14 @@ class TestRootPin:
 
     def test_root_flag_takes_precedence_over_env_var(self, cli_repo, tmp_path):
         """When both --root and PINAX_ROOT are set, --root (the explicit,
-        per-invocation flag) wins over the ambient environment variable."""
+        per-invocation flag) wins over the ambient environment variable --
+        for the command itself and for the pre-commit hook that verifies
+        the command's own commit.
+
+        The hook receives no arguments, so the publish sequence hands it
+        the resolved root in its environment; a hook left with the stale
+        PINAX_ROOT below would refuse this commit for a root mismatch and
+        the event would be appended and never published."""
         root, item_id = cli_repo
         wrong = tmp_path / "wrong-env-dir"
         wrong.mkdir()
@@ -355,6 +404,10 @@ class TestRootPin:
         )
         assert r.returncode == 0, r.stderr
         assert json.loads(r.stdout)["priority"] == 7
+        # Published, not merely appended: the sequence's own commit ran the
+        # hook, the hook's verify passed, and nothing is left behind in the
+        # working tree.
+        assert _git(root, "status", "--porcelain").stdout.strip() == ""
 
     def test_pinned_root_blocks_unrelated_walkup(self, cli_repo, tmp_path):
         """PINAX_ROOT rejects a command whose working directory resolves elsewhere."""
