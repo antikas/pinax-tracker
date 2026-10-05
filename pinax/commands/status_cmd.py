@@ -20,7 +20,8 @@ import sys
 
 from ..append import append_event
 from ..event import mint_event
-from ..fold import read_events
+from ..fold import fold_events, read_events
+from ..targets import unknown_target_message
 from ..statusview import status_view
 
 _VALID_STATES = frozenset({
@@ -74,6 +75,18 @@ def _set_status(
         sys.exit(1)
 
     events = read_events(log_dir)
+
+    # This setter appends without the publish sequence, so it asks the one
+    # unknown-item rule (pinax.targets) itself, before anything is appended.
+    unknown = unknown_target_message(
+        "item.status_changed",
+        {"item_id": item_id, "status": new_status},
+        items=fold_events(events).get("items", {}),
+    )
+    if unknown is not None:
+        print(unknown + ".", file=sys.stderr)
+        sys.exit(1)
+
     next_seq = (max(e["seq"] for e in events) + 1) if events else 0
 
     _actor = actor or _default_actor()

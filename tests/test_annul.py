@@ -420,8 +420,10 @@ class TestAnnulCLIWiring:
         hub = tempfile.mkdtemp()
         subprocess.run([sys.executable, "-m", "pinax", "init"], check=True,
                        capture_output=True, cwd=hub, env=_build_env())
+        # An annulment names an event that exists; init's own first event is one.
+        target = read_events(os.path.join(hub, ".ergon", "log"))[0]["id"]
         result = subprocess.run(
-            [sys.executable, "-m", "pinax", "annul", "phantom-id", "--reason", "x", "--json"],
+            [sys.executable, "-m", "pinax", "annul", target, "--reason", "x", "--json"],
             capture_output=True, cwd=hub, env=_build_env(),
         )
         assert result.returncode == 0, result.stderr

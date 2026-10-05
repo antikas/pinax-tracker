@@ -69,11 +69,12 @@ def run(
 
     Mints the event.annulled event tombstoning target_id with the given
     reason and hands it to the publish sequence, which owns the fetch, the
-    union fold, the append, the projection, the commit and the push. Does
-    NOT validate that target_id exists in the log - annulling an id that
-    never appears is a harmless no-op (nothing to suppress), which keeps
-    this command a pure append with no read-then-conditionally-reject step
-    that could itself race with a concurrent writer.
+    union fold, the append, the projection, the commit and the push. The
+    sequence refuses a target_id that names no event in the union fold,
+    before appending anything (pinax.targets owns that rule): a tombstone
+    for an id that does not exist suppresses nothing and only misleads a
+    reader of the log. The check runs inside the sequence, against the same
+    union fold the append uses, so it adds no second read of its own.
 
     runner is injectable for tests only; the CLI passes none.
     """

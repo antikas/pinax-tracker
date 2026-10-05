@@ -74,6 +74,7 @@ from pinax.commands.note import run as note_run
 from pinax.commands.park import run as park_run
 from pinax.commands.priority import run as priority_run
 from pinax.event import mint_event
+from pinax.fold import read_events
 from pinax.sync import GitResult
 
 
@@ -1002,7 +1003,8 @@ def test_note_add_runs_the_sequence_once_with_its_own_subject(repo):
 
 def test_annul_runs_the_sequence_once_with_its_own_subject(repo):
     git = FakeGit(remote_events=[])
-    target = "9a8b7c6d5e4f"
+    # An annulment names an event that exists; the seeded creation is one.
+    target = read_events(_log_dir(repo))[0]["id"]
 
     annul_run(repo, target, "bad event", actor=ACTOR, runner=git)
 

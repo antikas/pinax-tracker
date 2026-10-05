@@ -95,10 +95,10 @@ def run(
     """
     Execute pinax priority in repo_root.
 
-    Validates the item exists (validate-before-append, same discipline as
-    pinax dep), resolves rank_arg (explicit int / bump / top) against the
-    current local fold, then hands an item.priority_set event with the
-    resolved integer to the publish sequence.
+    Resolves rank_arg (explicit int / bump / top) against the current local
+    fold, then hands an item.priority_set event with the resolved integer
+    to the publish sequence, which refuses an item that does not exist
+    before appending anything (pinax.targets owns that rule).
 
     runner is injectable for tests only; the CLI passes none.
     """
@@ -111,13 +111,6 @@ def run(
 
     state = fold(log_dir)
     items = state.get("items", {})
-
-    if item_id not in items:
-        print(
-            f"pinax: unknown item '{item_id}'. Known items: {', '.join(sorted(items))}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
     try:
         priority = _resolve_rank(rank_arg, item_id, items)

@@ -9,6 +9,9 @@ it wants to record and this module runs the whole sequence.
   fetch origin, unless offline mode applies
   fold the union of the local log and the remote default branch's
     committed shards (local log only, when offline)
+  refuse an event that names an item (or, for an annulment, an event) the
+    union does not hold, before anything is minted; the rule itself is
+    owned by pinax.targets
   refuse a claim whose intended timestamp is behind the newest published
     event by more than the clock tolerance, before anything is minted
   append the event
@@ -75,6 +78,8 @@ Exit codes are mapped in exactly one place, _exit_code:
 
   0  the event is committed, and pushed when the remote default branch is
      the checked-out branch
+  1  the event names an item that does not exist in the union fold (an
+     annulment: an event that does not exist); nothing was minted
   2  the actor handle is not role@host; nothing was minted
   3  the event is published and the fold over the pushed remote state
      reports this claim superseded by an earlier one
@@ -111,6 +116,7 @@ from .event import mint_event
 from .fold import _collect_annulled_ids, finalise_events, fold_events, read_raw_events
 from .projection import regenerate
 from .replay import ReplayRefError, read_raw_events_at_ref
+from .targets import unknown_target_message
 
 _REMOTE = "origin"
 _REMOTE_REF_PREFIX = f"refs/remotes/{_REMOTE}/"
@@ -140,6 +146,7 @@ _ITEMS_DIR_NAME = "items"
 _ACTOR_HANDLE_RE = re.compile(r"^[^\s@]+@[^\s@]+$")
 
 EXIT_OK = 0
+EXIT_UNKNOWN_TARGET = 1
 EXIT_INVALID_ACTOR = 2
 EXIT_CLAIM_SUPERSEDED = 3
 EXIT_REMOTE_REQUIRED = 4
@@ -148,6 +155,7 @@ EXIT_CLOCK_BEHIND = 6
 EXIT_COMMIT_REFUSED = 7
 
 INVALID_ACTOR = "invalid_actor"
+UNKNOWN_TARGET = "unknown_target"
 PUSHED = "pushed"
 COMMITTED_LOCAL = "committed_local"
 REMOTE_UNREACHABLE = "remote_unreachable"
@@ -176,6 +184,9 @@ _EXIT_BY_STATUS = {
     NO_DEFAULT_BRANCH: EXIT_OK,
     NOT_A_GIT_REPOSITORY: EXIT_OK,
     INVALID_ACTOR: EXIT_INVALID_ACTOR,
+    # The event names an item (or, for an annulment, an event) that the
+    # union fold does not hold; nothing was minted.
+    UNKNOWN_TARGET: EXIT_UNKNOWN_TARGET,
     # repo_root sits inside a different repository's history: the sequence
     # cannot publish there for any command, required-remote or not.
     FOREIGN_REPOSITORY: EXIT_REMOTE_REQUIRED,
@@ -945,6 +956,34 @@ def run_sequence(
             exc, report_base, appended=False, requires_remote=requires_remote
         )
     _note_fold_warnings(notes, state)
+
+    # The target rule, on the pre-append union fold and before anything is
+    # minted: an event about an item that does not exist is never appended.
+    # The rule and its message belong to pinax.targets; this is the one
+    # place the sequence asks it, so every command that publishes an event
+    # is covered without carrying a check of its own.
+    unknown = unknown_target_message(
+        event_type, payload, items=state.get("items", {}), events=events
+    )
+    if unknown is not None:
+        return SyncOutcome(
+            status=UNKNOWN_TARGET,
+            exit_code=_exit_code(UNKNOWN_TARGET, requires_remote),
+            report=dict(
+                report_base,
+                status=UNKNOWN_TARGET,
+                remote_branch=remote_branch,
+                appended=False,
+                committed=False,
+                pushed=False,
+                message=unknown,
+            ),
+            # Only the refusal: the notes gathered so far describe how an
+            # event would have been recorded, and none is.
+            notes=[unknown + "."],
+            remote_branch=remote_branch,
+            state=state,
+        )
 
     # The clock rule, on the pre-append fold and before anything is minted:
     # a command that asserts ownership from a moment in time may not record
