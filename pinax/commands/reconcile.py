@@ -29,6 +29,7 @@ from typing import Optional
 
 from ..append import append_event, _shard_name_for_actor
 from ..event import mint_event, _canonical_json, _b32
+from ..targets import unknown_target_message
 from ..fold import fold, read_events
 
 
@@ -284,7 +285,13 @@ def run(
             outcomes[idx] = ("reconciled", event_id)
             continue
 
-        if item_id not in items:
+        # The unknown-item decision is pinax.targets' alone; only the
+        # wording of the reason is this report's own.
+        if unknown_target_message(
+            "item.completed" if verb == "done" else "item.parked",
+            {"item_id": item_id},
+            items=items,
+        ) is not None:
             reason = f"unknown item-id: {item_id}"
             rejected.append({"line": stripped, "reason": reason})
             outcomes[idx] = ("rejected", reason)

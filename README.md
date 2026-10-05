@@ -112,6 +112,8 @@ The exit codes these commands share are:
 
     0  the event is committed, and published when the remote default
        branch is checked out
+    1  the command names an item that does not exist (an annulment: an
+       event that does not exist); nothing was appended
     2  the actor is not written as role@host; nothing was appended
     4  claim needed the remote and could not reach or read it, or any
        command's remote answered but its committed events could not be

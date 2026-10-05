@@ -24,7 +24,6 @@ import re
 import sys
 
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
-from ..fold import fold
 
 # pinax.sync imports pinax.projection, which imports pinax.commands.dep at
 # its own top level; deferred to run() below rather than imported here, to
@@ -54,7 +53,9 @@ def run(
     - ref that does not match the typed-ref pattern (ADR-004)
     - caption that exceeds 200 characters (ADR-004 / DESIGN.md)
 
-    On success: hands a note.added event to the publish sequence.
+    On success: hands a note.added event to the publish sequence, which
+    refuses an item that does not exist before appending anything
+    (pinax.targets owns that rule).
 
     runner is injectable for tests only; the CLI passes none.
     """
@@ -82,17 +83,6 @@ def run(
         print(
             f"pinax note add: REJECTED - caption exceeds {_CAPTION_MAX} characters "
             f"({len(caption)} chars). Truncate or use a ref to a vault document.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    # --- ITEM EXISTENCE CHECK ---
-
-    state = fold(log_dir)
-    items = state.get("items", {})
-    if item_id not in items:
-        print(
-            f"pinax note add: REJECTED - item {item_id!r} not found in the fold state.",
             file=sys.stderr,
         )
         sys.exit(1)

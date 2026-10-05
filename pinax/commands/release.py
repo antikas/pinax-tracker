@@ -20,9 +20,10 @@ state it reached. A later claim by another actor is then the winner.
 
 Refusals, all before anything is minted and each with one reason: an item
 the log does not know, an item carrying no live claim, and an empty
-reason. Reading the local fold first is the discipline pinax dep and pinax
-priority already use for their item; it decides nothing about ownership,
-which stays with the fold alone (ADR-006).
+reason. The local fold is read first because the live claim's owner is read
+from the item; the unknown-item rule itself is pinax.targets', the same one
+the publish sequence applies to every command. Reading it decides nothing
+about ownership, which stays with the fold alone (ADR-006).
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ import sys
 
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 from ..fold import fold
+from ..targets import unknown_target_message
 
 # pinax.sync imports pinax.projection, which imports pinax.commands.dep at
 # its own top level; deferred to run() below rather than imported here, to
@@ -75,11 +77,13 @@ def run(
     state = fold(log_dir)
     items = state.get("items", {})
 
-    if item_id not in items:
-        print(
-            f"pinax: unknown item '{item_id}'. Known items: {', '.join(sorted(items))}",
-            file=sys.stderr,
-        )
+    # The claim's owner has to be read from the item, so release looks the
+    # item up itself; the rule and its message stay with pinax.targets.
+    unknown = unknown_target_message(
+        "item.claim_released", {"item_id": item_id}, items=items
+    )
+    if unknown is not None:
+        print(unknown + ".", file=sys.stderr)
         sys.exit(1)
 
     owner = items[item_id].get("owner")

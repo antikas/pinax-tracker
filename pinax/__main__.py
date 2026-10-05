@@ -46,7 +46,8 @@ Supported commands:
     pinax annul  <event-id> --reason <reason> [--actor <actor>] [--offline] [--json]
         (tombstone a junk/tampered event id — appends event.annulled;
          fold suppresses ITS SPECIFIC tamper-evidence warning and payload
-         effects on every future fold; raw bytes stay untouched, append-only)
+         effects on every future fold; raw bytes stay untouched, append-only.
+         Refuses an id that names no event)
     pinax dep add <from_id> --to <to_id> --type <t> [--actor <actor>] [--offline] [--json]
     pinax dep add <from_id> --blocks <to_id> [--actor <actor>] [--offline] [--json]  (back-compat alias)
     pinax dep rm  <from_id> --to <to_id> --type <t> [--actor <actor>] [--offline] [--json]

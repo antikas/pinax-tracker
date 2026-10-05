@@ -32,7 +32,6 @@ import os
 import sys
 
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
-from ..fold import fold
 
 # pinax.sync imports pinax.projection, which imports this module for
 # VALID_EDGE_TYPES at its own top level -- a top-level "from .. import
@@ -71,9 +70,11 @@ def _run_dep(
 
     Hands dep.added (operation="add") or dep.removed (operation="rm") to
     the publish sequence. Validates first:
-    - Both item IDs exist in the fold state.
     - from_id != to_id (no self-edges).
     - edge_type is in the closed enum (VALID_EDGE_TYPES).
+
+    The publish sequence then refuses an edge whose either end names no
+    item, before appending anything (pinax.targets owns that rule).
 
     runner is injectable for tests only; the CLI passes none.
     """
@@ -93,21 +94,6 @@ def _run_dep(
         print("pinax: .ergon/log/ not found - run 'pinax init' first.", file=sys.stderr)
         sys.exit(1)
 
-    # Validate both item IDs exist.
-    state = fold(log_dir)
-    items = state.get("items", {})
-    if from_id not in items:
-        print(
-            f"pinax: unknown item '{from_id}'. Known items: {', '.join(sorted(items))}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    if to_id not in items:
-        print(
-            f"pinax: unknown item '{to_id}'. Known items: {', '.join(sorted(items))}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
     if from_id == to_id:
         print(
             "pinax: dep from_id and to_id must be different (self-dep not allowed).",
