@@ -159,9 +159,11 @@ def uncommitted_ergon_files(
     containing spaces or quotable characters parse exactly.
 
     Returns a sorted list of {"path": <repo-relative, forward-slash>,
-    "state": "untracked"|"modified"} — or None when git is unavailable /
-    this is not a git repo (fail-safe: the caller reports the class as
-    unavailable instead of guessing).
+    "state": "untracked"|"modified"}. A staged rename also carries
+    "renamed_from", the source path, which a commit must name to take the
+    source's removal with it; a copy has no removal to take. Returns None
+    when git is unavailable or this is not a git repo (fail-safe: the caller
+    reports the class as unavailable instead of guessing).
     """
     result = _run_git(
         repo_root, ["status", "--porcelain", "-z", "--", ergon_subpath]
@@ -178,14 +180,16 @@ def uncommitted_ergon_files(
             continue
         code = field[:2]
         path = field[3:]
-        entries.append(
-            {
-                "path": path,
-                "state": "untracked" if code == "??" else "modified",
-            }
-        )
-        # Rename/copy entries carry the source path as the NEXT NUL field.
-        if code and code[0] in ("R", "C"):
+        entry = {
+            "path": path,
+            "state": "untracked" if code == "??" else "modified",
+        }
+        entries.append(entry)
+        # A rename or copy, in either status column, carries the source path
+        # as the NEXT NUL field.
+        if "R" in code or "C" in code:
+            if "R" in code and i + 1 < len(fields) and fields[i + 1]:
+                entry["renamed_from"] = fields[i + 1]
             i += 2
         else:
             i += 1

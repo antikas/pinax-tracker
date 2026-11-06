@@ -255,7 +255,7 @@ def invalid_actor_message(actor: str) -> str | None:
         return None
     return (
         f"the actor {actor!r} is not a valid handle - every mutating "
-        "command requires role@host (for example builder@olympos), so "
+        "command requires role@host (for example builder@laptop), so "
         "the event log can tell every writer apart across machines"
     )
 
@@ -580,10 +580,21 @@ def _hook_environment(repo_root: str) -> dict[str, str]:
 
 
 def _commit(
-    git, repo_root: str, ergon_dir: str, shard_path: str, message: str
+    git,
+    repo_root: str,
+    ergon_dir: str,
+    shard_path: str,
+    message: str,
+    *,
+    only_these_paths: bool = True,
 ) -> tuple[str, GitResult]:
     """
     Stage the shard and the projection, then commit with hooks running.
+
+    The commit is limited to the paths staged here, so anything else
+    already staged stays staged and out of it. Git refuses a path-limited
+    commit while a merge is unfinished; only_these_paths=False is for the
+    one commit that exists to conclude such a merge.
 
     Only the commit carries _hook_environment: staging runs no hook. A hook
     that refuses the commit is reported as a refusal and never worked
@@ -592,18 +603,22 @@ def _commit(
     Returns the phase that failed and its result, so a repository that could
     not stage the files is never reported as a refused commit.
     """
-    staged = git.run(
-        "add",
-        "--",
-        shard_path,
-        os.path.join(ergon_dir, "board.md"),
-        os.path.join(ergon_dir, "items"),
-    )
+    items_dir = os.path.join(ergon_dir, "items")
+    paths = (shard_path, os.path.join(ergon_dir, "board.md"), items_dir)
+    staged = git.run("add", "--", *paths)
     if not staged.ok:
         return "stage", staged
-    return "commit", git.run(
-        "commit", "-m", message, env=_hook_environment(repo_root)
-    )
+    commit_args = ("commit", "-m", message)
+    if only_these_paths:
+        # Git rejects a path-limited commit naming a path it has never
+        # known, and an items directory with nothing staged in it can be
+        # unknown. Anything staged there, a deletion included, is known.
+        in_items = git.run("diff", "--cached", "--name-only", "--", items_dir)
+        if not in_items.ok:
+            return "stage", in_items
+        limit = paths if in_items.stdout.strip() else paths[:2]
+        commit_args += ("--", *limit)
+    return "commit", git.run(*commit_args, env=_hook_environment(repo_root))
 
 
 def _commit_message(event_type: str, item_id: str) -> str:
@@ -664,11 +679,26 @@ def _regenerate_after_pull(
     commit fails, and its own words become the obstacle returned here. An
     empty string means there is nothing standing in the way.
     """
+    # A merge git refused before starting leaves no MERGE_HEAD: nothing was
+    # merged, and the work staged beside the tracker files must not be
+    # swept into a commit that pretends otherwise.
+    concluding = not merged.ok and git.run(
+        "rev-parse", "--verify", "--quiet", "MERGE_HEAD"
+    ).ok
+    if not merged.ok and not concluding:
+        return merged.output() or "git merge failed"
     before = _projection_bytes(ergon_dir)
     regenerate(repo_root)
     if merged.ok and _projection_bytes(ergon_dir) == before:
         return ""
-    _phase, committed = _commit(git, repo_root, ergon_dir, shard_path, message)
+    _phase, committed = _commit(
+        git,
+        repo_root,
+        ergon_dir,
+        shard_path,
+        message,
+        only_these_paths=not concluding,
+    )
     return "" if committed.ok else committed.output()
 
 
