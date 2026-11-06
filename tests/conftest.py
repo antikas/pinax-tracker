@@ -17,11 +17,24 @@ import json as _json
 import os as _os
 import subprocess as _subprocess
 import sys as _sys
+import tempfile as _tempfile
 import time as _time
 from datetime import datetime as _datetime
 from pathlib import Path as _Path
 
 import pytest as _pytest
+
+
+# ---------------------------------------------------------------------------
+# The leak guard in pinax/append.py exempts the OS temp tree, and tests rely on
+# tmp_path being inside it. A runner can place pytest's base temporary directory
+# elsewhere with --basetemp, so this makes that directory the temp tree for the
+# test process: tmp_path stays the sandbox the guard exempts, wherever it is.
+# ---------------------------------------------------------------------------
+
+@_pytest.fixture(autouse=True, scope="session")
+def _base_temp_is_the_temp_tree(tmp_path_factory: "_pytest.TempPathFactory") -> None:
+    _tempfile.tempdir = str(tmp_path_factory.getbasetemp())
 
 
 def pytest_sessionstart(session: "_pytest.Session") -> None:
@@ -116,9 +129,7 @@ def pytest_sessionfinish(session: "_pytest.Session", exitstatus: int) -> None:
 # Lives entirely under the caller's pytest base temporary directory
 # (tmp_path). Its core.hooksPath points at an empty directory alongside it
 # so no hook installed on the host machine, outside pinax's own, gates a
-# test commit (docs/items/CONSTRAINTS.md; the campaign decision on commit
-# hooks under the sync). The hub publishes no content on its own: the
-# caller wires a working repository's `origin` remote at the returned path
+# test commit. The hub publishes no content on its own: the caller wires a working repository's `origin` remote at the returned path
 # and pushes that repository's base commit before running a command that
 # requires the remote.
 # ---------------------------------------------------------------------------

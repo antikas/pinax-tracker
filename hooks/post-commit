@@ -28,8 +28,7 @@ def main() -> None:
     if subprocess.run([sys.executable, "-m", "pinax", "overview", "--markdown"], cwd=repo_root).returncode:
         return
     if subprocess.run(["git", "diff", "--quiet", "--", "PORTFOLIO.md"], cwd=repo_root).returncode:
-        subprocess.run(["git", "add", "PORTFOLIO.md"], cwd=repo_root, check=False)
-        subprocess.run(["git", "commit", "-m", _MARKER], cwd=repo_root, check=False)
+        subprocess.run(["git", "commit", "-m", _MARKER, "--", "PORTFOLIO.md"], cwd=repo_root, check=False)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pinax-tracker"
-version = "0.2.1"
+version = "0.2.2"
 description = "Git-native, deterministic build tracker"
 readme = "README.md"
 license = "MIT"

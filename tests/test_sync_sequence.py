@@ -129,6 +129,7 @@ class FakeGit:
         # so a test can read what a git process (and the hooks it runs)
         # would have received. None means "this process's environment".
         self.call_envs: list[dict | None] = []
+        self.commit_paths: list[tuple[str, ...]] = []
         self.refs_read: list[str] = []
         # "<match>" (default): repo_toplevel() echoes back whatever
         # repo_root it is asked about, i.e. repo_root is its own top
@@ -146,7 +147,14 @@ class FakeGit:
         return self.toplevel
 
     def run(self, *args: str, env: dict | None = None) -> GitResult:
-        self.calls.append(args)
+        # A commit is recorded without its trailing path limit, which the
+        # tests that assert it read from commit_paths.
+        if args[0] == "commit" and "--" in args:
+            split = args.index("--")
+            self.commit_paths.append(args[split + 1 :])
+            self.calls.append(args[:split])
+        else:
+            self.calls.append(args)
         self.call_envs.append(env)
         name = args[0]
         if name == "fetch":
@@ -159,6 +167,8 @@ class FakeGit:
             return GitResult(returncode=0, stdout="")
         if name == "add":
             return self.stage
+        if name == "diff":
+            return GitResult(returncode=0, stdout=args[-1] + "\n")
         if name == "commit":
             return self.commit
         if name == "rev-parse":
@@ -941,6 +951,18 @@ def test_block_runs_the_sequence_once_with_its_own_subject(repo):
     assert [event["type"] for event in _shard_events(repo, ACTOR)] == ["item.blocked"]
 
 
+def test_the_commit_is_limited_to_the_shard_and_the_projection(repo):
+    git = FakeGit(remote_events=[])
+
+    park_run(repo, ITEM_ID, "later", actor=ACTOR, runner=git)
+
+    assert len(git.commit_paths) == 1
+    shard, board, items = git.commit_paths[0]
+    assert shard.endswith(ACTOR.replace("@", "-") + ".jsonl")
+    assert board == os.path.join(repo, ".ergon", "board.md")
+    assert items == os.path.join(repo, ".ergon", "items")
+
+
 def test_park_runs_the_sequence_once_with_its_own_subject(repo):
     git = FakeGit(remote_events=[])
 
@@ -1051,7 +1073,7 @@ def test_run_sequence_accepts_an_actor_with_at_host(repo):
         repo,
         event_type="item.blocked",
         payload={"item_id": ITEM_ID, "gate": "scope"},
-        actor="builder@olympos",
+        actor="builder@laptop",
         ts="2026-09-01T10:00:00Z",
         item_id=ITEM_ID,
         runner=git,
@@ -1076,9 +1098,9 @@ def test_block_refuses_an_actor_without_at_host(repo, capsys):
 def test_block_accepts_an_actor_with_at_host(repo):
     git = FakeGit(remote_events=[])
 
-    block_run(repo, ITEM_ID, "scope", actor="builder@olympos", runner=git)
+    block_run(repo, ITEM_ID, "scope", actor="builder@laptop", runner=git)
 
-    appended = _shard_events(repo, "builder@olympos")
+    appended = _shard_events(repo, "builder@laptop")
     assert [event["type"] for event in appended] == ["item.blocked"]
 
 

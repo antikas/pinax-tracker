@@ -67,7 +67,7 @@ def _print_report(repo_root: str, report: dict) -> None:
     elif not unc["files"]:
         print("  [1] uncommitted shard events: none")
     else:
-        n_files = len(unc["files"])
+        n_files = len({e["path"] for e in unc["files"]} | set(_rename_sources(unc["files"])))
         n_events = len(unc["events"])
         print(f"  [1] uncommitted shard events: {n_events} event(s) across "
               f"{n_files} uncommitted .ergon file(s)")
@@ -163,35 +163,95 @@ def _git(repo_root: str, args: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=repo_root, capture_output=True)
 
 
+def _rename_sources(files: list[dict]) -> list[str]:
+    return [e["renamed_from"] for e in files if e.get("renamed_from")]
+
+
+# Git refuses a path-limited commit while one of these operations is
+# unfinished, and each keeps this file until it ends.
+_OPERATION_STATE_FILES = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
+
+
+def _operation_unfinished(repo_root: str) -> bool:
+    # Staging would mark a conflicted file resolved with its markers still in
+    # it, and a conflict can outlast any operation: a stash pop leaves one
+    # with no state file at all.
+    if _git(repo_root, ["ls-files", "--unmerged"]).stdout:
+        return True
+    for name in _OPERATION_STATE_FILES:
+        found = _git(repo_root, ["rev-parse", "--git-path", name]).stdout
+        path = found.decode("utf-8", errors="replace").strip()
+        if path and os.path.exists(os.path.join(repo_root, path)):
+            return True
+    return False
+
+
+def _never_committed(repo_root: str, path: str) -> bool:
+    return _git(repo_root, ["cat-file", "-e", f"HEAD:{path}"]).returncode != 0
+
+
 def _reconcile_uncommitted(repo_root: str, report: dict) -> None:
     """Guided fix, class 1: one ordinary git commit of the orphaned paths."""
     unc = report["uncommitted"]
     if not unc["available"] or not unc["files"]:
         return
-    paths = [entry["path"] for entry in unc["files"]]
-    n_events = len(unc["events"])
-    answer = _prompt(
-        f"doctor: commit {len(paths)} orphaned .ergon file(s) "
-        f"({n_events} event(s)) as-is? [y/N] "
+    if _operation_unfinished(repo_root):
+        print("doctor: Git has an unfinished operation (see git status); "
+              "leaving uncommitted files in place. Finish it and run doctor again.",
+              file=sys.stderr)
+        return
+    paths = {entry["path"] for entry in unc["files"]}
+    # A file added and then deleted before any commit has nothing to commit:
+    # only its index entry remains to clear.
+    cleared = sorted(
+        p for p in paths
+        if not os.path.lexists(os.path.join(repo_root, p)) and _never_committed(repo_root, p)
     )
+    # A renamed file's old path is gone from the working tree, so it is
+    # committed by name rather than added; without it the removal stays
+    # staged after the commit. A source recreated on disk is named once.
+    named = sorted((paths - set(cleared)) | set(_rename_sources(unc["files"])))
+    n_events = len(unc["events"])
+    n_files = len(named)
+    clearing = f"clear {len(cleared)} .ergon file(s) added and then deleted"
+    committing = f"commit {n_files} orphaned .ergon file(s) ({n_events} event(s)) as-is"
+    actions = [text for text, wanted in ((committing, named), (clearing, cleared)) if wanted]
+    answer = _prompt(f"doctor: {' and '.join(actions)}? [y/N] ")
     if answer is None or answer.strip().lower() not in ("y", "yes"):
         print("doctor: leaving uncommitted files in place.")
         return
-    add = _git(repo_root, ["add", "--", *paths])
-    if add.returncode != 0:
-        print("doctor: git add failed: "
-              + add.stderr.decode("utf-8", errors="replace").strip(),
-              file=sys.stderr)
+    if cleared:
+        clear = _git(repo_root, ["rm", "--cached", "--quiet", "--", *cleared])
+        if clear.returncode != 0:
+            print("doctor: git rm failed: "
+                  + clear.stderr.decode("utf-8", errors="replace").strip(),
+                  file=sys.stderr)
+            return
+        print(f"doctor: cleared {len(cleared)} file(s) added and then deleted.")
+    if not named:
         return
+    # A deleted path cannot be added once it has left the index, which is how
+    # a staged deletion and a rename Git did not detect both appear. Only paths
+    # still on disk are added; the commit names every path, which takes each
+    # deletion with it.
+    on_disk = [p for p in named if os.path.lexists(os.path.join(repo_root, p))]
+    if on_disk:
+        add = _git(repo_root, ["add", "--", *on_disk])
+        if add.returncode != 0:
+            print("doctor: git add failed: "
+                  + add.stderr.decode("utf-8", errors="replace").strip(),
+                  file=sys.stderr)
+            return
     message = (f"pinax doctor: commit orphaned .ergon tracker trail "
-               f"({len(paths)} file(s), {n_events} event(s))")
-    commit = _git(repo_root, ["commit", "-m", message])
+               f"({n_files} file(s), {n_events} event(s))")
+    commit = _git(repo_root, ["commit", "-m", message, "--", *named])
     if commit.returncode != 0:
+        # Git writes some refusals to stdout, and a hook's output to stderr.
         print("doctor: git commit failed: "
-              + commit.stderr.decode("utf-8", errors="replace").strip(),
+              + (commit.stderr + commit.stdout).decode("utf-8", errors="replace").strip(),
               file=sys.stderr)
         return
-    print(f"doctor: committed {len(paths)} file(s).")
+    print(f"doctor: committed {n_files} file(s).")
 
 
 # What each resolution event is called on the console, in one place.

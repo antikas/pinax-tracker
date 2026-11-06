@@ -64,6 +64,28 @@ merge those files conflicted in. A merge that conflicted anywhere else is
 left for git to refuse: the commit that would conclude it fails, and that
 refusal ends the retry with exit 5 in the words git used.
 
+Other work staged in the repository changes none of this. Each commit the
+sequence makes is limited to the paths it staged, so that work stays staged
+and out of every Pinax commit. When the remote has diverged, Git may refuse
+the merge the pull performs because of that staged work. The sequence takes
+Git's refusal as the obstacle: it stops, ends with exit 5 and the
+`push_rejected` report, and leaves the staged work as it was.
+
+What the operator does next depends on the command. `claim` requires the
+remote, so it annuls its own event, as below, and ends with the same exit. The
+operator commits the other work, or sets it aside with
+`git stash push --staged`, and runs `claim` again. A plain `git stash` must not
+be used here: it also takes the uncommitted annulment, and the next `claim`
+would then publish the event that was annulled.
+
+Every other command keeps its event committed locally. Running the command
+again would append a second event, and for `add` a second item. The operator
+commits the other work, or sets it aside the same way, and runs
+`git pull --no-rebase`. That pull stops on a conflict in the generated files
+whenever both sides changed them. `pinax verify --fix`, `git add .ergon`,
+`git commit --no-edit` and `git push` then conclude the merge and publish the
+event. A pull that does not stop needs only `git push`.
+
 ## The fold decides how a claim ends
 
 After an accepted push the sequence fetches once more and folds again over
@@ -116,9 +138,9 @@ the warnings the log still carries. The operator is told each of those
 warnings once, not once per fold.
 
 A command whose purpose is cross-machine visibility declares that it
-requires the remote. Such a command ends with exit 4 when the sequence
-published nothing, and when the remote cannot be reached it appends nothing
-at all. When such a command has already appended and committed but cannot
+requires the remote. Such a command ends with exit 4 when the remote could
+not be used and with exit 5 when every push was rejected, and when the remote
+cannot be reached it appends nothing at all. When such a command has already appended and committed but cannot
 publish, it annuls its own event in the same shard, so an unpublished record
 is never carried forward by a later mutation.
 
@@ -140,8 +162,8 @@ performs no ownership check of its own; it publishes and lets the fold
 reconcile. The projection is written by regeneration from the log, as
 ADR-002 requires, and never by hand.
 
-A caller reads the outcome from the exit code alone: 0 published, 2 the
-actor handle, 3 a published claim the fold superseded, 4 a remote a claim
+A caller reads the outcome from the exit code alone: 0 published, 1 an id
+that names no item or event, with nothing appended, 2 the actor handle, 3 a published claim the fold superseded, 4 a remote a claim
 needed and could not reach or read, 5 a push rejected on every attempt, 6 a
 claim timestamp behind published history with nothing recorded, and 7 a
 staging failure or a refused commit.

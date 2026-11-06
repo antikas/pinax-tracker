@@ -115,10 +115,14 @@ The exit codes these commands share are:
     1  the command names an item that does not exist (an annulment: an
        event that does not exist); nothing was appended
     2  the actor is not written as role@host; nothing was appended
+    3  a published claim that the fold over the pushed remote state reports
+       superseded
     4  claim needed the remote and could not reach or read it, or any
        command's remote answered but its committed events could not be
        read
     5  the push was rejected on every attempt
+    6  a claim's timestamp is behind published history, or cannot be read;
+       nothing was appended
     7  the shard and the projection could not be staged, or the commit
        was refused; the appended event stays uncommitted either way
 
@@ -188,13 +192,11 @@ two-argument setter form. It scopes the building/shipped/parked lists and
 the next/queue_depth figures; the repo-wide claim-reconciliation notice
 count is unaffected.
 
-`next --json` and `status --json` were already JSON objects, so both
-simply gain an `under` key: the ancestor id, or `null` when `--under` is
-not given. `ready --json` was a bare array of item ids, and a JSON array
-cannot carry a key, so it keeps that exact shape when `--under` is not
-given; with `--under` it becomes `{"ready": [...], "under": "<id>"}`.
-`ready --json --all-branches` was already an object before `--under`
-existed, so it also just gains the `under` key.
+`next --json` and `status --json` are JSON objects with an `under` key:
+the ancestor id, or `null` when `--under` is not given. `ready --json` is
+a bare array of item ids when `--under` is not given; with `--under` it is
+`{"ready": [...], "under": "<id>"}`. `ready --json --all-branches` is an
+object that also carries the `under` key.
 
 An item with at least one `parent-child` child carries a derived
 `rollup` value beside its own `status` - `done`, `building`, `blocked`,

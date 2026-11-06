@@ -15,9 +15,8 @@ pytestmark = pytest.mark.deep
 
 ACTOR = "operator@example.test"
 
-# Actor handle for a fixture wired to a bare-hub origin (docs/items/
-# CONSTRAINTS.md): the hub and the repository pushing to it carry no
-# "test" substring in any actor handle they use, defensively, regardless
+# Actor handle for a fixture wired to a bare-hub origin: the hub and the
+# repository pushing to it carry no "test" substring in any actor handle they use, defensively, regardless
 # of the append guard's own isolated-temp-directory exemption.
 HUB_ACTOR = "operator@hub"
 

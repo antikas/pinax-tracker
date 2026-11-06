@@ -197,7 +197,8 @@ fetch from, it ends without appending anything, rather than recording a
 claim nobody else can see.
 
 Exit codes: 0 is committed, and published when the remote default branch
-is checked out; 2 is an actor not written as `role@host`, with nothing
+is checked out; 1 is an id that names no item or event, with nothing
+appended; 2 is an actor not written as `role@host`, with nothing
 appended; 3 is a published claim the fold over the pushed remote state
 reports superseded; 4 is a remote `claim` needed and could not reach or
 read, or any command's remote that answered but whose committed events

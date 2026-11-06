@@ -486,8 +486,7 @@ def test_reconcile_declined_leaves_everything_in_place(repo):
 def test_reconcile_prompts_done_park_skip_on_stale_claims(repo_with_origin):
     # 'claim' always requires the remote (pinax/sync.py), so this fixture
     # wires a reachable bare-hub origin rather than 'repo'; every actor
-    # driven against it carries no "test" substring (docs/items/
-    # CONSTRAINTS.md).
+    # driven against it carries no "test" substring.
     repo = repo_with_origin
     # A claim expiry wide enough to cover the far-future reference time
     # below, recorded before the claims so it is the policy in force for
