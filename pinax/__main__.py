@@ -22,7 +22,11 @@ Supported commands:
     pinax done   <id> --briefing <file> [--actor <actor>] [--offline] [--json]
         (runs the publish sequence; records the event locally when the
          remote cannot be reached, or when --offline is given)
-    pinax block  <id> --gate <gate> [--actor <actor>] [--offline] [--json]
+    pinax block  <id> --gate <gate> [--owner-gate CLASS] [--actor <actor>] [--offline] [--json]
+        (--owner-gate records the owner-gate class on the item. Under the
+         strict process a block with gate decision or destructive must name
+         a class from the project's list, and any class given must be on
+         it; under flow, the default, nothing is checked)
     pinax park   <id> --reason <reason> [--actor <actor>] [--offline] [--json]
     pinax release <id> --reason <reason> [--actor <actor>] [--offline] [--json]
         (release an item's live claim: appends item.claim_released. Any
@@ -37,6 +41,16 @@ Supported commands:
          expires a live claim as of the first event after it whose
          timestamp passes that deadline, so a log that records nothing
          after a claim never expires it)
+    pinax policy process --mode flow|strict [--actor <actor>] [--offline] [--json]
+        (repository-level: appends policy.process_set. The last one wins;
+         flow without one)
+    pinax policy owner-gates --class TEXT [--class TEXT ...] [--actor <actor>] [--offline] [--json]
+        (repository-level: appends policy.owner_gate_classes_set, the list
+         strict checks against. The last one wins; the built-in list without one)
+    pinax policy check [--json]
+        (read-only: lists blocked items for the owner with no valid
+         owner-gate class. Exits 0 under flow; under strict, 1 when it
+         lists any)
     pinax priority <id> <rank>|bump|top [--actor <actor>] [--offline] [--json]
         (priority control: appends item.priority_set;
          compute_next honours it ABOVE critical-path depth. <rank> is an
@@ -127,6 +141,8 @@ Their exit codes are:
     5  the push was rejected on every attempt
     7  the shard and the projection could not be staged, or the commit was
        refused; either way the appended event stays uncommitted
+    8  the project's policy refuses the event: under the strict process, a
+       block for the owner without a listed owner-gate class
 
 All commands operate on the repository at the current working directory (CWD),
 resolved by walking up from CWD to the nearest ancestor .git directory.
@@ -310,6 +326,7 @@ def _cmd_block(args: argparse.Namespace) -> None:
         repo_root=_find_repo_root(_resolve_root_pin(args)),
         item_id=args.id,
         gate=args.gate,
+        owner_gate=args.owner_gate,
         actor=args.actor,
         as_json=args.json,
         offline=args.offline,
@@ -348,6 +365,36 @@ def _cmd_policy_claim_expiry(args: argparse.Namespace) -> None:
         actor=args.actor,
         as_json=args.json,
         offline=args.offline,
+    )
+
+
+def _cmd_policy_process(args: argparse.Namespace) -> None:
+    from .commands.policy import run_process
+    run_process(
+        repo_root=_find_repo_root(_resolve_root_pin(args)),
+        mode=args.mode,
+        actor=args.actor,
+        as_json=args.json,
+        offline=args.offline,
+    )
+
+
+def _cmd_policy_owner_gates(args: argparse.Namespace) -> None:
+    from .commands.policy import run_owner_gates
+    run_owner_gates(
+        repo_root=_find_repo_root(_resolve_root_pin(args)),
+        classes=args.owner_gate_class,
+        actor=args.actor,
+        as_json=args.json,
+        offline=args.offline,
+    )
+
+
+def _cmd_policy_check(args: argparse.Namespace) -> None:
+    from .commands.policy import run_check
+    run_check(
+        repo_root=_find_repo_root(_resolve_root_pin(args)),
+        as_json=args.json,
     )
 
 
@@ -737,6 +784,12 @@ def main(argv: list[str] | None = None) -> None:
         choices=["scope", "decision", "destructive", "proposal"],
         help="Gate type",
     )
+    p_block.add_argument(
+        "--owner-gate", default=None, metavar="CLASS",
+        help="Owner-gate class, recorded on the item; required for gate "
+             "decision or destructive under the strict process, and then "
+             "checked against the project's list (see 'pinax policy check')",
+    )
     p_block.add_argument("--actor", default=None, help="Actor string (role@handle)")
     p_block.add_argument(
         "--offline", action="store_true",
@@ -806,6 +859,48 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_policy_expiry.add_argument("--json", action="store_true", help="Output JSON")
     p_policy_expiry.set_defaults(func=_cmd_policy_claim_expiry)
+
+    p_policy_process = policy_sub.add_parser(
+        "process",
+        help=(
+            "Set the project's process (appends policy.process_set; flow "
+            "without one, strict requires an owner-gate class on owner blocks)"
+        ),
+    )
+    p_policy_process.add_argument(
+        "--mode", required=True, choices=["flow", "strict"], help="Process",
+    )
+    p_policy_gates = policy_sub.add_parser(
+        "owner-gates",
+        help=(
+            "Set the owner-gate classes strict checks against (appends "
+            "policy.owner_gate_classes_set; the built-in list without one)"
+        ),
+    )
+    p_policy_gates.add_argument(
+        "--class", dest="owner_gate_class", action="append", required=True,
+        metavar="TEXT", help="One owner-gate class; repeat for each",
+    )
+    for parser_ in (p_policy_process, p_policy_gates):
+        parser_.add_argument("--actor", default=None, help="Actor string (role@handle)")
+        parser_.add_argument(
+            "--offline", action="store_true",
+            help="Skip fetch and push; append and commit locally only "
+                 "(also settable via the PINAX_OFFLINE=1 environment variable)",
+        )
+        parser_.add_argument("--json", action="store_true", help="Output JSON")
+    p_policy_process.set_defaults(func=_cmd_policy_process)
+    p_policy_gates.set_defaults(func=_cmd_policy_owner_gates)
+
+    p_policy_check = policy_sub.add_parser(
+        "check",
+        help=(
+            "List blocked items for the owner with no valid owner-gate class "
+            "(read-only; exits 1 on findings under strict only)"
+        ),
+    )
+    p_policy_check.add_argument("--json", action="store_true", help="Output JSON")
+    p_policy_check.set_defaults(func=_cmd_policy_check)
 
     # pinax priority
     p_priority = sub.add_parser(

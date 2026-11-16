@@ -30,6 +30,8 @@ from typing import Iterator
 
 from .event import (
     declared_expiry_hours,
+    declared_owner_gate_classes,
+    declared_process,
     parse_line,
     released_item,
     valid_annulment,
@@ -557,9 +559,53 @@ def _handle_policy_claim_expiry_set(state: dict, event: dict) -> None:
     state.setdefault("_pending_policies", []).append(event)
 
 
+def _policy_record(event: dict) -> dict:
+    return {"set_at": event["ts"], "set_by": event["actor"], "event_id": event["id"]}
+
+
+def _handle_policy_process_set(state: dict, event: dict) -> None:
+    """
+    Record a policy.process_set event: the project's process, flow or strict.
+
+    Repository-level and latest-by-total-order wins: state["process_policy"]
+    holds the last well-formed one. A log without one produces no key, and
+    pinax.owner_gates reads that as flow. A malformed record is warned about
+    and sets nothing.
+    """
+    process = declared_process(event)
+    if process is None:
+        logger.warning("policy.process_set event without flow or strict: %s", event.get("id"))
+        return
+    state["process_policy"] = dict(_policy_record(event), process=process)
+
+
+def _handle_policy_owner_gate_classes_set(state: dict, event: dict) -> None:
+    """
+    Record a policy.owner_gate_classes_set event: the project's class list.
+
+    Repository-level and latest-by-total-order wins, as the process is. A log
+    without one produces no key, and pinax.owner_gates reads that as the
+    default list. A malformed record is warned about and sets nothing.
+    """
+    listed = declared_owner_gate_classes(event)
+    if listed is None:
+        logger.warning(
+            "policy.owner_gate_classes_set event without a list of classes: %s",
+            event.get("id"),
+        )
+        return
+    state["owner_gate_policy"] = dict(_policy_record(event), classes=listed)
+
+
 def _handle_item_blocked(state: dict, event: dict) -> None:
     """
     Apply item.blocked to an item's status — sets status='blocked' and gate.
+
+    The owner-gate class is recorded when the event carries one and cleared
+    when it does not, so a later block without a class never inherits an
+    earlier block's class. An event without the key (every block written
+    before the class existed) leaves no owner_gate field at all. An item
+    that later leaves blocked loses its class in fold_events' post-pass.
 
     Latest-by-total-order wins (same discipline as item.status_changed).
     """
@@ -574,6 +620,11 @@ def _handle_item_blocked(state: dict, event: dict) -> None:
         return
     items[item_id]["status"] = "blocked"
     items[item_id]["gate"] = payload.get("gate", "")
+    owner_gate = payload.get("owner_gate")
+    if isinstance(owner_gate, str) and owner_gate.strip():
+        items[item_id]["owner_gate"] = owner_gate
+    else:
+        items[item_id].pop("owner_gate", None)
     items[item_id]["status_changed_at"] = event["ts"]
     items[item_id]["status_changed_by"] = event["actor"]
 
@@ -941,6 +992,8 @@ _HANDLERS = {
     "item.claimed": _handle_item_claimed,
     "item.claim_released": _handle_item_claim_released,
     "policy.claim_expiry_set": _handle_policy_claim_expiry_set,
+    "policy.process_set": _handle_policy_process_set,
+    "policy.owner_gate_classes_set": _handle_policy_owner_gate_classes_set,
     "item.blocked": _handle_item_blocked,
     "item.completed": _handle_item_completed,
     "item.parked": _handle_item_parked,
@@ -2181,6 +2234,14 @@ def fold_events(events: list[dict]) -> dict:
                 warnings.append(msg)
 
     _reconcile_claims(state, sorted(applied, key=_claim_sort_key))
+
+    # An owner-gate class describes a block in force. Once the item's
+    # settled status is anything but blocked, by whatever event moved it,
+    # the class is dropped, so the board and the item file never show a
+    # class for a block that has ended.
+    for item in state.get("items", {}).values():
+        if item.get("status") != "blocked":
+            item.pop("owner_gate", None)
 
     # Roll-up runs last: a post-pass over the fully reconciled state, after
     # claims (and their release/expiry) and the parent-child edges are both

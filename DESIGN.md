@@ -71,6 +71,20 @@ live. A log that records nothing after a claim never expires it: `pinax doctor
 --reconcile` offers a release there beside its done and park actions, and its
 staleness threshold defaults to the folded policy when the log carries one.
 
+## Owner-gate classes
+
+`policy.process_set` (flow or strict) and `policy.owner_gate_classes_set` (a
+list of classes) are repository-level events; the last of each in fold order is
+in force, and a log without one runs on flow and the built-in list. An
+`item.blocked` event may carry an `owner_gate` class; the fold records it on the
+item while the item stays blocked. A later block without one clears it, and so
+does any event that moves the item out of blocked. Every log written before the
+field existed replays unchanged. Under strict, the publish sequence asks
+`pinax.owner_gates` on the pre-append union fold and refuses a `decision` or
+`destructive` block with no listed class, with exit 8 and nothing minted.
+`pinax policy check` reports the blocked items for the owner that carry no valid
+class, and fails only under strict.
+
 ## Parent-child roll-up
 
 An item that has at least one direct child through a `parent-child` edge

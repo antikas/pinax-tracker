@@ -16,6 +16,10 @@ import json
 import math
 from typing import Any
 
+# pinax.owner_gates owns the set of valid processes. It imports nothing from
+# pinax, so this import cannot form a cycle.
+from .owner_gates import PROCESSES
+
 
 _DIGEST_BITS = 256  # blake2b truncated to 256 bits = 32 bytes = 52 chars base32
 
@@ -189,6 +193,51 @@ def declared_expiry_hours(event: dict) -> float | None:
     if not math.isfinite(hours) or hours <= 0:
         return None
     return float(hours)
+
+
+PROCESS_SET = "policy.process_set"
+OWNER_GATE_CLASSES_SET = "policy.owner_gate_classes_set"
+
+
+def declared_process(event: dict) -> str | None:
+    """
+    The process a well-formed policy.process_set event declares, else None.
+
+    The one place that payload's shape is stated: one of PROCESSES (flow
+    or strict). A record that declares anything else sets no process, so
+    the project keeps the one in force before it.
+    """
+    if not isinstance(event, dict) or event.get("type") != PROCESS_SET:
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    process = payload.get("process")
+    return process if process in PROCESSES else None
+
+
+def declared_owner_gate_classes(event: dict) -> list[str] | None:
+    """
+    The classes a well-formed policy.owner_gate_classes_set event declares.
+
+    The one place that payload's shape is stated: a non-empty list of
+    non-empty strings, each kept with its whitespace collapsed. Anything
+    else sets no list, so the project keeps the one in force before it.
+    """
+    if not isinstance(event, dict) or event.get("type") != OWNER_GATE_CLASSES_SET:
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    listed = payload.get("classes")
+    if not isinstance(listed, list) or not listed:
+        return None
+    cleaned = []
+    for entry in listed:
+        if not isinstance(entry, str) or not entry.strip():
+            return None
+        cleaned.append(" ".join(entry.split()))
+    return cleaned
 
 
 def valid_annulment(event: dict) -> bool:

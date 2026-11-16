@@ -152,6 +152,8 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
       ...
       ## Parked / needs human
       - <id> · <title> · <reason|gate>
+        (a blocked item with a recorded owner-gate class gains
+         " · owner gate: <class>" after its gate)
 
     `item_sources` (`--all-branches` only): optional {item_id: [branch
     names]} map — when an item id is a key, its line gets a trailing
@@ -238,6 +240,8 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
             status = item.get("status", "")
             if status == "blocked":
                 detail = f"gate={item.get('gate', '?')}"
+                if item.get("owner_gate"):
+                    detail += f" · owner gate: {item['owner_gate']}"
             else:
                 detail = item.get("park_reason", item.get("gate", "—"))
             lines.append(f"- {iid} · {item.get('title', '')} · {detail}")
@@ -492,6 +496,7 @@ def render_item(item_id: str, item: dict, state: dict) -> str:
       status: <status>
       rollup: <rollup, only when this item has children>
       gate: <gate>
+      owner_gate: <class, only while blocked with one recorded>
       deps: [<blockers>]
       cycle_home: <cycle-home if set>
       ---
@@ -552,6 +557,11 @@ def render_item(item_id: str, item: dict, state: dict) -> str:
         fm_lines.append(_fm("rollup", rollup))
     if gate:
         fm_lines.append(_fm("gate", gate))
+    # owner_gate is additive: present only while the item is blocked with a
+    # recorded class (the fold drops it once the item leaves blocked).
+    owner_gate = item.get("owner_gate", "")
+    if owner_gate:
+        fm_lines.append(_fm("owner_gate", owner_gate))
     if blockers:
         fm_lines.append(f"deps: [{', '.join(blockers)}]")
     else:

@@ -92,6 +92,9 @@ Exit codes are mapped in exactly one place, _exit_code:
      own form; the two are reported apart and nothing was minted either way
   7  the shard and the projection could not be staged, or the commit was
      refused; either way the appended event stays uncommitted
+  8  the project's policy refuses the event as given (a strict-process
+     block for the owner without a listed owner-gate class); nothing was
+     minted
 
 pinax.doctor reuses GitRunner and _default_branch, read-only, to compare
 what HEAD carries against the remote default branch without fetching; see
@@ -110,6 +113,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from typing import Callable
 
 from .append import append_event
 from .event import mint_event
@@ -153,6 +157,7 @@ EXIT_REMOTE_REQUIRED = 4
 EXIT_PUSH_EXHAUSTED = 5
 EXIT_CLOCK_BEHIND = 6
 EXIT_COMMIT_REFUSED = 7
+EXIT_POLICY_REFUSED = 8
 
 INVALID_ACTOR = "invalid_actor"
 UNKNOWN_TARGET = "unknown_target"
@@ -169,6 +174,7 @@ PUSH_REJECTED = "push_rejected"
 CLAIM_SUPERSEDED = "claim_superseded"
 CLOCK_BEHIND_REMOTE = "clock_behind_remote"
 UNREADABLE_TIMESTAMP = "unreadable_timestamp"
+POLICY_REFUSED = "policy_refused"
 
 # Outcomes that published nothing but left the repository consistent. They
 # are acceptable for a command that tolerates local-only work and are a
@@ -205,6 +211,8 @@ _EXIT_BY_STATUS = {
     # staging failure and a refused commit do.
     CLOCK_BEHIND_REMOTE: EXIT_CLOCK_BEHIND,
     UNREADABLE_TIMESTAMP: EXIT_CLOCK_BEHIND,
+    # Nothing was minted: the project's policy refuses the event as given.
+    POLICY_REFUSED: EXIT_POLICY_REFUSED,
 }
 
 
@@ -809,6 +817,7 @@ def run_sequence(
     requires_remote: bool = False,
     guard_clock: bool = False,
     offline: bool = False,
+    policy_check: Callable[[dict], str | None] | None = None,
     runner: GitRunner | None = None,
 ) -> SyncOutcome:
     """
@@ -843,6 +852,15 @@ def run_sequence(
     from before this parameter existed). Offline mode skips the fetch and
     the push; the event is still appended, folded against the local log
     alone, and committed.
+
+    policy_check is a command's project-policy rule. It is handed the
+    pre-append union fold, after the target rule, and returns None to let
+    the event through or a refusal message; a refusal ends with exit 8 and
+    nothing minted. The fold it reads is the same union the event would be
+    appended against, so a policy set on another clone already binds. A
+    check that lets the event through may complete the caller's payload
+    from that fold (block records a class in its listed spelling); the
+    event is minted from the payload once, after the check.
 
     runner is injectable for tests only; production callers pass none.
     """
@@ -1011,6 +1029,27 @@ def run_sequence(
             # Only the refusal: the notes gathered so far describe how an
             # event would have been recorded, and none is.
             notes=[unknown + "."],
+            remote_branch=remote_branch,
+            state=state,
+        )
+
+    # The command's policy rule, on the same pre-append union fold and
+    # before anything is minted.
+    refusal = policy_check(state) if policy_check is not None else None
+    if refusal is not None:
+        return SyncOutcome(
+            status=POLICY_REFUSED,
+            exit_code=_exit_code(POLICY_REFUSED, requires_remote),
+            report=dict(
+                report_base,
+                status=POLICY_REFUSED,
+                remote_branch=remote_branch,
+                appended=False,
+                committed=False,
+                pushed=False,
+                message=refusal,
+            ),
+            notes=[refusal],
             remote_branch=remote_branch,
             state=state,
         )
