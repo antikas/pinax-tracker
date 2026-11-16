@@ -75,11 +75,11 @@ def test_the_default_process_is_flow(repo):
     assert "process_policy" not in _state(repo)
 
 
-def test_the_default_list_is_the_core_rules_classes(repo):
+def test_the_default_list_is_the_built_in_classes(repo):
     assert owner_gates.classes(_state(repo)) == (
         "production deployment",
         "publication",
-        "real child or school data",
+        "real personal data",
         "irreversible or destructive act",
         "material change of scope, cost or architecture",
         "login-bound act or owner-held input",
@@ -127,7 +127,11 @@ def test_strict_refuses_a_planted_invented_class(repo, capsys):
     assert exc.value.code == sync.EXIT_POLICY_REFUSED == 8
     assert _log_bytes(repo) == before
     err = capsys.readouterr().err
-    assert f"'{INVENTED}' is not an owner-gate class" in err
+    listed = "; ".join(owner_gates.DEFAULT_CLASSES)
+    assert err.strip() == (
+        f"pinax: strict process: '{INVENTED}' is not an owner-gate class. "
+        f"Give one of these with --owner-gate: {listed}. Nothing was appended."
+    )
 
 
 @pytest.mark.parametrize("gate", ["decision", "destructive"])
@@ -145,17 +149,18 @@ def test_strict_refuses_a_block_for_the_owner_with_no_class(repo, capsys, gate):
     assert report["appended"] is False
 
 
-def test_the_refusal_is_one_sentence_that_shows_the_list(repo, capsys):
+def test_the_refusal_is_one_plain_line_that_shows_the_list(repo, capsys):
     _strict(repo)
     with pytest.raises(SystemExit):
         block_run(repo, ITEM, "decision", actor=ACTOR, runner=FakeGit(remote_events=[]))
 
     err = [line for line in capsys.readouterr().err.splitlines() if line.strip()]
     assert len(err) == 1
-    sentence = err[0]
-    assert sentence.count(". ") == 0 and sentence.endswith(".")
-    for entry in owner_gates.DEFAULT_CLASSES:
-        assert entry in sentence
+    listed = "; ".join(owner_gates.DEFAULT_CLASSES)
+    assert err[0] == (
+        "pinax: strict process: a block with gate decision needs an owner-gate class. "
+        f"Give one of these with --owner-gate: {listed}. Nothing was appended."
+    )
 
 
 def test_strict_accepts_a_listed_class_however_it_is_typed(repo):

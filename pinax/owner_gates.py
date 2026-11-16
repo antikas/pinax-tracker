@@ -39,7 +39,7 @@ OWNER_GATES = frozenset({"decision", "destructive"})
 DEFAULT_CLASSES = (
     "production deployment",
     "publication",
-    "real child or school data",
+    "real personal data",
     "irreversible or destructive act",
     "material change of scope, cost or architecture",
     "login-bound act or owner-held input",
@@ -87,7 +87,7 @@ def _list_text(listed: Iterable[str]) -> str:
 
 def block_refusal(state: dict, gate: str, owner_gate: str | None) -> str | None:
     """
-    None when the block may be appended; otherwise the one-sentence refusal.
+    None when the block may be appended; otherwise the one-line refusal.
 
     Only strict refuses anything. In strict, a block for the owner needs a
     listed class, and any class given on another gate must be listed too.
@@ -101,12 +101,12 @@ def block_refusal(state: dict, gate: str, owner_gate: str | None) -> str | None:
     if given is not None and match(given, listed) is not None:
         return None
     if given is None:
-        problem = f"a block with gate {gate} must name an owner-gate class"
+        problem = f"a block with gate {gate} needs an owner-gate class"
     else:
         problem = f"'{given.strip()}' is not an owner-gate class"
     return (
-        f"pinax: this project runs the strict process and {problem} with "
-        f"--owner-gate, one of: {_list_text(listed)}; nothing was appended."
+        f"pinax: strict process: {problem}. Give one of these with "
+        f"--owner-gate: {_list_text(listed)}. Nothing was appended."
     )
 
 

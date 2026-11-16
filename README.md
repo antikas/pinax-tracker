@@ -92,10 +92,15 @@ runs on `flow`.
   the class as given, and a block without it is the same event as before.
 - `strict`: a block for the owner must name a class with `--owner-gate`,
   and any class given must be on the project's list. A block with no class,
-  or with a class not on the list, is refused with one sentence that shows
-  the list, nothing is appended, and the command ends with exit 8. The
-  check runs on the union with the remote, so a process set on another
-  clone already binds.
+  or with a class not on the list, is refused, nothing is appended, and the
+  command ends with exit 8. The check runs on the union with the remote, so
+  a process set on another clone already binds. The refusal is one line that
+  shows the list, for example:
+
+  ```text
+  pinax: strict process: 'because I said so' is not an owner-gate class. Give one of these with --owner-gate: production deployment; publication; ... Nothing was appended.
+  pinax: strict process: a block with gate decision needs an owner-gate class. Give one of these with --owner-gate: production deployment; publication; ... Nothing was appended.
+  ```
 
 A class matches whatever its case and spacing, and is recorded in the
 list's own spelling. While the item is blocked, the class shows on its
@@ -103,12 +108,13 @@ board line (`gate=decision · owner gate: publication`) and as
 `owner_gate:` in its item file. When the item leaves blocked, the class
 goes with the block.
 
-The list is project policy too. Until `pinax policy owner-gates --class TEXT
-...` sets one, it is:
+The list is project policy too: a project sets its own list with
+`pinax policy owner-gates --class TEXT [--class TEXT ...]`. Until it does,
+the list is:
 
 - production deployment
 - publication
-- real child or school data
+- real personal data
 - irreversible or destructive act
 - material change of scope, cost or architecture
 - login-bound act or owner-held input
