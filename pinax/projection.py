@@ -30,12 +30,24 @@ from __future__ import annotations
 import json
 import os
 
+from . import owner_gates
 from .commands.dep import VALID_EDGE_TYPES
 from .fold import compute_next, compute_ready, fold_events, read_events
 
 # Deterministic display ordering for typed edges in per-item files (alphabetical).
 # Derived from the single-source enum — adding a 6th type requires only dep.py.
 _ALL_EDGE_TYPES = sorted(VALID_EDGE_TYPES)
+
+
+def _shows_owner_gate(state: dict) -> bool:
+    """
+    Whether the projection shows owner-gate classes: under strict only.
+
+    Under flow the class is recorded in the event and nowhere else, so the
+    board and item files stay byte-identical to what a client without
+    classes renders for the same log, and older clients see no drift.
+    """
+    return owner_gates.process_mode(state) == owner_gates.STRICT
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +164,8 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
       ...
       ## Parked / needs human
       - <id> · <title> · <reason|gate>
-        (a blocked item with a recorded owner-gate class gains
-         " · owner gate: <class>" after its gate)
+        (under the strict process, a blocked item with a recorded
+         owner-gate class gains " · owner gate: <class>" after its gate)
 
     `item_sources` (`--all-branches` only): optional {item_id: [branch
     names]} map — when an item id is a key, its line gets a trailing
@@ -233,6 +245,7 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
             parked_blocked_items.extend(lanes[status])
 
     if parked_blocked_items:
+        shows_class = _shows_owner_gate(state)
         lines.append("## Parked / needs human")
         lines.append("")
         for iid in parked_blocked_items:
@@ -240,7 +253,7 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
             status = item.get("status", "")
             if status == "blocked":
                 detail = f"gate={item.get('gate', '?')}"
-                if item.get("owner_gate"):
+                if shows_class and item.get("owner_gate"):
                     detail += f" · owner gate: {item['owner_gate']}"
             else:
                 detail = item.get("park_reason", item.get("gate", "—"))
@@ -496,7 +509,7 @@ def render_item(item_id: str, item: dict, state: dict) -> str:
       status: <status>
       rollup: <rollup, only when this item has children>
       gate: <gate>
-      owner_gate: <class, only while blocked with one recorded>
+      owner_gate: <class, only under strict while blocked with one recorded>
       deps: [<blockers>]
       cycle_home: <cycle-home if set>
       ---
@@ -557,10 +570,11 @@ def render_item(item_id: str, item: dict, state: dict) -> str:
         fm_lines.append(_fm("rollup", rollup))
     if gate:
         fm_lines.append(_fm("gate", gate))
-    # owner_gate is additive: present only while the item is blocked with a
-    # recorded class (the fold drops it once the item leaves blocked).
+    # owner_gate is additive: present only under the strict process, while
+    # the item is blocked with a recorded class (the fold drops it once the
+    # item leaves blocked). Under flow the class lives in the event alone.
     owner_gate = item.get("owner_gate", "")
-    if owner_gate:
+    if owner_gate and _shows_owner_gate(state):
         fm_lines.append(_fm("owner_gate", owner_gate))
     if blockers:
         fm_lines.append(f"deps: [{', '.join(blockers)}]")

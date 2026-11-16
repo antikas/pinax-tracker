@@ -79,7 +79,10 @@ in force, and a log without one runs on flow and the built-in list. An
 `item.blocked` event may carry an `owner_gate` class; the fold records it on the
 item while the item stays blocked. A later block without one clears it, and so
 does any event that moves the item out of blocked. Every log written before the
-field existed replays unchanged. Under strict, the publish sequence asks
+field existed replays unchanged. The projection shows the class only under
+strict: under flow the board and item files are byte-identical to those a
+client without classes renders for the same log, so mixed client versions see
+no drift until a project sets strict. Under strict, the publish sequence asks
 `pinax.owner_gates` on the pre-append union fold and refuses a `decision` or
 `destructive` block with no listed class, with exit 8 and nothing minted.
 `pinax policy check` reports the blocked items for the owner that carry no valid

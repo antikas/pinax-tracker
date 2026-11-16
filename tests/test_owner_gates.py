@@ -19,7 +19,7 @@ from pinax.commands.block import run as block_run
 from pinax.commands.policy import run_check, run_owner_gates, run_process
 from pinax.event import mint_event
 from pinax.fold import fold
-from pinax.projection import render_item
+from pinax.projection import render_board, render_item
 
 from test_sync_sequence import FakeGit, _log_dir, _seed, _shard_events
 
@@ -29,6 +29,11 @@ ITEM = "pnx-a1b2"
 OTHER = "pnx-c3d4"
 INVENTED = "because the moon is full"
 DEFAULT_CLASS = "production deployment"
+STRICT_WARNING = (
+    "pinax: every clone, and every older pinax on PATH, must run 0.3.0 or later "
+    "before this is used; an older client will report drift, and after "
+    "upgrading, pinax verify --fix repairs it."
+)
 
 
 @pytest.fixture()
@@ -265,7 +270,8 @@ def test_a_malformed_class_list_event_sets_nothing(repo):
 # The class on the item, the board and the item file
 # ---------------------------------------------------------------------------
 
-def test_the_board_and_the_item_file_show_the_class(repo):
+def test_under_strict_the_board_and_the_item_file_show_the_class(repo):
+    _strict(repo)
     block_run(repo, ITEM, "decision", actor=ACTOR, owner_gate="publication",
               runner=FakeGit(remote_events=[]))
 
@@ -303,9 +309,10 @@ def test_a_later_block_without_a_class_clears_the_earlier_class(repo):
     ],
 )
 def test_an_item_that_leaves_blocked_drops_its_class(repo, etype, payload):
-    _seed(repo, 2, "2026-09-01T09:02:00Z", OWNER, "item.blocked",
+    _strict(repo)
+    _seed(repo, 3, "2026-09-01T09:03:00Z", OWNER, "item.blocked",
           {"item_id": ITEM, "gate": "decision", "owner_gate": "publication"})
-    _seed(repo, 3, "2026-09-01T09:03:00Z", OWNER, etype, payload)
+    _seed(repo, 4, "2026-09-01T09:04:00Z", OWNER, etype, payload)
 
     state = _state(repo)
     item = state["items"][ITEM]
@@ -314,12 +321,65 @@ def test_an_item_that_leaves_blocked_drops_its_class(repo, etype, payload):
     assert "owner_gate" not in render_item(ITEM, item, state)
 
 
-def test_a_blocked_item_keeps_its_class_in_the_item_file(repo):
-    _seed(repo, 2, "2026-09-01T09:02:00Z", OWNER, "item.blocked",
+def test_under_strict_a_blocked_item_keeps_its_class_in_the_item_file(repo):
+    _strict(repo)
+    _seed(repo, 3, "2026-09-01T09:03:00Z", OWNER, "item.blocked",
           {"item_id": ITEM, "gate": "decision", "owner_gate": "publication"})
 
     state = _state(repo)
     assert "\nowner_gate: publication\n" in render_item(ITEM, state["items"][ITEM], state)
+
+
+def _projection(root):
+    state = _state(root)
+    pages = {iid: render_item(iid, item, state) for iid, item in state["items"].items()}
+    return render_board(state), pages
+
+
+def _two_logs(tmp_path, strict):
+    """The same log twice: one block carries a class, the other does not."""
+    roots = []
+    for name, extra in (("classed", {"owner_gate": "publication"}), ("plain", {})):
+        root = str(tmp_path / name)
+        os.makedirs(_log_dir(root))
+        _seed(root, 0, "2026-09-01T09:00:00Z", OWNER, "item.created",
+              {"item_id": ITEM, "title": "First", "prefix": "pnx"})
+        if strict:
+            _strict(root, seq=1)
+        _seed(root, 2, "2026-09-01T09:02:00Z", OWNER, "item.blocked",
+              dict({"item_id": ITEM, "gate": "decision"}, **extra))
+        roots.append(root)
+    return roots
+
+
+def test_under_flow_the_projection_equals_the_projection_without_the_class(tmp_path):
+    classed, plain = _two_logs(tmp_path, strict=False)
+
+    assert _state(classed)["items"][ITEM]["owner_gate"] == "publication"
+    assert _projection(classed) == _projection(plain)
+    board, pages = _projection(classed)
+    assert "owner gate" not in board
+    assert "owner_gate" not in pages[ITEM]
+
+
+def test_under_strict_the_projection_shows_the_class(tmp_path):
+    classed, plain = _two_logs(tmp_path, strict=True)
+
+    board, pages = _projection(classed)
+    assert f"- {ITEM} · First · gate=decision · owner gate: publication" in board
+    assert "\nowner_gate: publication\n" in pages[ITEM]
+    assert _projection(classed) != _projection(plain)
+
+
+def test_setting_strict_prints_the_upgrade_warning(repo, capsys):
+    run_process(repo, "strict", actor=ACTOR, runner=FakeGit(remote_events=[]))
+    out = capsys.readouterr().out
+    assert STRICT_WARNING in out.splitlines()
+
+
+def test_setting_flow_prints_no_upgrade_warning(repo, capsys):
+    run_process(repo, "flow", actor=ACTOR, runner=FakeGit(remote_events=[]))
+    assert STRICT_WARNING not in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

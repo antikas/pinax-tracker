@@ -45,6 +45,12 @@ import sys
 
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 
+STRICT_UPGRADE_WARNING = (
+    "pinax: every clone, and every older pinax on PATH, must run 0.3.0 or later "
+    "before this is used; an older client will report drift, and after "
+    "upgrading, pinax verify --fix repairs it."
+)
+
 # pinax.sync imports pinax.projection, which imports pinax.commands.dep at
 # its own top level; deferred to run() below rather than imported here, to
 # stay clear of that chain the way pinax.commands.dep itself now must.
@@ -187,7 +193,8 @@ def run_process(
 
     Hands a repository-level policy.process_set event to the publish
     sequence. Refuses, before anything is minted, a mode that is neither
-    flow nor strict.
+    flow nor strict. After setting strict it prints STRICT_UPGRADE_WARNING
+    (to stderr under --json, so the JSON line stays the only output).
 
     runner is injectable for tests only; the CLI passes none.
     """
@@ -206,6 +213,11 @@ def run_process(
         repo_root, "policy.process_set", {"process": mode},
         actor, as_json, offline, runner, f"process set to {mode}",
     )
+    if mode == owner_gates.STRICT:
+        # Strict puts the class on the board and in item files, which a
+        # client older than 0.3.0 does not render: it is the one act that
+        # needs every client upgraded first.
+        print(STRICT_UPGRADE_WARNING, file=sys.stderr if as_json else sys.stdout)
 
 
 def run_owner_gates(
