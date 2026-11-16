@@ -360,6 +360,8 @@ _EXEMPT = {
     "phase.opened": "repository-level",
     "item.created": "creates the id it carries",
     "policy.claim_expiry_set": "repository-level",
+    "policy.process_set": "repository-level",
+    "policy.owner_gate_classes_set": "repository-level",
     "registry.repo_added": "names a repository, not an item",
     "registry.repo_removed": "names a repository, not an item",
 }

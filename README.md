@@ -55,7 +55,7 @@ generated projection.
 pinax add --title TEXT
 pinax claim ITEM_ID
 pinax done ITEM_ID --briefing FILE
-pinax block ITEM_ID --gate scope|decision|destructive|proposal
+pinax block ITEM_ID --gate scope|decision|destructive|proposal [--owner-gate CLASS]
 pinax park ITEM_ID --reason TEXT
 pinax dep add FROM_ID --blocks TO_ID
 pinax ready [--under ITEM_ID]
@@ -65,6 +65,9 @@ pinax board [--json]
 pinax report [--json]
 pinax release ITEM_ID --reason TEXT
 pinax policy claim-expiry --hours N
+pinax policy process --mode flow|strict
+pinax policy owner-gates --class TEXT [--class TEXT ...]
+pinax policy check [--json]
 pinax verify [--fix]
 pinax replay --at GIT_REF
 ```
@@ -74,6 +77,64 @@ unless it is covered by a valid tombstone, then compares the generated board
 and item pages with the committed projection. `--fix` regenerates only a
 drifted projection. It refuses invalid event history without changing the log
 or projection.
+
+## Owner-gate classes
+
+A block with gate `decision` or `destructive` is a block for the owner: the
+item waits until the owner decides or approves. `scope` and `proposal` are
+not, and never need a class.
+
+Each project chooses a process with `pinax policy process --mode flow|strict`.
+The last such event in the log is the one in force, and a log without one
+runs on `flow`.
+
+Before you set `strict`, upgrade every clone, and every older `pinax` on
+PATH that a pre-commit hook could run, to 0.3.0 or later. Under strict the
+board and item files show the class, which an earlier Pinax does not
+write: it reports drift, its pre-commit hook refuses every commit, and its
+next write removes the class from the projection. After upgrading, run
+`pinax verify --fix` to repair the projection. The command prints the same
+warning when it sets strict.
+
+- `flow`: nothing is checked. `--owner-gate CLASS` on `pinax block` records
+  the class in the event and nowhere else, so the board and item files are
+  the same as an earlier Pinax writes for the same log. A block without the
+  option is the same event as before. A class that matches a listed one,
+  whatever its case and spacing, is stored in the list's spelling; any other
+  class is stored as given with its spaces collapsed.
+- `strict`: a block for the owner must name a class with `--owner-gate`,
+  and any class given must be on the project's list. A block with no class,
+  or with a class not on the list, is refused, nothing is appended, and the
+  command ends with exit 8. The check runs on the union with the remote, so
+  a process set on another clone already binds. With `--offline` there is no
+  remote check, so a strict process set on another clone and not yet pulled
+  does not bind. The refusal is one line that shows the list, for example:
+
+  ```text
+  pinax: strict process: 'because I said so' is not an owner-gate class. Give one of these with --owner-gate: production deployment; publication; ... Nothing was appended.
+  pinax: strict process: a block with gate decision needs an owner-gate class. Give one of these with --owner-gate: production deployment; publication; ... Nothing was appended.
+  ```
+
+Under strict, while the item is blocked, the class shows on its board line
+(`gate=decision · owner gate: publication`) and as `owner_gate:` in its
+item file. When the item leaves blocked, the class goes with the block.
+
+The list is project policy too: a project sets its own list with
+`pinax policy owner-gates --class TEXT [--class TEXT ...]`. Until it does,
+the list is:
+
+- production deployment
+- publication
+- real personal data
+- irreversible or destructive act
+- material change of scope, cost or architecture
+- login-bound act or owner-held input
+- start signal for a material plan
+
+`pinax policy check` lists every blocked item for the owner with no class,
+or with a class not on the list. Under `flow` it only reports and exits 0.
+Under `strict` it exits 1 when it lists any item. It reads the local log
+and changes nothing, so pull before you run it.
 
 ## Publishing a state change
 
@@ -125,6 +186,9 @@ The exit codes these commands share are:
        nothing was appended
     7  the shard and the projection could not be staged, or the commit
        was refused; the appended event stays uncommitted either way
+    8  the project's policy refuses the event: under the strict process,
+       a block for the owner without a listed owner-gate class; nothing
+       was appended
 
 A hook that refuses the commit is never worked around. The command prints
 the hook's output, names the shard and the event id, leaves the appended
