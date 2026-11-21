@@ -67,7 +67,8 @@ def utc_now_iso() -> str:
 def default_actor() -> str:
     """The actor handle a command falls back to when none is given explicitly."""
     import socket
-    return f"operator@{socket.gethostname()}"
+    from .append import normalise_actor
+    return normalise_actor(f"operator@{socket.gethostname()}")
 
 
 def hook_resolution_mode() -> str:

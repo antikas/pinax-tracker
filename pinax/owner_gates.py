@@ -18,6 +18,10 @@ neither needs a class.
 The list of classes is held in the project policy too. A log that sets no
 list runs on DEFAULT_CLASSES.
 
+Who may record a decision on an item is project policy as well. Under flow
+any actor may decide. Under strict only an actor on the project's
+decision-actor list may, and a project that sets no list lets nobody decide.
+
 Everything here is pure: it reads fold state and returns values or
 messages. The commands and the publish sequence ask it; none of them keeps
 its own copy of the rule.
@@ -146,3 +150,47 @@ def unclassed_blocked(state: dict) -> list[dict]:
             }
         )
     return found
+
+
+DECISION_ACTORS_COMMAND = "pinax policy decision-actors --decider <role@host>"
+
+
+def decision_actors(state: dict) -> tuple[str, ...] | None:
+    """The actors who may decide under strict: the last policy event's, else None."""
+    policy = state.get("decision_actors_policy")
+    if isinstance(policy, dict):
+        listed = policy.get("actors")
+        if isinstance(listed, list) and listed:
+            return tuple(listed)
+    return None
+
+
+def decide_refusal(state: dict, actor: str) -> str | None:
+    """
+    None when actor may decide; otherwise the one-line refusal.
+
+    Under flow any actor may decide and the list is recorded and not
+    checked. Under strict the deciding actor must be on the list in force,
+    compared with the host in lower case on both sides, and a project with
+    no list set refuses every decision.
+    """
+    if process_mode(state) != STRICT:
+        return None
+    # pinax.append imports pinax.event, which imports this module.
+    from .append import normalise_actor
+
+    listed = decision_actors(state)
+    if listed is None:
+        return (
+            "pinax: strict process: no decision-actor list is set, so no actor "
+            f"may decide. Set one with {DECISION_ACTORS_COMMAND}. Nothing was "
+            "appended."
+        )
+    allowed = {normalise_actor(entry) for entry in listed}
+    if normalise_actor(actor) in allowed:
+        return None
+    return (
+        f"pinax: strict process: {actor} is not on the decision-actor list "
+        f"({_list_text(listed)}). Set the list with {DECISION_ACTORS_COMMAND}. "
+        "Nothing was appended."
+    )

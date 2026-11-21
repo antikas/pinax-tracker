@@ -14,7 +14,8 @@ it wants to record and this module runs the whole sequence.
     owned by pinax.targets
   refuse a claim whose intended timestamp is behind the newest published
     event by more than the clock tolerance, before anything is minted
-  append the event
+  append the event, or the command's events in order (a park decision
+    publishes two in one commit)
   regenerate the projection
   commit the shard and the projection with the repository's hooks running
     and the resolved tracker root in their environment
@@ -93,8 +94,15 @@ Exit codes are mapped in exactly one place, _exit_code:
   7  the shard and the projection could not be staged, or the commit was
      refused; either way the appended event stays uncommitted
   8  the project's policy refuses the event as given (a strict-process
-     block for the owner without a listed owner-gate class); nothing was
-     minted
+     block for the owner without a listed owner-gate class, or a
+     strict-process decision from an actor not on the decision-actor list
+     or with no list set); nothing was minted
+
+Every report, and every write command's own result on exit 0, carries
+"published" and "sync_status" from SyncOutcome.publication, the one place
+publication is decided. "published" is true only when this run's push was
+accepted or the remote default branch as fetched in this run already holds
+what the result reports; exit 0 also covers a commit that stayed local.
 
 pinax.doctor reuses GitRunner and _default_branch, read-only, to compare
 what HEAD carries against the remote default branch without fetching; see
@@ -113,9 +121,9 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Sequence
 
-from .append import append_event
+from .append import append_event, prev_for_actor, shard_path_for_actor
 from .event import mint_event
 from .fold import _collect_annulled_ids, finalise_events, fold_events, read_raw_events
 from .projection import regenerate
@@ -175,6 +183,7 @@ CLAIM_SUPERSEDED = "claim_superseded"
 CLOCK_BEHIND_REMOTE = "clock_behind_remote"
 UNREADABLE_TIMESTAMP = "unreadable_timestamp"
 POLICY_REFUSED = "policy_refused"
+ALREADY_PUBLISHED = "already_published"
 
 # Outcomes that published nothing but left the repository consistent. They
 # are acceptable for a command that tolerates local-only work and are a
@@ -213,6 +222,9 @@ _EXIT_BY_STATUS = {
     UNREADABLE_TIMESTAMP: EXIT_CLOCK_BEHIND,
     # Nothing was minted: the project's policy refuses the event as given.
     POLICY_REFUSED: EXIT_POLICY_REFUSED,
+    # Nothing was minted: the remote default branch, as fetched in this
+    # run, already records what the command would append.
+    ALREADY_PUBLISHED: EXIT_OK,
 }
 
 
@@ -370,6 +382,20 @@ class SyncOutcome:
     shard_path: str | None = None
     remote_branch: str | None = None
     state: dict = field(default_factory=dict)
+    # Every event this sequence minted, in append order; event is the first.
+    events: list[dict] = field(default_factory=list)
+    # True once this run's push was accepted by the remote.
+    push_accepted: bool = False
+
+    def publication(self) -> dict:
+        """
+        The two keys every write result carries: whether this run's push
+        to the remote default branch was accepted or the remote default
+        branch as fetched already held the events, and this run's status.
+        The one place publication is decided.
+        """
+        published = self.push_accepted or self.status == ALREADY_PUBLISHED
+        return {"published": published, "sync_status": self.status}
 
 
 def _default_branch(git) -> str | None:
@@ -562,12 +588,6 @@ def _superseded_by(state: dict, event: dict) -> dict | None:
 def _next_seq(events: list[dict]) -> int:
     """The sequence number after every event in the union."""
     return (max(event["seq"] for event in events) + 1) if events else 0
-
-
-def _prev_for_actor(events: list[dict], actor: str) -> str:
-    """This actor's latest event id in the union, or the empty sentinel."""
-    owned = [event for event in events if event.get("actor") == actor]
-    return owned[-1]["id"] if owned else ""
 
 
 def _hook_environment(repo_root: str) -> dict[str, str]:
@@ -774,6 +794,7 @@ def _unreadable_outcome(
     shard_path: str | None = None,
     remote_branch: str | None = None,
     state: dict | None = None,
+    push_accepted: bool = False,
 ) -> SyncOutcome:
     """The outcome for a remote whose committed events could not be read."""
     lines = list(notes or [])
@@ -803,6 +824,7 @@ def _unreadable_outcome(
         shard_path=shard_path,
         remote_branch=remote_branch,
         state=state if state is not None else {},
+        push_accepted=push_accepted,
     )
 
 
@@ -818,6 +840,8 @@ def run_sequence(
     guard_clock: bool = False,
     offline: bool = False,
     policy_check: Callable[[dict], str | None] | None = None,
+    follow_on: Sequence[tuple[str, dict]] = (),
+    already_recorded: Callable[[dict], bool] | None = None,
     runner: GitRunner | None = None,
 ) -> SyncOutcome:
     """
@@ -862,8 +886,67 @@ def run_sequence(
     from that fold (block records a class in its listed spelling); the
     event is minted from the payload once, after the check.
 
+    follow_on names further events, each an (event type, payload) pair, that
+    the same command publishes after the first in the same commit. The
+    target rule is applied to each of them on the same union fold; they
+    share the first event's actor and timestamp, take the next sequence
+    numbers in turn, and each names the one before it as prev. The commit
+    subject names the first event. Every command but decide passes none
+    and publishes exactly one event.
+
+    already_recorded is handed the pre-append union fold, after the policy
+    rule. True means the events are already in the log, so nothing is
+    minted and the sequence delivers the existing record instead: when the
+    fold of the remote default branch as fetched in this run also answers
+    true, it ends with status already_published and exit 0; otherwise it
+    commits the actor's shard and the projection when HEAD does not yet
+    hold the events, and pushes when HEAD holds commits the remote default
+    branch lacks, ending exactly as a fresh event would there. A repeat
+    never appends a second copy, whether the first is uncommitted,
+    committed, local only or published.
+
     runner is injectable for tests only; production callers pass none.
     """
+    minted: list[dict] = []
+    outcome = _run_sequence(
+        repo_root,
+        event_type=event_type,
+        payload=payload,
+        actor=actor,
+        ts=ts,
+        item_id=item_id,
+        requires_remote=requires_remote,
+        guard_clock=guard_clock,
+        offline=offline,
+        policy_check=policy_check,
+        follow_on=tuple(follow_on),
+        already_recorded=already_recorded,
+        runner=runner,
+        minted=minted,
+    )
+    outcome.events = list(minted)
+    outcome.report.update(outcome.publication())
+    return outcome
+
+
+def _run_sequence(
+    repo_root: str,
+    *,
+    event_type: str,
+    payload: dict,
+    actor: str,
+    ts: str,
+    item_id: str,
+    requires_remote: bool,
+    guard_clock: bool,
+    offline: bool,
+    policy_check: Callable[[dict], str | None] | None,
+    follow_on: tuple[tuple[str, dict], ...],
+    already_recorded: Callable[[dict], bool] | None,
+    runner: GitRunner | None,
+    minted: list[dict],
+) -> SyncOutcome:
+    """run_sequence's body; every event it mints is added to minted."""
     ergon_dir = os.path.join(repo_root, ".ergon")
     report_base = {
         "event_type": event_type,
@@ -1010,9 +1093,13 @@ def run_sequence(
     # The rule and its message belong to pinax.targets; this is the one
     # place the sequence asks it, so every command that publishes an event
     # is covered without carrying a check of its own.
-    unknown = unknown_target_message(
-        event_type, payload, items=state.get("items", {}), events=events
-    )
+    unknown = None
+    for target_type, target_payload in ((event_type, payload), *follow_on):
+        unknown = unknown_target_message(
+            target_type, target_payload, items=state.get("items", {}), events=events
+        )
+        if unknown is not None:
+            break
     if unknown is not None:
         return SyncOutcome(
             status=UNKNOWN_TARGET,
@@ -1052,6 +1139,69 @@ def run_sequence(
             notes=[refusal],
             remote_branch=remote_branch,
             state=state,
+        )
+
+    # The repeat rule, on the same pre-append union fold and before
+    # anything is minted. A repeat delivers the existing record through the
+    # same commit and push half a fresh event runs.
+    if already_recorded is not None and already_recorded(state):
+        repeat_base = dict(
+            report_base,
+            remote_branch=remote_branch,
+            commit_message=message,
+            shard=shard_path_for_actor(log_dir, actor),
+            appended=False,
+        )
+        if remote_raw and already_recorded(fold_events(finalise_events(list(remote_raw)))):
+            return SyncOutcome(
+                status=ALREADY_PUBLISHED,
+                exit_code=_exit_code(ALREADY_PUBLISHED, requires_remote),
+                report=dict(
+                    repeat_base,
+                    status=ALREADY_PUBLISHED,
+                    committed=True,
+                    pushed=False,
+                    message=(
+                        f"{remote_branch} already records this, so nothing was "
+                        "appended, committed or pushed"
+                    ),
+                ),
+                notes=_fold_warnings(state),
+                remote_branch=remote_branch,
+                state=state,
+            )
+        commit_needed = False
+        if not no_git_repo:
+            try:
+                head_raw = git.raw_events_at_ref("HEAD")
+            except RemoteReadError as exc:
+                return _unreadable_outcome(
+                    exc, repeat_base, appended=False, requires_remote=requires_remote
+                )
+            committed_fold = fold_events(
+                finalise_events(list(head_raw or []) + list(remote_raw))
+            )
+            commit_needed = not already_recorded(committed_fold)
+        return _deliver(
+            git,
+            repo_root=repo_root,
+            ergon_dir=ergon_dir,
+            log_dir=log_dir,
+            shard_path=repeat_base["shard"],
+            message=message,
+            report_base=repeat_base,
+            notes=notes,
+            event=None,
+            state=state,
+            remote_branch=remote_branch,
+            remote_ref=remote_ref,
+            unpublished_status=unpublished_status,
+            unpublished_reason=unpublished_reason,
+            no_git_repo=no_git_repo,
+            requires_remote=requires_remote,
+            item_id=item_id,
+            actor=actor,
+            commit_needed=commit_needed,
         )
 
     # The clock rule, on the pre-append fold and before anything is minted:
@@ -1138,9 +1288,22 @@ def run_sequence(
         actor=actor,
         etype=event_type,
         payload=payload,
-        prev=_prev_for_actor(events, actor),
+        prev=prev_for_actor(log_dir, actor),
     )
     shard_path = append_event(log_dir, event, actor=actor)
+    minted.append(event)
+    for next_type, next_payload in follow_on:
+        before = minted[-1]
+        following = mint_event(
+            seq=before["seq"] + 1,
+            ts=ts,
+            actor=actor,
+            etype=next_type,
+            payload=next_payload,
+            prev=before["id"],
+        )
+        append_event(log_dir, following, actor=actor)
+        minted.append(following)
     regenerate(repo_root)
 
     report_base = dict(
@@ -1150,6 +1313,80 @@ def run_sequence(
         shard=shard_path,
         remote_branch=remote_branch,
         commit_message=message,
+    )
+    if follow_on:
+        report_base["follow_on_event_ids"] = [e["id"] for e in minted[1:]]
+
+    return _deliver(
+        git,
+        repo_root=repo_root,
+        ergon_dir=ergon_dir,
+        log_dir=log_dir,
+        shard_path=shard_path,
+        message=message,
+        report_base=report_base,
+        notes=notes,
+        event=event,
+        state=state,
+        remote_branch=remote_branch,
+        remote_ref=remote_ref,
+        unpublished_status=unpublished_status,
+        unpublished_reason=unpublished_reason,
+        no_git_repo=no_git_repo,
+        requires_remote=requires_remote,
+        item_id=item_id,
+        actor=actor,
+    )
+
+
+def _ahead_of_remote(git, remote_ref: str) -> bool:
+    """True when HEAD holds a commit the fetched remote branch lacks."""
+    counted = git.run("rev-list", "--count", remote_ref + "..HEAD")
+    if not counted.ok:
+        return True
+    try:
+        return int(counted.stdout.strip() or "0") > 0
+    except ValueError:
+        return True
+
+
+def _deliver(
+    git,
+    *,
+    repo_root: str,
+    ergon_dir: str,
+    log_dir: str,
+    shard_path: str,
+    message: str,
+    report_base: dict,
+    notes: list[str],
+    event: dict | None,
+    state: dict,
+    remote_branch: str | None,
+    remote_ref: str | None,
+    unpublished_status: str,
+    unpublished_reason: str,
+    no_git_repo: bool,
+    requires_remote: bool,
+    item_id: str,
+    actor: str,
+    commit_needed: bool = True,
+) -> SyncOutcome:
+    """
+    The commit and push half of the sequence, for events already in the
+    working-tree log.
+
+    event is the first event this run minted, or None for a repeat that
+    delivers events an earlier run appended. A repeat passes
+    commit_needed=False when HEAD already holds them, and is pushed only
+    when HEAD holds commits the remote default branch lacks.
+    """
+    repeat = event is None
+    subject = "the recorded event" if repeat else "the event"
+    event_label = (
+        f"the recorded event in {shard_path}"
+        if repeat
+        else f"event {event['id']} in {shard_path}"
     )
 
     if no_git_repo:
@@ -1164,7 +1401,7 @@ def run_sequence(
                 status=NOT_A_GIT_REPOSITORY,
                 committed=False,
                 pushed=False,
-                message="the event is appended locally; " + unpublished_reason,
+                message=subject + " is appended locally; " + unpublished_reason,
             ),
             notes=notes,
             event=event,
@@ -1173,48 +1410,51 @@ def run_sequence(
             state=state,
         )
 
-    phase, committed = _commit(git, repo_root, ergon_dir, shard_path, message)
-    if not committed.ok:
-        detail = committed.output()
-        if phase == "stage":
-            status = STAGE_FAILED
-            headline = "the shard and the projection could not be staged"
-            summary = (
-                "the shard and the projection could not be staged, so the "
-                "appended event stays uncommitted; fix the repository and "
-                "commit them"
+    if commit_needed:
+        if repeat:
+            regenerate(repo_root)
+        phase, committed = _commit(git, repo_root, ergon_dir, shard_path, message)
+        if not committed.ok:
+            detail = committed.output()
+            if phase == "stage":
+                status = STAGE_FAILED
+                headline = "the shard and the projection could not be staged"
+                summary = (
+                    "the shard and the projection could not be staged, so the "
+                    "appended event stays uncommitted; fix the repository and "
+                    "commit them"
+                )
+            else:
+                status = COMMIT_REFUSED
+                headline = "the commit was refused"
+                summary = (
+                    "the commit was refused, so the appended event stays "
+                    "uncommitted; fix the refusal and commit the shard and "
+                    "the projection"
+                )
+            notes.append(
+                f"pinax: {headline}, so {event_label} "
+                "is appended and not committed."
             )
-        else:
-            status = COMMIT_REFUSED
-            headline = "the commit was refused"
-            summary = (
-                "the commit was refused, so the appended event stays "
-                "uncommitted; fix the refusal and commit the shard and "
-                "the projection"
-            )
-        notes.append(
-            f"pinax: {headline}, so event {event['id']} in {shard_path} "
-            "is appended and not committed."
-        )
-        if detail:
-            notes.append(detail)
-        return SyncOutcome(
-            status=status,
-            exit_code=_exit_code(status, requires_remote),
-            report=dict(
-                report_base,
+            if detail:
+                notes.append(detail)
+            return SyncOutcome(
                 status=status,
-                committed=False,
-                phase=phase,
-                git_output=detail,
-                message=summary,
-            ),
-            notes=notes,
-            event=event,
-            shard_path=shard_path,
-            remote_branch=remote_branch,
-            state=state,
-        )
+                exit_code=_exit_code(status, requires_remote),
+                report=dict(
+                    report_base,
+                    status=status,
+                    committed=False,
+                    phase=phase,
+                    git_output=detail,
+                    message=summary,
+                ),
+                notes=notes,
+                event=event,
+                shard_path=shard_path,
+                remote_branch=remote_branch,
+                state=state,
+            )
 
     if remote_branch is None:
         return SyncOutcome(
@@ -1225,7 +1465,7 @@ def run_sequence(
                 status=unpublished_status,
                 committed=True,
                 pushed=False,
-                message="the event is committed locally; " + unpublished_reason,
+                message=subject + " is committed locally; " + unpublished_reason,
             ),
             notes=notes,
             event=event,
@@ -1240,7 +1480,7 @@ def run_sequence(
         refused = head_branch or "the checked-out branch"
         notes.append(
             f"pinax: the push was refused because {refused} is not the "
-            f"{_REMOTE} default branch {remote_branch}; the event is "
+            f"{_REMOTE} default branch {remote_branch}; {subject} is "
             "committed locally and not published."
         )
         return SyncOutcome(
@@ -1255,6 +1495,29 @@ def run_sequence(
                 message=(
                     f"the sync publishes only {remote_branch} and {refused} "
                     "is checked out"
+                ),
+            ),
+            notes=notes,
+            event=event,
+            shard_path=shard_path,
+            remote_branch=remote_branch,
+            state=state,
+        )
+
+    if repeat and not _ahead_of_remote(git, remote_ref):
+        # HEAD is already contained in the remote branch and the remote
+        # fold still does not record the events, so a push carries nothing.
+        return SyncOutcome(
+            status=COMMITTED_LOCAL,
+            exit_code=_exit_code(COMMITTED_LOCAL, requires_remote),
+            report=dict(
+                report_base,
+                status=COMMITTED_LOCAL,
+                committed=True,
+                pushed=False,
+                message=(
+                    f"{subject} is committed locally and HEAD holds nothing "
+                    f"{remote_branch} lacks"
                 ),
             ),
             notes=notes,
@@ -1289,7 +1552,7 @@ def run_sequence(
                 return _unreadable_outcome(
                     exc,
                     report_base,
-                    appended=True,
+                    appended=not repeat,
                     committed=True,
                     requires_remote=requires_remote,
                     notes=notes,
@@ -1297,9 +1560,10 @@ def run_sequence(
                     shard_path=shard_path,
                     remote_branch=remote_branch,
                     state=state,
+                    push_accepted=True,
                 )
             _note_fold_warnings(notes, state)
-            superseded = _superseded_by(state, event)
+            superseded = _superseded_by(state, event) if event is not None else None
             if superseded is not None:
                 summary = (
                     f"the claim on {item_id} is superseded by an earlier claim "
@@ -1331,6 +1595,7 @@ def run_sequence(
                     shard_path=shard_path,
                     remote_branch=remote_branch,
                     state=state,
+                    push_accepted=True,
                 )
             return SyncOutcome(
                 status=PUSHED,
@@ -1341,13 +1606,14 @@ def run_sequence(
                     committed=True,
                     pushed=True,
                     attempts=attempts,
-                    message=f"the event is committed and published on {remote_branch}",
+                    message=f"{subject} is committed and published on {remote_branch}",
                 ),
                 notes=notes,
                 event=event,
                 shard_path=shard_path,
                 remote_branch=remote_branch,
                 state=state,
+                push_accepted=True,
             )
         obstacle = pushed.output()
         if attempts == _MAX_PUSH_ATTEMPTS:
@@ -1380,7 +1646,7 @@ def run_sequence(
             return _unreadable_outcome(
                 exc,
                 report_base,
-                appended=True,
+                appended=not repeat,
                 committed=True,
                 requires_remote=requires_remote,
                 notes=notes,
@@ -1400,9 +1666,9 @@ def run_sequence(
         attempts=attempts,
         remote_head=remote_head.stdout.strip() if remote_head.ok else "",
         git_output=obstacle,
-        message=f"the push to {remote_branch} was rejected and the event is not published",
+        message=f"the push to {remote_branch} was rejected and {subject} is not published",
     )
-    if requires_remote:
+    if requires_remote and event is not None:
         annulment = {
             "target_id": event["id"],
             "reason": _ANNUL_REASON,
@@ -1428,6 +1694,8 @@ def run_sequence(
         remote_branch=remote_branch,
         state=state,
     )
+
+
 
 
 def conclude(outcome: SyncOutcome) -> None:

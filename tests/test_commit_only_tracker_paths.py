@@ -320,10 +320,33 @@ def test_the_post_commit_hook_stages_nothing_during_a_cherry_pick(repo):
     _git(repo, "checkout", "-q", "main")
     _install_post_commit_hook(repo)
 
-    _git(repo, "cherry-pick", "side")
+    picked = _git(repo, "cherry-pick", "side")
 
     assert _changed_paths(repo) == ["picked.txt"]
     assert _git(repo, "diff", "--cached", "--name-only").stdout == ""
+    _assert_the_hook_stayed_quiet(repo, picked)
+
+
+def _assert_the_hook_stayed_quiet(root: str, operation) -> None:
+    output = operation.stdout + operation.stderr
+    assert not [line for line in output.splitlines() if "fatal" in line], output
+    assert _git(root, "status", "--porcelain", "--", "PORTFOLIO.md").stdout == ""
+
+
+def test_the_post_commit_hook_stays_quiet_during_a_two_commit_cherry_pick(repo):
+    _seed_portfolio(repo)
+    _git(repo, "checkout", "-q", "-b", "side")
+    _commit_new_file(repo, "first.txt")
+    _commit_new_file(repo, "second.txt")
+    _git(repo, "checkout", "-q", "main")
+    _install_post_commit_hook(repo)
+
+    picked = _git(repo, "cherry-pick", "main..side")
+
+    assert _changed_paths(repo, "HEAD") == ["second.txt"]
+    assert _changed_paths(repo, "HEAD~1") == ["first.txt"]
+    assert _git(repo, "diff", "--cached", "--name-only").stdout == ""
+    _assert_the_hook_stayed_quiet(repo, picked)
 
 
 def test_the_post_commit_hook_keeps_the_portfolio_out_of_rebased_commits(repo):
@@ -336,11 +359,12 @@ def test_the_post_commit_hook_keeps_the_portfolio_out_of_rebased_commits(repo):
     _git(repo, "checkout", "-q", "side")
     _install_post_commit_hook(repo)
 
-    _git(repo, "rebase", "main")
+    rebased = _git(repo, "rebase", "main")
 
     assert _changed_paths(repo, "HEAD") == ["second.txt"]
     assert _changed_paths(repo, "HEAD~1") == ["first.txt"]
     assert _git(repo, "diff", "--cached", "--name-only").stdout == ""
+    _assert_the_hook_stayed_quiet(repo, rebased)
 
 
 def test_doctor_reconcile_commits_a_staged_rename_in_one_pass(repo):
@@ -561,6 +585,43 @@ def test_doctor_reconcile_is_not_stopped_by_what_a_quit_rebase_left_behind(repo)
     assert "doctor: committed" in result.stdout
 
 
+def test_doctor_reconcile_waits_for_a_rebase_stopped_with_no_conflict(repo):
+    _git(repo, "checkout", "-q", "-b", "side")
+    _commit_new_file(repo, "side.txt")
+    _git(repo, "checkout", "-q", "main")
+    _commit_new_file(repo, "base.txt")
+    _git(repo, "checkout", "-q", "side")
+    assert _git(repo, "rebase", "--exec", "false", "main", check=False).returncode != 0
+    assert _git(repo, "ls-files", "--unmerged").stdout == ""
+    _append_uncommitted_item(repo, "orphaned trail")
+    head = _git(repo, "rev-parse", "HEAD").stdout
+
+    result = _reconcile(repo)
+
+    assert "unfinished operation" in result.stderr
+    assert "doctor: committed" not in result.stdout
+    assert _git(repo, "rev-parse", "HEAD").stdout == head
+
+
+def test_doctor_reconcile_waits_for_a_cherry_pick_whose_conflict_is_resolved(repo):
+    _conflict_on_branches(repo)
+    assert _start_cherry_pick(repo).returncode != 0
+    with open(os.path.join(repo, "conflict.txt"), "w") as fh:
+        fh.write("resolved\n")
+    _git(repo, "add", "conflict.txt")
+    assert _git(repo, "ls-files", "--unmerged").stdout == ""
+    assert os.path.exists(os.path.join(repo, ".git", "CHERRY_PICK_HEAD"))
+    _append_uncommitted_item(repo, "orphaned trail")
+    head = _git(repo, "rev-parse", "HEAD").stdout
+    before = _git(repo, "status", "--porcelain", "--", ".ergon").stdout
+
+    result = _reconcile(repo)
+
+    assert "unfinished operation" in result.stderr
+    assert _git(repo, "rev-parse", "HEAD").stdout == head
+    assert _git(repo, "status", "--porcelain", "--", ".ergon").stdout == before
+
+
 def test_doctor_reconcile_clears_an_intent_to_add_file_since_deleted(repo):
     os.makedirs(os.path.join(repo, ".ergon", "extra"), exist_ok=True)
     path = os.path.join(repo, ".ergon", "extra", "brief.txt")
@@ -631,6 +692,25 @@ def test_a_rename_in_the_worktree_column_is_read_as_a_rename(repo):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert _git(repo, "status", "--porcelain", "--", ".ergon").stdout == ""
+
+
+def test_doctor_reconcile_clears_a_never_committed_rename_source_in_one_pass(repo):
+    os.makedirs(os.path.join(repo, ".ergon", "extra"), exist_ok=True)
+    old = os.path.join(repo, ".ergon", "extra", "old.txt")
+    new = os.path.join(repo, ".ergon", "extra", "new.txt")
+    with open(old, "w") as fh:
+        fh.write("moved\n")
+    _git(repo, "add", old)
+    os.rename(old, new)
+    _git(repo, "add", "-N", new)
+    status = _git(repo, "status", "--porcelain", "--", ".ergon").stdout
+    assert " R .ergon/extra/old.txt -> .ergon/extra/new.txt" in status.splitlines()
+
+    result = _reconcile(repo)
+
+    assert "commit failed" not in result.stdout + result.stderr
+    assert _git(repo, "status", "--porcelain", "--", ".ergon").stdout == ""
+    assert _changed_paths(repo) == [".ergon/extra/new.txt"]
 
 
 def test_doctor_reports_both_paths_of_a_rename(repo):

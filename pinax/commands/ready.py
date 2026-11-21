@@ -25,8 +25,8 @@ from ..visibility import warn_unmerged
 
 
 def _default_actor() -> str:
-    import socket
-    return f"operator@{socket.gethostname()}"
+    from ..doctor import default_actor
+    return default_actor()
 
 
 def run(

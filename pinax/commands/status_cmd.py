@@ -18,7 +18,7 @@ import datetime
 import json
 import sys
 
-from ..append import append_event
+from ..append import append_event, prev_for_actor
 from ..event import mint_event
 from ..fold import fold_events, read_events
 from ..targets import unknown_target_message
@@ -41,8 +41,8 @@ def _utc_now_iso() -> str:
 
 
 def _default_actor() -> str:
-    import socket
-    return f"operator@{socket.gethostname()}"
+    from ..doctor import default_actor
+    return default_actor()
 
 
 def _set_status(
@@ -92,8 +92,7 @@ def _set_status(
     _actor = actor or _default_actor()
     ts = _utc_now_iso()
 
-    actor_events = [e for e in events if e.get("actor") == _actor]
-    prev = actor_events[-1]["id"] if actor_events else ""
+    prev = prev_for_actor(log_dir, _actor)
 
     payload = {"item_id": item_id, "status": new_status}
     event = mint_event(

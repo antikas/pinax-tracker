@@ -619,3 +619,141 @@ class TestProjectionOrdering:
                 f"pnx-aaa.md is missing frontmatter field {field!r}.\n"
                 f"Content:\n{content[:400]}"
             )
+
+
+# ---------------------------------------------------------------------------
+# 5. A live claim shows a queued or ready item as building
+# ---------------------------------------------------------------------------
+
+CREATOR = "operator@example.org"
+CLAIMER = "builder@example.org"
+
+
+def _board_lanes(content: str) -> dict[str, list[str]]:
+    """Map each board lane heading to the item lines listed under it."""
+    lanes: dict[str, list[str]] = {}
+    current = None
+    for line in content.split("\n"):
+        if line.startswith("## "):
+            current = line[3:]
+            lanes[current] = []
+        elif current is not None and line.startswith("- "):
+            lanes[current].append(line)
+    return lanes
+
+
+def _item_line(lanes: dict[str, list[str]], lane: str, item_id: str) -> str | None:
+    for line in lanes.get(lane, []):
+        if line.startswith(f"- {item_id} · "):
+            return line
+    return None
+
+
+def _status_frontmatter(root: str, item_id: str) -> str:
+    content = _read_text(os.path.join(root, ".ergon", "items", f"{item_id}.md"))
+    for line in content.split("\n"):
+        if line.startswith("status:"):
+            return line
+    raise AssertionError(f"no status line in {item_id}.md:\n{content}")
+
+
+def _claim_repo(root: str, *, status: str = "queued", claimer: str = CREATOR,
+                after: list[tuple[str, dict]] | None = None) -> dict:
+    """
+    Write a log: an item created with `status`, claimed by `claimer`, then
+    the `after` events by the claimer. Returns the folded state.
+    """
+    log_dir = os.path.join(root, ".ergon", "log")
+    os.makedirs(log_dir, exist_ok=True)
+    e = _append(log_dir, seq=0, actor=CREATOR, etype="ergon.created",
+                payload={"repo": "claims"})
+    e = _append(log_dir, seq=1, actor=CREATOR, etype="phase.opened",
+                payload={"phase": "phase-1"}, prev=e["id"])
+    e = _append(log_dir, seq=2, actor=CREATOR, etype="item.created",
+                payload={"item_id": "pnx-ccc", "title": "Claimed item",
+                         "prefix": "phase-1", "status": status},
+                prev=e["id"])
+    e = _append(log_dir, seq=3, actor=claimer, etype="item.claimed",
+                payload={"item_id": "pnx-ccc"}, prev=e["id"])
+    seq = 4
+    for etype, payload in after or []:
+        e = _append(log_dir, seq=seq, actor=claimer, etype=etype,
+                    payload=dict(payload, item_id="pnx-ccc"), prev=e["id"])
+        seq += 1
+    return fold_events(read_events(log_dir))
+
+
+class TestLiveClaimShowsBuilding:
+    """The projection shows a queued or ready item with a live claim as building."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        self.root = tempfile.mkdtemp()
+        yield
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _assert_building(self, state: dict, fold_status: str, owner: str) -> None:
+        assert state["items"]["pnx-ccc"]["status"] == fold_status
+        assert state["items"]["pnx-ccc"]["owner"] == owner
+        regenerate(self.root)
+        lanes = _board_lanes(_read_text(os.path.join(self.root, ".ergon", "board.md")))
+        line = _item_line(lanes, "Building", "pnx-ccc")
+        assert line is not None, f"pnx-ccc not under Building: {lanes}"
+        assert _item_line(lanes, "Queued", "pnx-ccc") is None
+        assert _item_line(lanes, "Ready", "pnx-ccc") is None
+        assert f" · building · {owner} · " in line, line
+        assert _status_frontmatter(self.root, "pnx-ccc") == "status: building"
+
+    def test_claimed_queued_item_shows_building(self):
+        state = _claim_repo(self.root)
+        self._assert_building(state, "queued", CREATOR)
+
+    def test_claim_from_another_shard_shows_building(self):
+        state = _claim_repo(self.root, claimer=CLAIMER)
+        shards = sorted(os.listdir(os.path.join(self.root, ".ergon", "log")))
+        assert len(shards) == 2, shards
+        self._assert_building(state, "queued", CLAIMER)
+
+    def test_claimed_ready_item_shows_building(self):
+        state = _claim_repo(self.root, status="ready")
+        self._assert_building(state, "ready", CREATOR)
+
+    def _assert_shows(self, status: str) -> dict:
+        regenerate(self.root)
+        lanes = _board_lanes(_read_text(os.path.join(self.root, ".ergon", "board.md")))
+        assert _item_line(lanes, "Building", "pnx-ccc") is None, lanes
+        assert _status_frontmatter(self.root, "pnx-ccc") == f"status: {status}"
+        return lanes
+
+    def test_released_claim_shows_queued_again(self):
+        state = _claim_repo(self.root, after=[
+            ("item.claim_released", {"reason": "handing back"}),
+        ])
+        assert not state["items"]["pnx-ccc"].get("owner")
+        lanes = self._assert_shows("queued")
+        line = _item_line(lanes, "Queued", "pnx-ccc")
+        assert line is not None and " · queued" in line, lanes
+
+    def test_unclaimed_queued_item_stays_queued(self):
+        log_dir = os.path.join(self.root, ".ergon", "log")
+        os.makedirs(log_dir)
+        e = _append(log_dir, seq=0, actor=CREATOR, etype="ergon.created",
+                    payload={"repo": "claims"})
+        _append(log_dir, seq=1, actor=CREATOR, etype="item.created",
+                payload={"item_id": "pnx-ccc", "title": "Claimed item",
+                         "status": "queued"}, prev=e["id"])
+        lanes = self._assert_shows("queued")
+        line = _item_line(lanes, "Queued", "pnx-ccc")
+        assert line is not None and " · queued" in line, lanes
+
+    def test_claimed_then_completed_item_shows_done(self):
+        _claim_repo(self.root, after=[("item.completed", {})])
+        lanes = self._assert_shows("done")
+        line = _item_line(lanes, "Done", "pnx-ccc")
+        assert line is not None and " · done · " in line, lanes
+
+    def test_claimed_then_blocked_item_shows_blocked(self):
+        _claim_repo(self.root, after=[("item.blocked", {"gate": "review"})])
+        lanes = self._assert_shows("blocked")
+        line = _item_line(lanes, "Parked / needs human", "pnx-ccc")
+        assert line is not None and line.endswith(" · gate=review"), lanes

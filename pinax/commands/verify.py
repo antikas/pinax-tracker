@@ -26,8 +26,15 @@ def _inspect(repo_root: str) -> tuple[list[str] | None, list[dict]]:
     ``invalid_events`` because annulment is Pinax's audit-preserving mechanism
     for retiring a known bad event.
     """
-    from ..fold import _collect_annulled_ids, finalise_events, fold_events, read_raw_events
-    from ..event import valid_annulment, verify_id
+    from ..fold import (
+        _collect_annulled_ids,
+        _sort_key,
+        broken_prev_links,
+        finalise_events,
+        fold_events,
+        read_raw_events,
+    )
+    from ..event import EVENT_VERSION, event_version, valid_annulment, verify_id
     from ..projection import render_board, render_item
 
     ergon_dir = os.path.join(repo_root, ".ergon")
@@ -54,6 +61,15 @@ def _inspect(repo_root: str) -> tuple[list[str] | None, list[dict]]:
     # Do not sort or fold a malformed physical record. Besides reporting the
     # integrity failure first, this keeps --fix from deriving a replacement
     # projection from invalid history.
+    if not invalid_events:
+        invalid_events = [
+            event
+            for _shard, _actor, event in broken_prev_links(
+                sorted(raw_events, key=_sort_key), annulled_ids
+            )
+            if event_version(event) == EVENT_VERSION
+        ]
+
     if invalid_events:
         return [], invalid_events
 
@@ -118,7 +134,7 @@ def _fail_on_invalid_events(invalid_events: list[dict]) -> None:
     print(
         "pinax verify: EVENT LOG INTEGRITY FAILURE - "
         f"{len(invalid_events)} non-annulled event(s) no longer match their "
-        "stored content hash.\n"
+        "stored content hash or name a predecessor missing from their chain.\n"
         f"  Invalid events:\n{details}\n\n"
         "  The append-only event log was modified after these events were written.\n"
         "  'pinax verify --fix' only regenerates projections and will not rewrite\n"

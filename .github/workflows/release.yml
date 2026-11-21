@@ -6,7 +6,6 @@ on:
       release_tag:
         description: GitHub release tag containing the reviewed package artifacts
         required: true
-        default: v0.1.2
         type: string
 
 concurrency:
@@ -28,6 +27,35 @@ jobs:
       id-token: write
 
     steps:
+      - name: Check the tag against the package version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release_tag must use the form vX.Y.Z" >&2
+            exit 1
+          fi
+
+          expected="${RELEASE_TAG#v}"
+          raw="Accept: application/vnd.github.raw"
+          pyproject_text="$(gh api -H "$raw" "repos/$REPOSITORY/contents/pyproject.toml?ref=$RELEASE_TAG")"
+          module_text="$(gh api -H "$raw" "repos/$REPOSITORY/contents/pinax/__init__.py?ref=$RELEASE_TAG")"
+          pyproject_version="$(printf '%s\n' "$pyproject_text" | sed -nE 's/^version = "([^"]+)"$/\1/p' | head -n 1)"
+          module_version="$(printf '%s\n' "$module_text" | sed -nE 's/^__version__ = "([^"]+)"$/\1/p' | head -n 1)"
+
+          if [ "$pyproject_version" != "$expected" ]; then
+            echo "release_tag $RELEASE_TAG does not match the pyproject.toml version '$pyproject_version'" >&2
+            exit 1
+          fi
+          if [ "$module_version" != "$expected" ]; then
+            echo "release_tag $RELEASE_TAG does not match the pinax/__init__.py version '$module_version'" >&2
+            exit 1
+          fi
+
       - name: Download the GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -36,13 +64,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          case "$RELEASE_TAG" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *)
-              echo "release_tag must use the form vX.Y.Z" >&2
-              exit 1
-              ;;
-          esac
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release_tag must use the form vX.Y.Z" >&2
+            exit 1
+          fi
 
           mkdir -p release-assets dist
           gh release download "$RELEASE_TAG" \
@@ -53,18 +78,32 @@ jobs:
             --pattern "SHA256SUMS"
 
       - name: Verify the release assets
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s nullglob
           cd release-assets
 
           test -f SHA256SUMS
-          mapfile -t packages < <(
-            find . -maxdepth 1 -type f \
-              \( -name "pinax_tracker-*.whl" -o -name "pinax_tracker-*.tar.gz" \) \
-              -printf "%f\n" | sort
-          )
-          test "${#packages[@]}" -eq 2
+          version="${RELEASE_TAG#v}"
+          wheels=(pinax_tracker-*.whl)
+          sdists=(pinax_tracker-*.tar.gz)
+          test "${#wheels[@]}" -eq 1
+          test "${#sdists[@]}" -eq 1
+          if [ "${wheels[0]}" != "pinax_tracker-${version}-py3-none-any.whl" ] \
+            || [ "${sdists[0]}" != "pinax_tracker-${version}.tar.gz" ]; then
+            echo "release assets are not version $version: ${wheels[0]} ${sdists[0]}" >&2
+            exit 1
+          fi
+          packages=("${wheels[0]}" "${sdists[0]}")
+
+          mapfile -t listed < <(sed -E 's/^[0-9A-Fa-f]{64} [ *]//' SHA256SUMS | LC_ALL=C sort)
+          mapfile -t expected < <(printf '%s\n' "${packages[@]}" | LC_ALL=C sort)
+          test "${#listed[@]}" -eq 2
+          test "${listed[0]}" = "${expected[0]}"
+          test "${listed[1]}" = "${expected[1]}"
           sha256sum --check --strict SHA256SUMS
 
           cp -- "${packages[@]}" ../dist/
