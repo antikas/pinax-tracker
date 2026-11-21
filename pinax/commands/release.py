@@ -32,6 +32,7 @@ import json
 import os
 import sys
 
+from .. import refusal
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 from ..fold import fold
 from ..targets import unknown_target_message
@@ -62,17 +63,14 @@ def run(
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
 
-    if not os.path.isdir(log_dir):
-        print("pinax: .ergon/log/ not found - run 'pinax init' first.", file=sys.stderr)
-        sys.exit(1)
+    refusal.require_tracker(log_dir)
 
     if not reason.strip():
-        print(
+        refusal.refuse(
             "pinax: a release records why a claim ended - give a non-empty "
             "--reason.",
-            file=sys.stderr,
+            refusal.INVALID_ARGUMENT,
         )
-        sys.exit(1)
 
     state = fold(log_dir)
     items = state.get("items", {})
@@ -83,17 +81,15 @@ def run(
         "item.claim_released", {"item_id": item_id}, items=items
     )
     if unknown is not None:
-        print(unknown + ".", file=sys.stderr)
-        sys.exit(1)
+        refusal.refuse(unknown + ".", refusal.UNKNOWN_TARGET)
 
     owner = items[item_id].get("owner")
     if not owner:
-        print(
+        refusal.refuse(
             f"pinax: item {item_id} carries no live claim, so there is "
             "nothing to release.",
-            file=sys.stderr,
+            refusal.INVALID_ARGUMENT,
         )
-        sys.exit(1)
 
     from .. import sync
 
@@ -126,6 +122,7 @@ def run(
         "root": ergon_dir,
     }
 
+    result.update(outcome.publication())
     if as_json:
         print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     else:

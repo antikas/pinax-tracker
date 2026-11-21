@@ -43,7 +43,8 @@ import json
 import os
 import sys
 
-from ..append import append_event
+from .. import refusal
+from ..append import append_event, prev_for_actor
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 from ..event import mint_event
 from ..fold import read_events
@@ -81,9 +82,7 @@ def run(
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
 
-    if not os.path.isdir(log_dir):
-        print("pinax: .ergon/log/ not found - run 'pinax init' first.", file=sys.stderr)
-        sys.exit(1)
+    refusal.require_tracker(log_dir)
 
     from .. import sync
 
@@ -115,6 +114,7 @@ def run(
         "root": ergon_dir,
     }
 
+    result.update(outcome.publication())
     if as_json:
         print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     else:
@@ -146,8 +146,7 @@ def append_local(
     next_seq = (max(e["seq"] for e in events) + 1) if events else 0
     ts = utc_now_iso()
 
-    actor_events = [e for e in events if e.get("actor") == actor]
-    prev = actor_events[-1]["id"] if actor_events else ""
+    prev = prev_for_actor(log_dir, actor)
 
     payload = {"target_id": target_id, "reason": reason}
     event = mint_event(

@@ -59,9 +59,17 @@ def test_two_shard_union_merge_no_false_warnings(caplog):
 
     # Actor B: shard-b.jsonl — starts with a non-empty prev.
     # This simulates actor B resuming after a prior session; their first event in
-    # this shard legitimately references the last event they wrote in their prior shard.
-    # (The "prior shard" is not present in this log_dir — simulating a cross-shard
-    prior_b_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"  # synthetic prior id
+    # this shard legitimately references the last event they wrote in their prior
+    # shard, shard-b-prior.jsonl. The named event must exist somewhere in the log:
+    # an anchor whose prev names no event in the log is a broken link.
+    e_b_prior = mint_event(
+        seq=0, ts="2026-06-29T09:00:00Z",
+        actor="actorb@host", etype="item.created",
+        payload={"item_id": "pnx-bb0", "title": "B prior item", "prefix": "pnx",
+                 "status": "queued"},
+        prev="",
+    )
+    prior_b_id = e_b_prior["id"]
     e_b0 = mint_event(
         seq=0, ts="2026-06-29T10:00:02Z",
         actor="actorb@host", etype="item.created",
@@ -81,6 +89,7 @@ def test_two_shard_union_merge_no_false_warnings(caplog):
     try:
         _write_shard(tmpdir, "shard-a.jsonl", [e_a0, e_a1])
         _write_shard(tmpdir, "shard-b.jsonl", [e_b0, e_b1])
+        _write_shard(tmpdir, "shard-b-prior.jsonl", [e_b_prior])
 
         with caplog.at_level(logging.WARNING, logger="pinax.fold"):
             events = read_events(tmpdir)
@@ -101,8 +110,31 @@ def test_two_shard_union_merge_no_false_warnings(caplog):
             "prev was non-empty (a valid cross-shard reference)."
         )
 
-        # Sanity: fold produced all 4 unique events.
-        assert len(events) == 4, f"Expected 4 events after dedup+sort, got {len(events)}"
+        # Sanity: fold produced all 5 unique events.
+        assert len(events) == 5, f"Expected 5 events after dedup+sort, got {len(events)}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_anchor_naming_no_event_in_the_log_warns(caplog):
+    """A shard's first event whose prev names no event anywhere in the log warns."""
+    absent_id = "a" * 52
+    e_b0 = mint_event(
+        seq=0, ts="2026-06-29T10:00:02Z",
+        actor="actorb@host", etype="item.created",
+        payload={"item_id": "pnx-bb1", "title": "B item 1", "prefix": "pnx",
+                 "status": "queued"},
+        prev=absent_id,
+    )
+    tmpdir = tempfile.mkdtemp()
+    try:
+        _write_shard(tmpdir, "shard-b.jsonl", [e_b0])
+        with caplog.at_level(logging.WARNING, logger="pinax.fold"):
+            read_events(tmpdir)
+        assert any(
+            "Broken prev-chain" in r.message and e_b0["id"] in r.message
+            for r in caplog.records
+        )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

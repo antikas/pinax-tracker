@@ -29,6 +29,7 @@ import json
 import os
 import sys
 
+from .. import refusal
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 from ..fold import fold
 
@@ -105,9 +106,7 @@ def run(
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
 
-    if not os.path.isdir(log_dir):
-        print("pinax: .ergon/log/ not found - run 'pinax init' first.", file=sys.stderr)
-        sys.exit(1)
+    refusal.require_tracker(log_dir)
 
     state = fold(log_dir)
     items = state.get("items", {})
@@ -115,8 +114,7 @@ def run(
     try:
         priority = _resolve_rank(rank_arg, item_id, items)
     except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(1)
+        refusal.refuse(str(exc), refusal.INVALID_ARGUMENT)
 
     from .. import sync
 
@@ -149,6 +147,7 @@ def run(
         "root": ergon_dir,
     }
 
+    result.update(outcome.publication())
     if as_json:
         print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     else:

@@ -23,6 +23,7 @@ import os
 import re
 import sys
 
+from .. import refusal
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 
 # pinax.sync imports pinax.projection, which imports pinax.commands.dep at
@@ -62,30 +63,23 @@ def run(
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
 
-    if not os.path.isdir(log_dir):
-        print(
-            "pinax: .ergon/log/ not found - run 'pinax init' first.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    refusal.require_tracker(log_dir)
 
     # --- HARD VALIDATION (ADR-004 / DESIGN.md) ---
 
     if not _REF_PATTERN.match(ref):
-        print(
+        refusal.refuse(
             f"pinax note add: REJECTED - ref must match "
             f"^(koine://|~/knowledge/|projects/|docs/), got: {ref!r}",
-            file=sys.stderr,
+            refusal.INVALID_ARGUMENT,
         )
-        sys.exit(1)
 
     if caption is not None and len(caption) > _CAPTION_MAX:
-        print(
+        refusal.refuse(
             f"pinax note add: REJECTED - caption exceeds {_CAPTION_MAX} characters "
             f"({len(caption)} chars). Truncate or use a ref to a vault document.",
-            file=sys.stderr,
+            refusal.INVALID_ARGUMENT,
         )
-        sys.exit(1)
 
     # --- HAND OFF TO THE PUBLISH SEQUENCE ---
 
@@ -118,6 +112,7 @@ def run(
             "item_id": item_id,
             "ref": ref,
             "root": ergon_dir,
+            **outcome.publication(),
         }))
     else:
         # visible the moment it happens.

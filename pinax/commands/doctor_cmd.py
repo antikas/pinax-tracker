@@ -19,7 +19,7 @@ import os
 import subprocess
 import sys
 
-from ..append import append_event
+from ..append import append_event, prev_for_actor
 from ..doctor import default_actor, diagnose, parse_ts
 from ..event import mint_event
 from ..fold import read_events
@@ -167,18 +167,28 @@ def _rename_sources(files: list[dict]) -> list[str]:
     return [e["renamed_from"] for e in files if e.get("renamed_from")]
 
 
-# Git refuses a path-limited commit while one of these operations is
-# unfinished, and each keeps this file until it ends.
-_OPERATION_STATE_FILES = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
+# Each unfinished merge, cherry-pick, revert or sequence of them keeps one of
+# these until it ends. The two state directories are the only trace of a
+# sequence that stopped without a conflict, where Git would still accept a
+# path-limited commit; REBASE_HEAD is left out because a quit leaves it.
+_OPERATION_STATE_PATHS = (
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+    "sequencer",
+)
 
 
-def _operation_unfinished(repo_root: str) -> bool:
+def operation_unfinished(repo_root: str) -> bool:
+    """True while Git has an unfinished operation or an unmerged entry."""
     # Staging would mark a conflicted file resolved with its markers still in
     # it, and a conflict can outlast any operation: a stash pop leaves one
     # with no state file at all.
     if _git(repo_root, ["ls-files", "--unmerged"]).stdout:
         return True
-    for name in _OPERATION_STATE_FILES:
+    for name in _OPERATION_STATE_PATHS:
         found = _git(repo_root, ["rev-parse", "--git-path", name]).stdout
         path = found.decode("utf-8", errors="replace").strip()
         if path and os.path.exists(os.path.join(repo_root, path)):
@@ -195,22 +205,23 @@ def _reconcile_uncommitted(repo_root: str, report: dict) -> None:
     unc = report["uncommitted"]
     if not unc["available"] or not unc["files"]:
         return
-    if _operation_unfinished(repo_root):
+    if operation_unfinished(repo_root):
         print("doctor: Git has an unfinished operation (see git status); "
               "leaving uncommitted files in place. Finish it and run doctor again.",
               file=sys.stderr)
         return
     paths = {entry["path"] for entry in unc["files"]}
-    # A file added and then deleted before any commit has nothing to commit:
-    # only its index entry remains to clear.
-    cleared = sorted(
-        p for p in paths
-        if not os.path.lexists(os.path.join(repo_root, p)) and _never_committed(repo_root, p)
-    )
     # A renamed file's old path is gone from the working tree, so it is
     # committed by name rather than added; without it the removal stays
     # staged after the commit. A source recreated on disk is named once.
-    named = sorted((paths - set(cleared)) | set(_rename_sources(unc["files"])))
+    sources = set(_rename_sources(unc["files"]))
+    # A file added and then deleted before any commit has nothing to commit:
+    # only its index entry remains to clear. A rename source can be one.
+    cleared = sorted(
+        p for p in paths | sources
+        if not os.path.lexists(os.path.join(repo_root, p)) and _never_committed(repo_root, p)
+    )
+    named = sorted((paths | sources) - set(cleared))
     n_events = len(unc["events"])
     n_files = len(named)
     clearing = f"clear {len(cleared)} .ergon file(s) added and then deleted"
@@ -286,8 +297,7 @@ def _reconcile_stale_claims(
 
     events = read_events(log_dir)
     next_seq = (max(e["seq"] for e in events) + 1) if events else 0
-    actor_events = [e for e in events if e.get("actor") == actor]
-    prev = actor_events[-1]["id"] if actor_events else ""
+    prev = prev_for_actor(log_dir, actor)
 
     appended = 0
     for c in claims:

@@ -52,11 +52,13 @@ generated projection.
 ## Everyday commands
 
 ```text
+pinax --version
 pinax add --title TEXT
 pinax claim ITEM_ID
 pinax done ITEM_ID --briefing FILE
 pinax block ITEM_ID --gate scope|decision|destructive|proposal [--owner-gate CLASS]
 pinax park ITEM_ID --reason TEXT
+pinax decide ITEM_ID --option KEY --label TEXT --effect release|park --reason TEXT
 pinax dep add FROM_ID --blocks TO_ID
 pinax ready [--under ITEM_ID]
 pinax next [--under ITEM_ID]
@@ -67,6 +69,7 @@ pinax release ITEM_ID --reason TEXT
 pinax policy claim-expiry --hours N
 pinax policy process --mode flow|strict
 pinax policy owner-gates --class TEXT [--class TEXT ...]
+pinax policy decision-actors --decider ROLE@HOST [--decider ROLE@HOST ...]
 pinax policy check [--json]
 pinax verify [--fix]
 pinax replay --at GIT_REF
@@ -89,12 +92,7 @@ The last such event in the log is the one in force, and a log without one
 runs on `flow`.
 
 Before you set `strict`, upgrade every clone, and every older `pinax` on
-PATH that a pre-commit hook could run, to 0.3.0 or later. Under strict the
-board and item files show the class, which an earlier Pinax does not
-write: it reports drift, its pre-commit hook refuses every commit, and its
-next write removes the class from the projection. After upgrading, run
-`pinax verify --fix` to repair the projection. The command prints the same
-warning when it sets strict.
+PATH that a pre-commit hook could run, to 0.4.0 or later.
 
 - `flow`: nothing is checked. `--owner-gate CLASS` on `pinax block` records
   the class in the event and nowhere else, so the board and item files are
@@ -136,10 +134,63 @@ or with a class not on the list. Under `flow` it only reports and exits 0.
 Under `strict` it exits 1 when it lists any item. It reads the local log
 and changes nothing, so pull before you run it.
 
+## Decisions
+
+`pinax decide ITEM_ID --option KEY --label TEXT --effect release|park
+--reason TEXT` records a decision on an item as one `item.decided` event
+holding the option, its label, the effect and the reason; the actor and the
+time are the event's own. The option, label and reason must not be blank,
+and the effect is `release` or `park`; anything else ends with exit 2 and
+nothing appended. An item that does not exist ends with exit 1.
+
+- `release`: only the decision is appended. The item's status, gate and
+  owner-gate class stay as they were, and the command says so, for example
+  `pinax: decision recorded on ITEM_ID; status unchanged: blocked (gate
+  scope)`. A decision does not release a claim; like any event, one
+  recorded past a claim's expiry deadline marks that claim expired.
+- `park`: the decision and an ordinary `item.parked` event with the same
+  reason are appended in one commit, decision first, so the item is parked
+  exactly as `pinax park` would park it.
+
+A decision is never written as a note, so an item's newest note stays what
+it was. The item page shows the latest decision in a `## Decision` section,
+and `pinax status --json` carries it as a `decision` object on every row it
+prints for that item. `pinax status --json` prints no row for a queued or
+ready item without a live claim, so such an item's decision shows on its
+item page and in the fold state only. Decisions change nothing in how an
+item with no decision renders or serialises.
+
+Running the same decision again is harmless, and it finishes what an
+earlier run left undone. When the latest decision on the item, in the
+local log together with the remote default branch, has the same option,
+label, effect, reason and actor (the actor's host compared in lower case),
+and for `park` the item is still parked, nothing is appended and the JSON
+says `"appended": false`. If the remote already has the decision, nothing
+is committed or pushed and the JSON says `"published": true` and
+`"sync_status": "already_published"`. Otherwise a decision left
+uncommitted by a refused commit is committed, and a decision left local by
+a rejected push is pushed, so a retry after a rejected push publishes the
+existing decision without appending a second copy. `published` then says
+whether it reached the remote.
+
+Under `flow` any actor may decide. Under `strict` only an actor on the
+project's decision-actor list may: set it with `pinax policy
+decision-actors --decider ROLE@HOST [--decider ROLE@HOST ...]`, where
+`--actor` stays the writer of the policy event. The last such event is in
+force. Under strict, a decision from an actor not on the list, or with no
+list set, ends with exit 8 and nothing appended.
+
+Before the first decision is written, every clone, and every older `pinax`
+a pre-commit hook could run, must run this version. Every released Pinax
+before 0.4.0 predates version 2 events and reports each version 2 event
+that no tombstone names as an integrity violation. Decision events are
+version 2 events and are reported the same way.
+
 ## Publishing a state change
 
 Every command above that appends an event (add, claim, done, block, park,
-priority, dep, note, annul) runs the same publish sequence. It fetches the
+decide, release, the four policy setters, priority, dep, note, annul) runs
+the same publish sequence. It fetches the
 remote named `origin`, folds the union of the local log and the remote
 default branch's committed shards, appends the event, regenerates the
 board and item pages, commits the shard and the projection with the
@@ -155,6 +206,30 @@ than whatever root the surrounding environment happened to name.
 
 Every one of these commands also refuses an actor that is not written as
 `role@host`, before it appends anything.
+
+A write command is one of the commands that run the publish sequence. Given
+`--json`, a write command prints exactly one JSON object on standard output,
+whatever the exit code, and that JSON result carries `published` and
+`sync_status`. `published` is true only when this run's push to the remote
+default branch was accepted, or when the remote default branch already
+held the event when this run fetched it. `sync_status` names what the
+sequence did (for example
+`pushed`, `committed_local` or `remote_unreachable`). When the sequence
+fails, the result is the sequence's own report. Exit 0 also covers a commit
+that stayed local, so a caller which must know a write reached other
+machines reads `published`.
+
+A write command refused before the sequence runs prints a refusal result.
+Its `published` is false, and its `sync_status` names the refusal:
+`invalid_argument`, `not_a_tracker`, `root_mismatch`, `prefix_refused`,
+`invalid_dependency`, `unknown_target` or `internal_error`. Its `error`
+holds the refusal's message, and `exit_code` and `command` name the exit
+code and the subcommand. The exit code is the same with or without
+`--json`, and the message still goes to standard error. An interrupt
+prints a result whose `sync_status` is `interrupted`, unless the sequence
+had already printed its report, and then ends the process by the
+interrupt as before. A help or version request is the one exception: it
+prints its text unchanged and exits 0.
 
 All of them except `claim` accept `--offline`, or the `PINAX_OFFLINE=1`
 environment variable, to skip the fetch and the push and commit locally
@@ -187,8 +262,9 @@ The exit codes these commands share are:
     7  the shard and the projection could not be staged, or the commit
        was refused; the appended event stays uncommitted either way
     8  the project's policy refuses the event: under the strict process,
-       a block for the owner without a listed owner-gate class; nothing
-       was appended
+       a block for the owner without a listed owner-gate class, or a
+       decide from an actor not on the decision-actor list or with no
+       list set; nothing was appended
 
 A hook that refuses the commit is never worked around. The command prints
 the hook's output, names the shard and the event id, leaves the appended
@@ -269,9 +345,39 @@ item's own status or its eligibility for `ready`/`next`. `pinax board`
 and `pinax status` render it alongside the status wherever it is
 present; the rule the fold applies is in [DESIGN.md](DESIGN.md).
 
-The predecessor field is a local consistency check. It can report a dangling
-predecessor reference, but version 1 does not hash the predecessor field or
-provide remote anchoring, signatures, or hostile-writer authentication.
+Each new event's identifier covers the event before it in its chain.
+`pinax verify` fails when a hashed field of such an event (`seq`, `ts`,
+`actor`, `type`, `payload`, `prev`, `v`) is changed and the event keeps its
+recorded identifier. It also fails when a new event that a later new event names as its
+predecessor is deleted, repointed, or edited with a recomputed identifier, while
+that later event stays as it was and is not annulled, even when the later events
+are moved into another shard file. These are not covered by the checks:
+deleting, or editing with a recomputed identifier, an event no later event
+names as its predecessor, which includes the newest events of a chain and,
+after two clones wrote to the same chain, the newest event of each branch;
+deleting an event whose successor is annulled; the content of an annulled
+event, of which only the identifier is checked; a rewrite that recomputes an
+event and every later event of its chain; deleting, or editing with a
+recomputed identifier, an event followed by one an earlier Pinax wrote; any
+edit to the predecessor field of an event an earlier Pinax wrote; and a field
+added to an event beside the hashed fields, which the fold does not read. Git
+history is the anchor for them.
+Events written by an earlier
+Pinax have no version field and keep verifying under the rule they were written
+with. There are no signatures and no outside anchor: Git history is the record
+of a rewrite the log cannot show on its own. [DESIGN.md](DESIGN.md) lists what
+each rule catches.
+
+An earlier Pinax checks every event under the old rule, so it reports each
+newly written event that no tombstone names as an integrity violation, its
+`pinax verify` fails, and its pre-commit hook refuses commits. Every clone, and every older `pinax` on
+PATH that a pre-commit hook could run, must run this version before the first
+version 2 event is written.
+
+Decisions follow the same order: every clone, and every older `pinax` a
+pre-commit hook could run, must run this version before the first decision
+is written. The Decisions section above says what an earlier Pinax does
+with a log that holds them.
 
 The event envelope, integrity rules, and projection model are described in
 [DESIGN.md](DESIGN.md). The executable event handlers and renderers are the

@@ -22,15 +22,15 @@ import sys
 import datetime
 
 from ..fold import fold, compute_ready, compute_next
-from ..append import append_event
+from ..append import append_event, normalise_actor, prev_for_actor
 from ..doctor import warn_if_log_ignored
 from ..event import mint_event
 from ..projection import regenerate
 
 
 def _default_actor() -> str:
-    import socket
-    return f"operator@{socket.gethostname()}"
+    from ..doctor import default_actor
+    return default_actor()
 
 
 def _utc_now_iso() -> str:
@@ -59,29 +59,6 @@ def _max_seq_in_log(log_dir: str) -> int:
             if isinstance(seq, int) and seq > max_seq:
                 max_seq = seq
     return max_seq
-
-
-def _last_event_id_in_shard(shard_path: str) -> str:
-    """Return the id of the last event in a shard, or '' if empty/absent."""
-    import pinax.event as ev_mod
-    events = []
-    try:
-        with open(shard_path, "rb") as fh:
-            raw = fh.read()
-    except OSError:
-        return ""
-    normalised = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    for line in normalised.split(b"\n"):
-        if not line:
-            continue
-        event = ev_mod.parse_line(line)
-        if event is not None:
-            events.append(event)
-    for event in reversed(events):
-        eid = event.get("id", "")
-        if eid:
-            return eid
-    return ""
 
 
 def run(
@@ -155,13 +132,11 @@ def run(
 
     # --claim: append item.claimed events for each manifest item.
     if claim and manifest:
-        _actor = actor or _default_actor()
+        _actor = normalise_actor(actor or _default_actor())
         ts = _utc_now_iso()
         seq = _max_seq_in_log(log_dir) + 1
 
-        shard_safe = _actor.replace("@", "-").replace("/", "-").replace("\\", "-").replace(" ", "-")
-        shard_path = os.path.join(log_dir, f"{shard_safe}.jsonl")
-        prev_id = _last_event_id_in_shard(shard_path)
+        prev_id = prev_for_actor(log_dir, _actor)
 
         for item_id in manifest_ids:
             payload = {"item_id": item_id, "actor": _actor}

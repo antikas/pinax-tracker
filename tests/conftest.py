@@ -37,6 +37,45 @@ def _base_temp_is_the_temp_tree(tmp_path_factory: "_pytest.TempPathFactory") -> 
     _tempfile.tempdir = str(tmp_path_factory.getbasetemp())
 
 
+# ---------------------------------------------------------------------------
+# The pre-commit hook 'pinax init' installs runs the first 'pinax' on PATH.
+# On a host with an installed release, that release would judge this tree's
+# events by its own rules. This puts a launcher for this source tree first on
+# PATH for the whole session, so every hook a test repository runs verifies
+# with the code under test.
+# ---------------------------------------------------------------------------
+
+_SOURCE_ROOT = str(_Path(__file__).resolve().parent.parent)
+
+
+def _write_pinax_launchers(bin_dir: "_Path") -> None:
+    if _os.name == "nt":
+        (bin_dir / "pinax.cmd").write_text(
+            "@echo off\r\n"
+            f'set "PYTHONPATH={_SOURCE_ROOT};%PYTHONPATH%"\r\n'
+            f'"{_sys.executable}" -m pinax %*\r\n',
+            encoding="utf-8",
+        )
+    script = bin_dir / "pinax"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"PYTHONPATH='{_SOURCE_ROOT}'${{PYTHONPATH:+:$PYTHONPATH}}\n"
+        "export PYTHONPATH\n"
+        f"exec '{_sys.executable}' -m pinax \"$@\"\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+
+@_pytest.fixture(autouse=True, scope="session")
+def _source_tree_pinax_first_on_path(tmp_path_factory: "_pytest.TempPathFactory"):
+    bin_dir = tmp_path_factory.mktemp("pinax-launcher")
+    _write_pinax_launchers(bin_dir)
+    with _pytest.MonkeyPatch.context() as patch:
+        patch.setenv("PATH", str(bin_dir) + _os.pathsep + _os.environ.get("PATH", ""))
+        yield str(bin_dir)
+
+
 def pytest_sessionstart(session: "_pytest.Session") -> None:
     session.config._lane_session_start = _time.monotonic()
 

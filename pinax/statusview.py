@@ -112,6 +112,16 @@ def _item_title(items: dict, item_id: str | None) -> str:
     return items.get(item_id, {}).get("title", "")
 
 
+_DECISION_KEYS = ("option", "label", "effect", "reason", "actor", "ts", "event_id")
+
+
+def _add_decision(row: dict, item: dict) -> None:
+    """Add the item's latest decision to a status row, only when it has one."""
+    decision = item.get("decision")
+    if isinstance(decision, dict):
+        row["decision"] = {key: decision.get(key, "") for key in _DECISION_KEYS}
+
+
 def _summarise_repo(
     repo_id: str,
     repo_root: str,
@@ -204,6 +214,7 @@ def _summarise_repo(
             # (see fold._compute_rollups) - a leaf item's row is unchanged.
             if item.get("rollup"):
                 row["rollup"] = item["rollup"]
+            _add_decision(row, item)
             building.append(row)
         elif status == "done":
             entry = {
@@ -214,6 +225,7 @@ def _summarise_repo(
             }
             if item.get("rollup"):
                 entry["rollup"] = item["rollup"]
+            _add_decision(entry, item)
             parsed = _parse_ts(changed_at)
             if threshold is None or (parsed is not None and parsed >= threshold):
                 shipped_recent.append(entry)
@@ -232,6 +244,7 @@ def _summarise_repo(
             }
             if item.get("rollup"):
                 row["rollup"] = item["rollup"]
+            _add_decision(row, item)
             parked.append(row)
 
     building.sort(key=lambda it: (it.get("since", ""), it["id"]))

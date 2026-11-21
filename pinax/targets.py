@@ -2,8 +2,8 @@
 pinax.targets - the one rule that an event about something names something real.
 
 An event that records a change to an existing item (a claim, a completion, a
-block, a park, a priority, a release, a note, a dependency edge, a status
-change) must name an item that exists, and an annulment must name an event
+block, a park, a priority, a release, a note, a decision, a dependency edge,
+a status change) must name an item that exists, and an annulment must name an event
 that exists. Appending one that does not leaves a line in the append-only log
 that the fold can only ignore with a warning, forever, so the command refuses
 before anything is appended.
@@ -33,6 +33,7 @@ ITEM_REFERENCES: Mapping[str, tuple[str, ...]] = {
     "item.completed": ("item_id",),
     "item.parked": ("item_id",),
     "item.priority_set": ("item_id",),
+    "item.decided": ("item_id",),
     "note.added": ("item_id",),
     "dep.added": ("from_id", "to_id"),
     "dep.removed": ("from_id", "to_id"),

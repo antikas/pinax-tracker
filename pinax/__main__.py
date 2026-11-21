@@ -28,6 +28,14 @@ Supported commands:
          a class from the project's list, and any class given must be on
          it; under flow, the default, nothing is checked)
     pinax park   <id> --reason <reason> [--actor <actor>] [--offline] [--json]
+    pinax decide <id> --option <key> --label <text> --effect release|park
+                 --reason <text> [--actor <actor>] [--offline] [--json]
+        (records a decision: appends item.decided. park also appends
+         item.parked with the same reason in the same commit; release leaves
+         the status, gate and claim alone. A repeat of the latest committed
+         decision appends nothing. Never a note. The value after --option,
+         --label, --reason, --effect and --actor is always taken as that
+         value, even when it starts with '-')
     pinax release <id> --reason <reason> [--actor <actor>] [--offline] [--json]
         (release an item's live claim: appends item.claim_released. Any
          actor may release, with a reason; the fold then clears the item's
@@ -47,6 +55,10 @@ Supported commands:
     pinax policy owner-gates --class TEXT [--class TEXT ...] [--actor <actor>] [--offline] [--json]
         (repository-level: appends policy.owner_gate_classes_set, the list
          strict checks against. The last one wins; the built-in list without one)
+    pinax policy decision-actors --decider <role@host> [--decider ...] [--actor <actor>] [--offline] [--json]
+        (repository-level: appends policy.decision_actors_set, the actors
+         who may decide under strict. The last one wins; under strict
+         without one nobody may decide, under flow it is not checked)
     pinax policy check [--json]
         (read-only: lists blocked items for the owner with no valid
          owner-gate class. Exits 0 under flow; under strict, 1 when it
@@ -122,7 +134,7 @@ Supported commands:
          normal event path -- the append-only log is never hand-edited)
 
 Publishing a state change: every command above that appends an event (add,
-claim, done, block, park, release, policy, priority, dep, note, annul) runs
+claim, done, block, park, decide, release, policy, priority, dep, note, annul) runs
 the one publish sequence in pinax.sync -- refuse an actor that is not role@host, fetch
 origin (unless offline mode applies), fold the union of the local log and
 the remote default branch's committed shards, append, regenerate the
@@ -142,7 +154,8 @@ Their exit codes are:
     7  the shard and the projection could not be staged, or the commit was
        refused; either way the appended event stays uncommitted
     8  the project's policy refuses the event: under the strict process, a
-       block for the owner without a listed owner-gate class
+       block for the owner without a listed owner-gate class, or a decide
+       from an actor not on the decision-actor list or with no list set
 
 All commands operate on the repository at the current working directory (CWD),
 resolved by walking up from CWD to the nearest ancestor .git directory.
@@ -158,9 +171,14 @@ ancestor tracker.
 from __future__ import annotations
 
 import argparse
+import io
+import json
 import os
 import subprocess
 import sys
+import traceback
+
+from . import refusal
 
 # Single-source edge-type enum (SSOT: dep.py).  All user-facing text derived here
 # so adding a 6th type is a one-line change in dep.py only (ADR-001).
@@ -193,7 +211,7 @@ def _find_repo_root(root_pin: str | None = None) -> str:
         pin_norm = os.path.normcase(os.path.normpath(os.path.abspath(root_pin)))
         resolved_norm = os.path.normcase(os.path.normpath(os.path.abspath(resolved)))
         if pin_norm != resolved_norm:
-            print(
+            refusal.refuse(
                 "pinax: ROOT MISMATCH - the pinned root (--root/PINAX_ROOT) is "
                 f"{root_pin!r} but walking up from the current directory "
                 f"({cwd!r}) resolves to {resolved!r} instead. Refusing to "
@@ -201,9 +219,8 @@ def _find_repo_root(root_pin: str | None = None) -> str:
                 "tracker. Run pinax "
                 "from inside the pinned repo, fix the pin, or unset "
                 "--root/PINAX_ROOT if this drift is intentional.",
-                file=sys.stderr,
+                refusal.ROOT_MISMATCH,
             )
-            sys.exit(1)
 
     return resolved
 
@@ -345,6 +362,60 @@ def _cmd_park(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_decide(args: argparse.Namespace) -> None:
+    from .commands.decide import run
+    run(
+        repo_root=_find_repo_root(_resolve_root_pin(args)),
+        item_id=args.id,
+        option=args.option,
+        label=args.label,
+        effect=args.effect,
+        reason=args.reason,
+        actor=args.actor,
+        as_json=args.json,
+        offline=args.offline,
+    )
+
+
+_DECIDE_VALUE_FLAGS = frozenset({"--option", "--label", "--effect", "--reason", "--actor"})
+
+
+def _bind_decide_values(argv: list[str]) -> list[str]:
+    """
+    For decide, join each value flag with the token after it as flag=value.
+
+    argparse would read a reason such as '--offline' as the flag itself; a
+    caller passing free text as one argument means it as the value. Only
+    '--root' itself is skipped with its value before the subcommand; an
+    abbreviation such as '--ro' leaves the list to argparse unchanged, as
+    it always has.
+    """
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--root":
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        break
+    if index >= len(argv) or argv[index] != "decide":
+        return argv
+    bound = list(argv[: index + 1])
+    rest = argv[index + 1:]
+    position = 0
+    while position < len(rest):
+        token = rest[position]
+        if token in _DECIDE_VALUE_FLAGS and position + 1 < len(rest):
+            bound.append(f"{token}={rest[position + 1]}")
+            position += 2
+            continue
+        bound.append(token)
+        position += 1
+    return bound
+
+
 def _cmd_release(args: argparse.Namespace) -> None:
     from .commands.release import run
     run(
@@ -384,6 +455,17 @@ def _cmd_policy_owner_gates(args: argparse.Namespace) -> None:
     run_owner_gates(
         repo_root=_find_repo_root(_resolve_root_pin(args)),
         classes=args.owner_gate_class,
+        actor=args.actor,
+        as_json=args.json,
+        offline=args.offline,
+    )
+
+
+def _cmd_policy_decision_actors(args: argparse.Namespace) -> None:
+    from .commands.policy import run_decision_actors
+    run_decision_actors(
+        repo_root=_find_repo_root(_resolve_root_pin(args)),
+        deciders=args.decider,
         actor=args.actor,
         as_json=args.json,
         offline=args.offline,
@@ -441,21 +523,19 @@ def _validate_dep_args(args: argparse.Namespace, op: str) -> tuple[str, str]:
 
     # Case: both --to and --blocks given — ambiguous.
     if has_to and has_blocks:
-        print(
+        refusal.refuse(
             f"pinax dep {op}: --to and --blocks are mutually exclusive. "
             "Use '--to <id> --type blocks' or '--blocks <id>' but not both.",
-            file=sys.stderr,
+            refusal.INVALID_DEPENDENCY,
         )
-        sys.exit(1)
 
     # Case: neither --to nor --blocks given.
     if not has_to and not has_blocks:
-        print(
+        refusal.refuse(
             f"pinax dep {op}: must supply '--to <id> --type <t>' "
             "or '--blocks <id>' (back-compat alias for --type blocks).",
-            file=sys.stderr,
+            refusal.INVALID_DEPENDENCY,
         )
-        sys.exit(1)
 
     # Case: --blocks alias (back-compat) — edge type is forced to "blocks".
     if has_blocks:
@@ -463,13 +543,12 @@ def _validate_dep_args(args: argparse.Namespace, op: str) -> tuple[str, str]:
 
     # Case: --to without --type — require explicit --type (no silent default).
     if not has_type:
-        print(
+        refusal.refuse(
             f"pinax dep {op}: --to requires --type <t>. "
             f"Specify the edge type explicitly ({_VALID_TYPES_HELP}). "
             "To add a blocks edge use '--blocks <id>' or '--to <id> --type blocks'.",
-            file=sys.stderr,
+            refusal.INVALID_DEPENDENCY,
         )
-        sys.exit(1)
 
     return args.to, args.type
 
@@ -654,8 +733,8 @@ def _cmd_doctor(args: argparse.Namespace) -> None:
     )
 
 
-def main(argv: list[str] | None = None) -> None:
-    _configure_console_streams()
+def build_parser() -> argparse.ArgumentParser:
+    """The whole command line: every subcommand and its handler."""
     parser = argparse.ArgumentParser(
         prog="pinax",
         description="Pinax - Git-native build tracker",
@@ -672,6 +751,14 @@ def main(argv: list[str] | None = None) -> None:
             "silently walking up if the resolved .git root differs from this "
             "(also settable via the PINAX_ROOT environment variable)"
         ),
+    )
+    from . import __version__
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"pinax {__version__}",
+        help="Print the Pinax version and exit",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -690,7 +777,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip fetch and push; append and commit locally only "
              "(also settable via the PINAX_OFFLINE=1 environment variable)",
     )
-    p_add.add_argument("--json", action="store_true", help="Output JSON")
+    p_add.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_add.add_argument(
         "--allow-new-prefix",
         action="store_true",
@@ -708,7 +795,7 @@ def main(argv: list[str] | None = None) -> None:
     p_claim = sub.add_parser("claim", help="Claim an item (appends item.claimed)")
     p_claim.add_argument("id", help="Item ID to claim")
     p_claim.add_argument("--actor", default=None, help="Actor string (role@handle)")
-    p_claim.add_argument("--json", action="store_true", help="Output JSON")
+    p_claim.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_claim.set_defaults(func=_cmd_claim)
 
     # pinax status
@@ -726,7 +813,7 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     p_status.add_argument("--actor", default=None, help="Actor string (role@handle)")
-    p_status.add_argument("--json", action="store_true", help="Output JSON")
+    p_status.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_status.add_argument(
         "--repo",
         default=None,
@@ -772,7 +859,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip fetch and push; append and commit locally only "
              "(also settable via the PINAX_OFFLINE=1 environment variable)",
     )
-    p_done.add_argument("--json", action="store_true", help="Output JSON")
+    p_done.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_done.set_defaults(func=_cmd_done)
 
     # pinax block
@@ -796,7 +883,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip fetch and push; append and commit locally only "
              "(also settable via the PINAX_OFFLINE=1 environment variable)",
     )
-    p_block.add_argument("--json", action="store_true", help="Output JSON")
+    p_block.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_block.set_defaults(func=_cmd_block)
 
     # pinax park
@@ -809,8 +896,30 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip fetch and push; append and commit locally only "
              "(also settable via the PINAX_OFFLINE=1 environment variable)",
     )
-    p_park.add_argument("--json", action="store_true", help="Output JSON")
+    p_park.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_park.set_defaults(func=_cmd_park)
+
+    # pinax decide
+    p_decide = sub.add_parser(
+        "decide",
+        help="Record a decision on an item (appends item.decided; park also parks it)",
+    )
+    p_decide.add_argument("id", help="Item ID")
+    p_decide.add_argument("--option", required=True, help="The chosen option's key")
+    p_decide.add_argument("--label", required=True, help="The chosen option's label")
+    p_decide.add_argument(
+        "--effect", required=True, choices=["release", "park"],
+        help="release leaves the item's status alone; park also parks it",
+    )
+    p_decide.add_argument("--reason", required=True, help="Why this was decided")
+    p_decide.add_argument("--actor", default=None, help="Actor string (role@handle)")
+    p_decide.add_argument(
+        "--offline", action="store_true",
+        help="Skip fetch and push; append and commit locally only "
+             "(also settable via the PINAX_OFFLINE=1 environment variable)",
+    )
+    p_decide.add_argument("--json", action=_JsonFlag, help="Output JSON")
+    p_decide.set_defaults(func=_cmd_decide)
 
     # pinax release
     p_release = sub.add_parser(
@@ -825,7 +934,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip fetch and push; append and commit locally only "
              "(also settable via the PINAX_OFFLINE=1 environment variable)",
     )
-    p_release.add_argument("--json", action="store_true", help="Output JSON")
+    p_release.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_release.set_defaults(func=_cmd_release)
 
     # pinax policy (sub-subcommand: claim-expiry)
@@ -857,7 +966,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip fetch and push; append and commit locally only "
              "(also settable via the PINAX_OFFLINE=1 environment variable)",
     )
-    p_policy_expiry.add_argument("--json", action="store_true", help="Output JSON")
+    p_policy_expiry.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_policy_expiry.set_defaults(func=_cmd_policy_claim_expiry)
 
     p_policy_process = policy_sub.add_parser(
@@ -881,16 +990,28 @@ def main(argv: list[str] | None = None) -> None:
         "--class", dest="owner_gate_class", action="append", required=True,
         metavar="TEXT", help="One owner-gate class; repeat for each",
     )
-    for parser_ in (p_policy_process, p_policy_gates):
+    p_policy_deciders = policy_sub.add_parser(
+        "decision-actors",
+        help=(
+            "Set who may decide under strict (appends "
+            "policy.decision_actors_set; under strict nobody without one)"
+        ),
+    )
+    p_policy_deciders.add_argument(
+        "--decider", action="append", required=True, metavar="ROLE@HOST",
+        help="One actor who may decide; repeat for each",
+    )
+    for parser_ in (p_policy_process, p_policy_gates, p_policy_deciders):
         parser_.add_argument("--actor", default=None, help="Actor string (role@handle)")
         parser_.add_argument(
             "--offline", action="store_true",
             help="Skip fetch and push; append and commit locally only "
                  "(also settable via the PINAX_OFFLINE=1 environment variable)",
         )
-        parser_.add_argument("--json", action="store_true", help="Output JSON")
+        parser_.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_policy_process.set_defaults(func=_cmd_policy_process)
     p_policy_gates.set_defaults(func=_cmd_policy_owner_gates)
+    p_policy_deciders.set_defaults(func=_cmd_policy_decision_actors)
 
     p_policy_check = policy_sub.add_parser(
         "check",
@@ -899,7 +1020,7 @@ def main(argv: list[str] | None = None) -> None:
             "(read-only; exits 1 on findings under strict only)"
         ),
     )
-    p_policy_check.add_argument("--json", action="store_true", help="Output JSON")
+    p_policy_check.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_policy_check.set_defaults(func=_cmd_policy_check)
 
     # pinax priority
@@ -918,7 +1039,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip fetch and push; append and commit locally only "
              "(also settable via the PINAX_OFFLINE=1 environment variable)",
     )
-    p_priority.add_argument("--json", action="store_true", help="Output JSON")
+    p_priority.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_priority.set_defaults(func=_cmd_priority)
 
     # pinax annul
@@ -934,7 +1055,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip fetch and push; append and commit locally only "
              "(also settable via the PINAX_OFFLINE=1 environment variable)",
     )
-    p_annul.add_argument("--json", action="store_true", help="Output JSON")
+    p_annul.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_annul.set_defaults(func=_cmd_annul)
 
     # pinax dep (sub-subcommand: add / rm)
@@ -976,7 +1097,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip fetch and push; append and commit locally only "
              "(also settable via the PINAX_OFFLINE=1 environment variable)",
     )
-    p_dep_add.add_argument("--json", action="store_true", help="Output JSON")
+    p_dep_add.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_dep_add.set_defaults(func=_cmd_dep_add)
 
     p_dep_rm = dep_sub.add_parser(
@@ -1009,13 +1130,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip fetch and push; append and commit locally only "
              "(also settable via the PINAX_OFFLINE=1 environment variable)",
     )
-    p_dep_rm.add_argument("--json", action="store_true", help="Output JSON")
+    p_dep_rm.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_dep_rm.set_defaults(func=_cmd_dep_rm)
 
     # pinax ready
     p_ready = sub.add_parser("ready", help="List items ready for dispatch")
     p_ready.add_argument("--actor", default=None, help="Actor string (role@handle)")
-    p_ready.add_argument("--json", action="store_true", help="Output JSON")
+    p_ready.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_ready.add_argument(
         "--all-branches", action="store_true", dest="all_branches",
         help="Fold in every unmerged local branch's committed .ergon shards.",
@@ -1030,7 +1151,7 @@ def main(argv: list[str] | None = None) -> None:
     # pinax next
     p_next = sub.add_parser("next", help="Show single next item to dispatch")
     p_next.add_argument("--actor", default=None, help="Actor string (role@handle)")
-    p_next.add_argument("--json", action="store_true", help="Output JSON")
+    p_next.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_next.add_argument(
         "--under", default=None, metavar="ITEM_ID",
         help="Restrict the candidate set to the transitive parent-child "
@@ -1079,7 +1200,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip fetch and push; append and commit locally only "
              "(also settable via the PINAX_OFFLINE=1 environment variable)",
     )
-    p_note_add.add_argument("--json", action="store_true", help="Output JSON")
+    p_note_add.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_note_add.set_defaults(func=_cmd_note_add)
 
     # pinax metrics
@@ -1087,7 +1208,7 @@ def main(argv: list[str] | None = None) -> None:
         "metrics",
         help="Read-only metrics fold over the event log (never writes to knowledge plane)",
     )
-    p_metrics.add_argument("--json", action="store_true", help="Output JSON")
+    p_metrics.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_metrics.set_defaults(func=_cmd_metrics)
 
     # pinax report
@@ -1095,7 +1216,7 @@ def main(argv: list[str] | None = None) -> None:
         "report",
         help="Summary: shipped / parked / failed+blocked / next (read-only fold)",
     )
-    p_report.add_argument("--json", action="store_true", help="Output JSON")
+    p_report.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_report.add_argument(
         "--all-branches", action="store_true", dest="all_branches",
         help="Fold in every unmerged local branch's committed .ergon shards.",
@@ -1120,7 +1241,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Automatically claim each manifest item",
     )
     p_dispatch.add_argument("--actor", default=None, help="Actor string (role@handle)")
-    p_dispatch.add_argument("--json", action="store_true", help="Output JSON")
+    p_dispatch.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_dispatch.set_defaults(func=_cmd_dispatch)
 
     # pinax replay
@@ -1134,7 +1255,7 @@ def main(argv: list[str] | None = None) -> None:
         metavar="REF",
         help="Git ref (branch, tag, or commit sha) to fold the log up to",
     )
-    p_replay.add_argument("--json", action="store_true", help="Output JSON")
+    p_replay.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_replay.set_defaults(func=_cmd_replay)
 
     # pinax board
@@ -1142,7 +1263,7 @@ def main(argv: list[str] | None = None) -> None:
         "board",
         help="Print this repo's board (live push-down, read-only fold)",
     )
-    p_board.add_argument("--json", action="store_true", help="Output JSON")
+    p_board.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_board.add_argument(
         "--all-branches", action="store_true", dest="all_branches",
         help="Fold in every unmerged local branch's committed .ergon shards.",
@@ -1164,7 +1285,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Max directory depth to scan under each root "
              "(default: 3; also settable via PINAX_ROOTS_MAX_DEPTH)",
     )
-    p_overview.add_argument("--json", action="store_true", help="Output JSON")
+    p_overview.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_overview.add_argument(
         "--markdown", action="store_true",
         help="Write the committed PORTFOLIO.md projection at the repo root "
@@ -1208,7 +1329,7 @@ def main(argv: list[str] | None = None) -> None:
              "--path/--url is required",
     )
     p_registry_add.add_argument("--actor", default=None, help="Actor string (role@handle)")
-    p_registry_add.add_argument("--json", action="store_true", help="Output JSON")
+    p_registry_add.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_registry_add.set_defaults(func=_cmd_registry_add)
 
     p_registry_rm = registry_sub.add_parser(
@@ -1217,14 +1338,14 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_registry_rm.add_argument("--id", required=True, help="Repo id (lowercase slug)")
     p_registry_rm.add_argument("--actor", default=None, help="Actor string (role@handle)")
-    p_registry_rm.add_argument("--json", action="store_true", help="Output JSON")
+    p_registry_rm.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_registry_rm.set_defaults(func=_cmd_registry_rm)
 
     p_registry_list = registry_sub.add_parser(
         "list",
         help="List registered repos (read-only fold)",
     )
-    p_registry_list.add_argument("--json", action="store_true", help="Output JSON")
+    p_registry_list.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_registry_list.set_defaults(func=_cmd_registry_list)
 
     # pinax reconcile
@@ -1244,7 +1365,7 @@ def main(argv: list[str] | None = None) -> None:
         "--dry-run", action="store_true",
         help="Print what would be imported/rejected/skipped; touch nothing",
     )
-    p_reconcile.add_argument("--json", action="store_true", help="Output JSON")
+    p_reconcile.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_reconcile.set_defaults(func=_cmd_reconcile)
 
     # pinax doctor
@@ -1284,11 +1405,316 @@ def main(argv: list[str] | None = None) -> None:
         "--actor", default=None,
         help="Actor for events appended under --reconcile (role@handle)",
     )
-    p_doctor.add_argument("--json", action="store_true", help="Output JSON")
+    p_doctor.add_argument("--json", action=_JsonFlag, help="Output JSON")
     p_doctor.set_defaults(func=_cmd_doctor)
+    _tag_commands(parser)
+    return parser
 
-    parsed = parser.parse_args(argv)
+
+# The write commands: every subcommand whose handler runs the publish
+# sequence. Under --json each of them prints exactly one JSON object on
+# every exit (see _run_with_json_result). tests/test_json_every_exit.py
+# derives the same set from the handlers, so a new write command cannot
+# be left out silently.
+WRITE_COMMANDS = (
+    "add", "claim", "done", "block", "park", "decide", "release",
+    "policy claim-expiry", "policy process", "policy owner-gates",
+    "policy decision-actors", "priority", "annul", "dep add", "dep rm",
+    "note add",
+)
+
+# Subcommands whose second word names the operation.
+_GROUPED = frozenset({"policy", "dep", "note"})
+
+
+def _subparser(parser: argparse.ArgumentParser, path: list[str]):
+    """The parser for the subcommand words in path, or None."""
+    current = parser
+    for word in path:
+        found = None
+        for action in current._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                found = action.choices.get(word)
+        if found is None:
+            return None
+        current = found
+    return current
+
+
+def _refused_json_command(parser: argparse.ArgumentParser, argv: list[str]) -> str | None:
+    """
+    The write command an argument list argparse refused names, when the
+    list asks for --json; else None.
+
+    Used only when argparse ended with an error before its --json action
+    ran (see _JsonFlag), so a --json written where argparse refuses it,
+    such as '--json=1', before the subcommand, between 'dep' and 'add', or
+    after an option still waiting for its value, still asks for JSON and
+    the argument error is reported as JSON. argv is the list after
+    _bind_decide_values, so a decide value such as '--reason --json' is
+    already one token, '--reason=--json'. Options are resolved as argparse
+    resolves them, abbreviations included, against the parser for the
+    words read so far: '--ro PATH' is the root pin, '--js' is --json. A
+    '--' before the subcommand words is passed over, as argparse passes it
+    over; after them, what follows is positional.
+    """
+    words: list[str] = []
+    current = parser
+    asked = False
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            complete = len(words) == 2 or (len(words) == 1 and words[0] not in _GROUPED)
+            if complete:
+                break
+            index += 1
+            continue
+        if token.startswith("--"):
+            name = token.split("=", 1)[0]
+            option = _option_name(current, token)
+            if option == "--json" or (option is None and len(name) > 2 and "--json".startswith(name)):
+                asked = True
+            elif current is parser and option == "--root" and "=" not in token:
+                # The pin's value, unless argparse would read it as an option.
+                if index + 1 < len(argv) and not argv[index + 1].startswith("-"):
+                    index += 1
+        elif not token.startswith("-"):
+            if not words or (len(words) == 1 and words[0] in _GROUPED):
+                words.append(token)
+                current = _subparser(parser, words) or current
+        index += 1
+    command = " ".join(words)
+    return command if asked and command in WRITE_COMMANDS else None
+
+
+def _option_name(parser: argparse.ArgumentParser, token: str) -> str | None:
+    """
+    The long option a '--' token names in parser, as argparse resolves it:
+    the exact name, or the one option the name abbreviates; else None.
+    """
+    name = token.split("=", 1)[0]
+    options = parser._option_string_actions
+    if name in options:
+        return name
+    if len(name) <= 2:
+        return None
+    matches = [option for option in options if option.startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
+# The write commands whose --json flag argparse has read in this process,
+# appended by _JsonFlag in the order argparse read them.
+_JSON_SEEN: list[str] = []
+
+
+class _JsonFlag(argparse._StoreTrueAction):
+    """
+    --json, which also records which subcommand argparse read it for.
+
+    argparse may still end with an error after reading the flag, such as a
+    missing required option; the record says the caller asked for JSON
+    exactly as argparse parsed the list, for the Python running it.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        super().__call__(parser, namespace, values, option_string)
+        _JSON_SEEN.append(getattr(parser, "pinax_command", ""))
+
+
+def _tag_commands(parser: argparse.ArgumentParser, path: tuple = ()) -> None:
+    """Name each subcommand parser with its words, on the parser and its result."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for word, child in action.choices.items():
+                _tag_commands(child, path + (word,))
+            return
+    parser.pinax_command = " ".join(path)
+    parser.set_defaults(pinax_command=" ".join(path))
+
+
+def _run_parsed(parsed: argparse.Namespace) -> None:
+    if getattr(parsed, "actor", None):
+        from .append import normalise_actor
+        parsed.actor = normalise_actor(parsed.actor)
     parsed.func(parsed)
+
+
+class _WriteThrough(io.TextIOBase):
+    """Standard error that still reaches the terminal and is also kept."""
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self._kept = io.StringIO()
+
+    def write(self, text: str) -> int:
+        self._kept.write(text)
+        if self._stream is not None:
+            self._stream.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if self._stream is not None:
+            self._stream.flush()
+
+    def kept(self) -> str:
+        return self._kept.getvalue()
+
+
+def _exit_code(exc: SystemExit) -> int:
+    if exc.code is None:
+        return 0
+    if isinstance(exc.code, int):
+        return exc.code
+    print(exc.code, file=sys.stderr)
+    return 1
+
+
+def _publication_result(line: str) -> dict | None:
+    try:
+        value = json.loads(line)
+    except ValueError:
+        return None
+    if isinstance(value, dict) and "published" in value and "sync_status" in value:
+        return value
+    return None
+
+
+def _write(stream, text: str) -> None:
+    """Write text to stream when there is a usable one; never fail for it."""
+    if stream is None or not text:
+        return
+    try:
+        stream.write(text)
+        stream.flush()
+    except (OSError, ValueError):
+        pass
+
+
+# The exit code a JSON result reports for an interrupt: the shell's status
+# for SIGINT. The process itself still ends by the interrupt.
+_INTERRUPT_EXIT_CODE = 130
+
+
+def _run_with_json_result(
+    parsed: argparse.Namespace | None,
+    parse_code: int,
+    command: str,
+    captured: io.StringIO,
+    kept: _WriteThrough,
+) -> None:
+    """
+    Run a write command under --json and print exactly one JSON object.
+
+    parsed is None when argparse refused the arguments with parse_code.
+    Standard output is captured; standard error is kept and still written
+    through. Whatever ends the command, the one line printed is its own
+    result on exit 0, the publish sequence's report when the command
+    printed one, and otherwise a refusal object naming why it stopped.
+    Every other line the command printed goes to standard error. The exit
+    code is the command's own. An interrupt prints the result, then ends
+    the process by the interrupt exactly as without --json.
+    """
+    real_stdout, real_stderr = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = captured, kept
+    name = None
+    error = None
+    interrupt = None
+    try:
+        if parsed is None:
+            raise refusal.Refusal(parse_code, refusal.INVALID_ARGUMENT)
+        _run_parsed(parsed)
+        code = 0
+    except refusal.Refusal as exc:
+        code, name = _exit_code(exc), exc.name
+    except SystemExit as exc:
+        # A plain exit the command did not name is a value refusal.
+        code, name = _exit_code(exc), refusal.INVALID_ARGUMENT
+    except KeyboardInterrupt as exc:
+        interrupt = exc
+        code, name = _INTERRUPT_EXIT_CODE, refusal.INTERRUPTED
+        error = "pinax: interrupted (KeyboardInterrupt)"
+    except Exception as exc:
+        traceback.print_exc()
+        code, name = 1, refusal.INTERNAL_ERROR
+        error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+    finally:
+        sys.stdout, sys.stderr = real_stdout, real_stderr
+
+    chosen = None
+    others = []
+    for line in captured.getvalue().splitlines():
+        result = _publication_result(line) if chosen is None else None
+        if result is not None:
+            chosen = result
+        elif line.strip():
+            others.append(line)
+    _write(real_stderr, "".join(line + "\n" for line in others))
+
+    if chosen is None:
+        if code == 0:
+            name = refusal.INTERNAL_ERROR
+            error = "pinax: the command printed no JSON result"
+        if error is None:
+            error = kept.kept().strip() or f"pinax {command}: exited with code {code}"
+        chosen = {
+            "published": False,
+            "sync_status": name,
+            "error": error,
+            "exit_code": code,
+            "command": command,
+        }
+    _write(real_stdout, json.dumps(chosen, sort_keys=True, ensure_ascii=True) + "\n")
+    if interrupt is not None:
+        raise interrupt
+    if code != 0:
+        sys.exit(code)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """
+    Parse the arguments, then run the command.
+
+    Parsing always runs with standard output captured and standard error
+    kept and written through, so the mode follows what argparse actually
+    parsed: a write command whose parse read --json runs under
+    _run_with_json_result, and every other command runs as it always has.
+    A help or version text reaches standard output unchanged, exit 0.
+    """
+    _configure_console_streams()
+    parser = build_parser()
+    bound = _bind_decide_values(list(sys.argv[1:] if argv is None else argv))
+    real_stdout, real_stderr = sys.stdout, sys.stderr
+    captured = io.StringIO()
+    kept = _WriteThrough(real_stderr)
+    del _JSON_SEEN[:]
+    parsed = None
+    parse_code = 0
+    sys.stdout, sys.stderr = captured, kept
+    try:
+        parsed = parser.parse_args(bound)
+    except SystemExit as exc:
+        parse_code = _exit_code(exc)
+    finally:
+        sys.stdout, sys.stderr = real_stdout, real_stderr
+
+    if parsed is None and parse_code == 0:
+        _write(real_stdout, captured.getvalue())
+        sys.exit(0)
+    if parsed is not None:
+        named = getattr(parsed, "pinax_command", "")
+        asked = bool(getattr(parsed, "json", False)) and named in WRITE_COMMANDS
+        command = named if asked else None
+    else:
+        seen = [name for name in _JSON_SEEN if name in WRITE_COMMANDS]
+        command = seen[0] if seen else _refused_json_command(parser, bound)
+    if command is None:
+        _write(real_stdout, captured.getvalue())
+        if parsed is None:
+            sys.exit(parse_code)
+        _run_parsed(parsed)
+        return
+    _run_with_json_result(parsed, parse_code, command, captured, kept)
 
 
 if __name__ == "__main__":

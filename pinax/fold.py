@@ -29,6 +29,8 @@ from collections import OrderedDict, defaultdict
 from typing import Iterator
 
 from .event import (
+    decided_item,
+    declared_decision_actors,
     declared_expiry_hours,
     declared_owner_gate_classes,
     declared_process,
@@ -172,22 +174,38 @@ def _check_prev_chain(events: list[dict], annulled_ids: frozenset[str] = frozens
       predecessor, so it cries "Broken prev-chain" on every fork.  This is the
       common case for same-actor branches sharing one shard.
 
-    Set-membership rule:
+    Set-membership rule (broken_prev_links owns it):
       Within each (shard, actor) scope, collect all event ids as a set.  An event's
-      prev is LEGITIMATE if it is empty (chain anchor) OR references a known id in
-      that scope's id-set.  A prev that references NO known id is a dangling ref —
-      evidence of deletion or tamper — and warrants a WARNING.
+      prev is LEGITIMATE if it is empty OR references a known id in that scope's
+      id-set.  The scope's first event (its anchor) may instead reference any id
+      anywhere in the log, since a chain can continue from another shard file.
+      A prev that references NO such id is a dangling ref, evidence of deletion
+      or tamper, and warrants a WARNING.
 
     What this detects and does not detect:
-      - DETECTS: a deleted-middle event (its successor's prev dangles — the deleted
-        id is no longer in the id-set).
-      - DETECTS: a mutated-payload event (its id changes, so its successor's prev
-        references the OLD id which is no longer in the set — dangling).
-      - DOES NOT DETECT: anchor tamper (deleting/altering the first event — the new
-        first event self-anchors with prev=''; see DESIGN.md, "Verification and tombstones" for this v1
-        limitation.)
-      - DOES NOT DETECT: tip tamper (deleting/altering the last event — no successor
-        to dangle; documented in DESIGN.md, "Verification and tombstones").
+      - DETECTS: a deleted event that a later, non-annulled event names as its
+        prev, the oldest included (that later event's prev dangles: the
+        deleted id is no longer in the log), wherever the later events are
+        moved, into another shard file of the same actor or another actor's
+        shard file.
+      - DETECTS: a mutated-payload event with a recomputed id that a later,
+        non-annulled event names as its prev (that prev references the OLD id
+        which is no longer in the log, so it dangles), the oldest included,
+        whatever its new position in sort order.
+      - CAUGHT BY THE ID CHECK: an altered event, the first and the last included.
+        Altering any hashed field (every field of a version 2 event; every field
+        but prev of a version 1 event) means that event fails its own id check
+        in `pinax verify`, unless the id is recomputed.
+      - DOES NOT DETECT (nor does the id check): deleting, or an edit that
+        recomputes the id of, an event no later event names as its prev (the
+        last event, and after a union merge of two clones of one actor the
+        tip of each fork branch), deleting an event whose successor is
+        annulled, or a rewrite that recomputes every later event up to the
+        last; see DESIGN.md, "Verification and tombstones".
+      - DOES NOT CHECK: the content of an annulled event; any line that keeps
+        its id satisfies a prev that names it.
+      - WARNS ONLY: a broken link on a version 1 event, the anchor included;
+        `pinax verify` fails only for version 2 events.
       - DOES NOT DETECT: seq-monotonicity violations (documented in DESIGN.md, "Verification and tombstones").
       - DOES NOT DETECT: a fork (multiple events sharing the same prev — legitimate
         after a union merge; this is intentional).
@@ -195,47 +213,72 @@ def _check_prev_chain(events: list[dict], annulled_ids: frozenset[str] = frozens
     A broken link means a log segment was deleted or a prev/payload field was
     mutated.  Emit a WARNING for each dangling prev — detectable on replay.
     """
-    # Group events by (shard, actor), preserving the already-established total order.
-    # Tuple key: (shard_path, actor_string).
+    for shard, actor, event in broken_prev_links(events, annulled_ids):
+        logger.warning(
+            "Broken prev-chain in shard=%s for actor=%s at seq=%s id=%s: "
+            "prev=%r references no known id in this (shard,actor) scope "
+            "(deleted or tampered predecessor).",
+            shard,
+            actor,
+            event.get("seq"),
+            event.get("id"),
+            event.get("prev", ""),
+        )
+
+
+def broken_prev_links(
+    events: list[dict], annulled_ids: frozenset[str] = frozenset()
+) -> list[tuple[str, str, dict]]:
+    """
+    Return (shard, actor, event) for every event whose prev is a broken link.
+
+    The one home of the predecessor rule: the fold's warning and
+    ``pinax verify`` both read it from here.
+
+    ``events`` must be in total order and carry the '_shard' annotation, and
+    must be every parsed line of every shard of the log. An event whose own
+    id is annulled is never returned. Otherwise a non-empty prev is broken
+    when it names:
+
+      - for an event after the first of its (shard, actor) scope: no id in
+        that scope;
+      - for the first event of its scope (its anchor): no id anywhere in the
+        log. An anchor may continue a chain from another shard file, as a log
+        written before the shard choice took prev only from the chosen shard
+        does, but the event it names must exist.
+
+    The fold warns for each; ``pinax verify`` fails for each version 2 event
+    among them.
+
+    There is no exemption for a prev that names the target of a tombstone.
+    Pinax's commands only append to the log, so they do not remove an
+    annulled event's line, and a prev naming an annulled event finds its id
+    in the log. Exempting that shape would
+    let a writer annul an event, delete it and move its successors into
+    another shard file without verify noticing. Verify does not check the
+    content of an annulled event: any line that keeps its id satisfies a prev
+    that names it.
+    """
     by_chain: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    log_ids: set[str] = set()
     for event in events:
         shard = event.get("_shard", "<unknown>")
         actor = event.get("actor", "")
         by_chain[(shard, actor)].append(event)
+        if event.get("id"):
+            log_ids.add(event["id"])
 
+    broken: list[tuple[str, str, dict]] = []
     for (shard, actor), chain_events in by_chain.items():
-        if not chain_events:
-            continue
-
-        # Collect all known event ids in this (shard, actor) scope.
         known_ids: set[str] = {e["id"] for e in chain_events if e.get("id")}
-
         for event in chain_events:
             prev = event.get("prev", "")
-            # Rule: warn only when prev is non-empty AND not in known_ids AND this is
-            # not the scope's first event.  The first event is the chain anchor — its
-            # prev (empty or a cross-scope ref to a prior session/shard) is trusted.
-            # This also covers the single-event-scope case: a lone event is its own
-            # anchor, so its prev is trusted regardless of value (see DESIGN.md, "Verification and tombstones").
-            if prev and prev not in known_ids:
-                # suppressed (it is a formally tombstoned event) — every other
-                # event in this chain is still checked normally.
-                if event.get("id") in annulled_ids:
-                    continue
-                # Only warn if this is NOT the first event in the total-order for
-                # this (shard, actor) scope — the first event's prev is an anchor ref
-                # that may legitimately point outside this scope.
-                if event is not chain_events[0]:
-                    logger.warning(
-                        "Broken prev-chain in shard=%s for actor=%s at seq=%s id=%s: "
-                        "prev=%r references no known id in this (shard,actor) scope "
-                        "(deleted or tampered predecessor).",
-                        shard,
-                        actor,
-                        event.get("seq"),
-                        event.get("id"),
-                        prev,
-                    )
+            if not prev or event.get("id") in annulled_ids:
+                continue
+            scope = log_ids if event is chain_events[0] else known_ids
+            if prev not in scope:
+                broken.append((shard, actor, event))
+    return broken
 
 
 def _collect_annulled_ids(events: list) -> frozenset[str]:
@@ -335,12 +378,13 @@ def finalise_events(raw_events: list[dict]) -> list[dict]:
 
     After sorting+deduplication, performs two integrity checks (ADR-001 tamper-evidence):
     - id-verification: each event's stored id is recomputed and compared.
-    - prev-chain check (set-membership): warns when an event's prev
-      is non-empty and references no known id in its (shard,actor) scope (a dangling
-      prev = deleted/tampered predecessor).  A fork — multiple events chaining from
-      the same known id after a git merge=union — produces ZERO false warnings.
-      Anchor tamper, tip tamper, and seq-monotonicity are NOT detected; documented in
-      DESIGN.md, "Verification and tombstones" as v1 limitations.
+    - prev-chain check (set-membership, broken_prev_links): warns when an
+      event's prev is non-empty and references no known id in its (shard,actor)
+      scope, or, for the scope's first event, no id anywhere in the log (a
+      dangling prev = deleted/tampered predecessor).  A fork — multiple events
+      chaining from the same known id after a git merge=union — produces ZERO
+      false warnings. Tip tamper and seq-monotonicity are NOT detected;
+      documented in DESIGN.md, "Verification and tombstones".
     Both checks emit WARNING log messages on violation; neither drops events
     (detection is the guarantee; the fold still applies all events).
 
@@ -595,6 +639,54 @@ def _handle_policy_owner_gate_classes_set(state: dict, event: dict) -> None:
         )
         return
     state["owner_gate_policy"] = dict(_policy_record(event), classes=listed)
+
+
+def _handle_policy_decision_actors_set(state: dict, event: dict) -> None:
+    """
+    Record a policy.decision_actors_set event: who may decide under strict.
+
+    Repository-level and latest-by-total-order wins, as the process is. A log
+    without one produces no key, and pinax.owner_gates reads that as no list
+    set. A malformed record is warned about and sets nothing.
+    """
+    listed = declared_decision_actors(event)
+    if listed is None:
+        logger.warning(
+            "policy.decision_actors_set event without a list of actors: %s",
+            event.get("id"),
+        )
+        return
+    state["decision_actors_policy"] = dict(_policy_record(event), actors=listed)
+
+
+def _handle_item_decided(state: dict, event: dict) -> None:
+    """
+    Record an item.decided event as the item's latest decision.
+
+    Latest-by-total-order wins, and an annulled decision is never applied,
+    so the item carries the newest standing one. A decision changes nothing
+    else on the item: the park a park decision carries is its own
+    item.parked event. A record that is not a decision (see
+    event.decided_item) records nothing and is warned about once.
+    """
+    decided = decided_item(event)
+    if decided is None:
+        logger.warning("item.decided event that is not a decision: %s", event.get("id"))
+        return
+    items = state.setdefault("items", {})
+    item_id = decided["item_id"]
+    if item_id not in items:
+        logger.warning("item.decided for unknown item %s - ignored.", item_id)
+        return
+    items[item_id]["decision"] = {
+        "option": decided["option"],
+        "label": decided["label"],
+        "effect": decided["effect"],
+        "reason": decided["reason"],
+        "actor": event["actor"],
+        "ts": event["ts"],
+        "event_id": event["id"],
+    }
 
 
 def _handle_item_blocked(state: dict, event: dict) -> None:
@@ -998,6 +1090,8 @@ _HANDLERS = {
     "item.completed": _handle_item_completed,
     "item.parked": _handle_item_parked,
     "item.priority_set": _handle_item_priority_set,
+    "item.decided": _handle_item_decided,
+    "policy.decision_actors_set": _handle_policy_decision_actors_set,
     "dep.added": _handle_dep_added,
     "dep.removed": _handle_dep_removed,
     "note.added": _handle_note_added,

@@ -285,7 +285,7 @@ def test_done_commits_and_pushes_with_its_own_subject(repo, briefing):
 # 2. The union fold owns the sequence number and the predecessor reference
 # ---------------------------------------------------------------------------
 
-def test_union_fold_with_the_remote_decides_seq_and_prev(repo):
+def test_union_fold_with_the_remote_decides_seq_and_the_local_log_decides_prev(repo):
     remote_only = mint_event(
         seq=7,
         ts="2026-09-02T10:00:00Z",
@@ -300,7 +300,9 @@ def test_union_fold_with_the_remote_decides_seq_and_prev(repo):
     appended = _shard_events(repo, ACTOR)[-1]
     # The local log's highest seq is 0; the union's is 7.
     assert appended["seq"] == 8
-    assert appended["prev"] == remote_only["id"]
+    # The pre-commit hook verifies the local log before any merge, where an
+    # event only the remote holds is no known predecessor.
+    assert appended["prev"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -844,15 +846,26 @@ def _python_sources(root: str) -> list[str]:
     return sorted(found)
 
 
-def _matches(paths: list[str], patterns: tuple[str, ...]) -> list[str]:
+def _matches(
+    paths: list[str], patterns: tuple[str, ...], allowed: re.Pattern | None = None
+) -> list[str]:
     hits = []
     for path in paths:
         with open(path, "r", encoding="utf-8") as fh:
             for number, line in enumerate(fh, start=1):
-                for pattern in patterns:
-                    if re.search(pattern, line):
-                        hits.append(f"{os.path.basename(path)}:{number}: {line.strip()}")
+                if _line_hits(line, patterns, allowed):
+                    hits.append(f"{os.path.basename(path)}:{number}: {line.strip()}")
     return hits
+
+
+def _line_hits(line: str, patterns: tuple[str, ...], allowed: re.Pattern | None = None) -> bool:
+    text = allowed.sub("", line) if allowed else line
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+# Git's state directories for a re-application in progress. Reading whether
+# one exists rewrites nothing, and the names would otherwise match "rebase".
+_REWRITE_STATE_DIRS = re.compile(r"\brebase-(?:merge|apply)\b(?!-)")
 
 
 _REWRITE_PATTERNS = (
@@ -893,8 +906,21 @@ def test_no_history_rewrite_command_anywhere_in_pinax():
     introduce. An argument list assembled at run time from variables, or a
     token split across lines, would evade it.
     """
-    hits = _matches(_python_sources(PINAX_ROOT), _REWRITE_PATTERNS)
+    hits = _matches(_python_sources(PINAX_ROOT), _REWRITE_PATTERNS, _REWRITE_STATE_DIRS)
     assert not hits, "history-rewriting git usage found under pinax/:\n" + "\n".join(hits)
+
+
+@pytest.mark.parametrize("line, hit", [
+    ('_git(root, ["git", "rebase", "main"])\n', True),
+    ('names = ("rebase-merge", "rebase")\n', True),
+    ('# a rebase-apply directory is left by git rebase\n', True),
+    ('    "rebase-merge",\n', False),
+    ('    "rebase-apply",\n', False),
+    ('dirs = ("rebase-merge", "rebase-apply")\n', False),
+    ('name = "rebase-merge-extra"\n', True),
+])
+def test_the_rewrite_scan_lets_only_the_state_directory_names_through(line, hit):
+    assert _line_hits(line, _REWRITE_PATTERNS, _REWRITE_STATE_DIRS) is hit
 
 
 def test_no_clock_read_in_the_fold_path():

@@ -362,6 +362,7 @@ _EXEMPT = {
     "policy.claim_expiry_set": "repository-level",
     "policy.process_set": "repository-level",
     "policy.owner_gate_classes_set": "repository-level",
+    "policy.decision_actors_set": "repository-level",
     "registry.repo_added": "names a repository, not an item",
     "registry.repo_removed": "names a repository, not an item",
 }

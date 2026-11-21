@@ -31,6 +31,7 @@ import json
 import os
 import sys
 
+from .. import refusal
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 
 # pinax.sync imports pinax.projection, which imports this module for
@@ -80,26 +81,22 @@ def _run_dep(
     """
     # Validate edge type at write-time (before touching the log).
     if edge_type not in VALID_EDGE_TYPES:
-        print(
+        refusal.refuse(
             f"pinax: unknown edge type '{edge_type}'. "
             f"Valid types: {', '.join(sorted(VALID_EDGE_TYPES))}",
-            file=sys.stderr,
+            refusal.INVALID_DEPENDENCY,
         )
-        sys.exit(1)
 
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
 
-    if not os.path.isdir(log_dir):
-        print("pinax: .ergon/log/ not found - run 'pinax init' first.", file=sys.stderr)
-        sys.exit(1)
+    refusal.require_tracker(log_dir)
 
     if from_id == to_id:
-        print(
+        refusal.refuse(
             "pinax: dep from_id and to_id must be different (self-dep not allowed).",
-            file=sys.stderr,
+            refusal.INVALID_DEPENDENCY,
         )
-        sys.exit(1)
 
     from .. import sync
 
@@ -139,6 +136,7 @@ def _run_dep(
         "root": ergon_dir,
     }
 
+    result.update(outcome.publication())
     if as_json:
         print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     else:

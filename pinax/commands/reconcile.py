@@ -27,7 +27,7 @@ import re
 import sys
 from typing import Optional
 
-from ..append import append_event, _shard_name_for_actor
+from ..append import append_event, prev_for_actor, _shard_name_for_actor
 from ..event import mint_event, _canonical_json, _b32
 from ..targets import unknown_target_message
 from ..fold import fold, read_events
@@ -39,8 +39,8 @@ _DEFAULT_FILENAME = "BACKLOG-OFFLINE.md"
 
 
 def _default_actor() -> str:
-    import socket
-    return f"operator@{socket.gethostname()}"
+    from ..doctor import default_actor
+    return default_actor()
 
 
 def _utc_now_iso() -> str:
@@ -177,11 +177,6 @@ def _split_file(content: str) -> tuple[list[str], list[str]]:
     return candidates, preserved
 
 
-def _prev_event_id_for_actor(all_events: list[dict], actor: str) -> str:
-    matching = [e["id"] for e in all_events if e.get("actor") == actor]
-    return matching[-1] if matching else ""
-
-
 def run(
     repo_root: str,
     file_path: Optional[str] = None,
@@ -245,7 +240,7 @@ def run(
 
     def _prev_for(line_actor: str) -> str:
         if line_actor not in actor_prev:
-            actor_prev[line_actor] = _prev_event_id_for_actor(all_events, line_actor)
+            actor_prev[line_actor] = prev_for_actor(log_dir, line_actor)
         return actor_prev[line_actor]
 
     # Local overlay so several lines for the same item within ONE file are

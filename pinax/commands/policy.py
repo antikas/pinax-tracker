@@ -2,13 +2,16 @@
 pinax policy claim-expiry --hours N [--actor ...] [--offline] [--json]
 pinax policy process --mode flow|strict [--actor ...] [--offline] [--json]
 pinax policy owner-gates --class TEXT [--class TEXT ...] [--actor ...] [--offline] [--json]
+pinax policy decision-actors --decider ROLE@HOST [--decider ROLE@HOST ...] [--actor ...] [--offline] [--json]
 pinax policy check [--json]
 
-The three setting commands each publish one repository-level event:
+The setting commands each publish one repository-level event:
 
 - claim-expiry: policy.claim_expiry_set, carrying the hours.
 - process: policy.process_set, carrying flow or strict.
 - owner-gates: policy.owner_gate_classes_set, carrying the whole list.
+- decision-actors: policy.decision_actors_set, carrying the whole list of
+  actors who may decide under strict. --actor stays the writer.
 
 Each runs the publish sequence (pinax.sync) exactly as park and release
 do: mint the event, then fetch (unless offline), fold, append, commit and
@@ -32,7 +35,8 @@ under strict when it lists any.
 
 Refusals, before anything is minted: a claim expiry that is not a positive
 number of hours; a process that is neither flow nor strict; a class list
-that is empty, holds an empty class or names one class twice. Nothing else
+that is empty, holds an empty class or names one class twice; a decider
+that is not role@host (exit 2). Nothing else
 is checked here - the fold reads the event and decides.
 """
 
@@ -43,10 +47,11 @@ import math
 import os
 import sys
 
+from .. import refusal
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 
 STRICT_UPGRADE_WARNING = (
-    "pinax: every clone, and every older pinax on PATH, must run 0.3.0 or later "
+    "pinax: every clone, and every older pinax on PATH, must run 0.4.0 or later "
     "before this is used; an older client will report drift, and after "
     "upgrading, pinax verify --fix repairs it."
 )
@@ -75,17 +80,14 @@ def run_claim_expiry(
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
 
-    if not os.path.isdir(log_dir):
-        print("pinax: .ergon/log/ not found - run 'pinax init' first.", file=sys.stderr)
-        sys.exit(1)
+    refusal.require_tracker(log_dir)
 
     if not math.isfinite(hours) or hours <= 0:
-        print(
+        refusal.refuse(
             f"pinax: a claim expiry must be a positive number of hours, got "
             f"{hours!r}.",
-            file=sys.stderr,
+            refusal.INVALID_ARGUMENT,
         )
-        sys.exit(1)
 
     from .. import sync
 
@@ -118,6 +120,7 @@ def run_claim_expiry(
         "root": ergon_dir,
     }
 
+    result.update(outcome.publication())
     if as_json:
         print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     else:
@@ -129,9 +132,7 @@ def run_claim_expiry(
 
 
 def _require_log(ergon_dir: str) -> None:
-    if not os.path.isdir(os.path.join(ergon_dir, "log")):
-        print("pinax: .ergon/log/ not found - run 'pinax init' first.", file=sys.stderr)
-        sys.exit(1)
+    refusal.require_tracker(os.path.join(ergon_dir, "log"))
 
 
 def _publish_policy(
@@ -173,6 +174,7 @@ def _publish_policy(
         type=event_type,
         root=ergon_dir,
     )
+    result.update(outcome.publication())
     if as_json:
         print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     else:
@@ -203,20 +205,19 @@ def run_process(
     ergon_dir = os.path.join(repo_root, ".ergon")
     _require_log(ergon_dir)
     if mode not in owner_gates.PROCESSES:
-        print(
+        refusal.refuse(
             f"pinax: the process must be one of {', '.join(owner_gates.PROCESSES)}, "
             f"got {mode!r}.",
-            file=sys.stderr,
+            refusal.INVALID_ARGUMENT,
         )
-        sys.exit(1)
     _publish_policy(
         repo_root, "policy.process_set", {"process": mode},
         actor, as_json, offline, runner, f"process set to {mode}",
     )
     if mode == owner_gates.STRICT:
         # Strict puts the class on the board and in item files, which a
-        # client older than 0.3.0 does not render: it is the one act that
-        # needs every client upgraded first.
+        # client older than 0.3.0 does not render, so the warning repeats
+        # the upgrade order here.
         print(STRICT_UPGRADE_WARNING, file=sys.stderr if as_json else sys.stdout)
 
 
@@ -243,19 +244,73 @@ def run_owner_gates(
     _require_log(ergon_dir)
     cleaned = [" ".join(c.split()) for c in (classes or [])]
     if not cleaned or any(not c for c in cleaned):
-        print("pinax: give at least one owner-gate class, none of them empty.", file=sys.stderr)
-        sys.exit(1)
+        refusal.refuse(
+            "pinax: give at least one owner-gate class, none of them empty.",
+            refusal.INVALID_ARGUMENT,
+        )
     seen = set()
     for entry in cleaned:
         key = owner_gates.normalise(entry)
         if key in seen:
-            print(f"pinax: the owner-gate class '{entry}' is given twice.", file=sys.stderr)
-            sys.exit(1)
+            refusal.refuse(
+                f"pinax: the owner-gate class '{entry}' is given twice.",
+                refusal.INVALID_ARGUMENT,
+            )
         seen.add(key)
     _publish_policy(
         repo_root, "policy.owner_gate_classes_set", {"classes": cleaned},
         actor, as_json, offline, runner,
         f"owner-gate classes set ({'; '.join(cleaned)})",
+    )
+
+
+def run_decision_actors(
+    repo_root: str,
+    deciders: list[str],
+    actor: str | None = None,
+    as_json: bool = False,
+    offline: bool = False,
+    runner=None,
+) -> None:
+    """
+    Execute pinax policy decision-actors in repo_root.
+
+    Hands a repository-level policy.decision_actors_set event, carrying the
+    whole list, to the publish sequence. Each decider is checked as an
+    actor handle and stored with its host in lower case; a decider that is
+    not role@host is refused with exit 2 before anything is minted. A
+    decider given twice is kept once.
+
+    runner is injectable for tests only; the CLI passes none.
+    """
+    from .. import sync
+    from ..append import normalise_actor
+
+    ergon_dir = os.path.join(repo_root, ".ergon")
+    _require_log(ergon_dir)
+    if not deciders:
+        refusal.refuse(
+            "pinax: give at least one --decider.",
+            refusal.INVALID_ARGUMENT,
+            sync.EXIT_INVALID_ACTOR,
+        )
+    listed: list[str] = []
+    for entry in deciders:
+        invalid = sync.invalid_actor_message(entry)
+        if invalid is not None:
+            refusal.refuse(
+                f"pinax: the decider {entry!r} is not a valid handle, so nothing "
+                "was appended; every decider must be written as role@host.",
+                refusal.INVALID_ARGUMENT,
+                sync.EXIT_INVALID_ACTOR,
+            )
+        normalised = normalise_actor(entry)
+        if normalised not in listed:
+            listed.append(normalised)
+    _publish_policy(
+        repo_root, "policy.decision_actors_set", {"actors": listed},
+        actor, as_json, offline, runner,
+        f"decision actors set ({'; '.join(listed)})",
     )
 
 

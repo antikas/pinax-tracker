@@ -22,6 +22,7 @@ import json
 import os
 import sys
 
+from .. import refusal
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 from ..fold import fold, read_events
 from ..ids import mint_item_id
@@ -60,9 +61,7 @@ def run(
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
 
-    if not os.path.isdir(log_dir):
-        print("pinax: .ergon/log/ not found - run 'pinax init' first.", file=sys.stderr)
-        sys.exit(1)
+    refusal.require_tracker(log_dir)
 
     # Local fold and log only: the id-mint entropy and the prefix-collision
     # guard are pre-append sanity checks against what this worktree can
@@ -79,7 +78,7 @@ def run(
         prefix_seen = any(iid.startswith(prefix_marker) for iid in existing_ids)
         if not prefix_seen:
             known_prefixes = sorted({iid.split("-", 1)[0] for iid in existing_ids if "-" in iid})
-            print(
+            refusal.refuse(
                 f"pinax add: REJECTED - prefix {prefix!r} has never appeared among "
                 f"this tracker's {len(existing_items)} existing item(s) at "
                 f"{ergon_dir} (known prefixes: {', '.join(known_prefixes) or 'none'}). "
@@ -87,9 +86,8 @@ def run(
                 "CWD) rather than a legitimate new prefix -- see 'pinax doctor' and "
                 "the --root/PINAX_ROOT pin. If this IS a genuine first use of a new "
                 "prefix, pass --allow-new-prefix.",
-                file=sys.stderr,
+                refusal.PREFIX_REFUSED,
             )
-            sys.exit(1)
 
     from .. import sync
 
@@ -151,6 +149,7 @@ def run(
         "root": ergon_dir,
     }
 
+    result.update(outcome.publication())
     if as_json:
         print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     else:

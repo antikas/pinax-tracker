@@ -61,7 +61,7 @@ def _seed_minimal_repo(repo_dir: str, actor: str = "operator@example.test") -> s
         check=True, capture_output=True,
     )
     subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
+        ["git", "config", "user.email", "test@example.com"],
         check=True, capture_output=True, cwd=repo_dir,
     )
     subprocess.run(
@@ -413,7 +413,7 @@ class TestDispatch:
         """Seed a repo with n_items ready items. Returns their IDs."""
         _env = _build_env()
         subprocess.run(["git", "init", "-b", "main", repo_dir], check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.email", "t@t.com"], check=True, capture_output=True, cwd=repo_dir)
+        subprocess.run(["git", "config", "user.email", "t@example.com"], check=True, capture_output=True, cwd=repo_dir)
         subprocess.run(["git", "config", "user.name", "t"], check=True, capture_output=True, cwd=repo_dir)
         subprocess.run(
             [sys.executable, "-m", "pinax", "init", "--actor", actor],
@@ -496,7 +496,7 @@ class TestDispatch:
             _env = _build_env()
             # Init only — no items added.
             subprocess.run(["git", "init", "-b", "main", repo_dir], check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "t@t.com"], check=True, capture_output=True, cwd=repo_dir)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], check=True, capture_output=True, cwd=repo_dir)
             subprocess.run(["git", "config", "user.name", "t"], check=True, capture_output=True, cwd=repo_dir)
             subprocess.run(
                 [sys.executable, "-m", "pinax", "init", "--actor", "operator@example.test"],

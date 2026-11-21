@@ -10,8 +10,11 @@ ADR-001 / ADR-002 compliance:
 
 Shard key:
   The default shard is named after the actor handle, for example
-  actor@host becomes actor-host.jsonl. The shard is actor-scoped, which keeps
-  concurrent writers on separate files while the fold remains shard-agnostic.
+  actor@host becomes actor-host.jsonl, with the host in lower case. An
+  existing shard whose name differs only by case is reused, so the log never
+  gains a pair of names that a case-insensitive file system cannot tell
+  apart. The shard is actor-scoped, which keeps concurrent writers on
+  separate files while the fold remains shard-agnostic.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ import re
 import sys
 import tempfile
 
-from .event import serialise
+from .event import parse_line, serialise
 
 
 class AppendLeakGuardError(RuntimeError):
@@ -35,7 +38,8 @@ class AppendLeakGuardError(RuntimeError):
 
 # Pinax IDs are always <lowercase-prefix>-<lowercase base32 hash>. By contrast,
 # an external ticket tracker's scheme uses an uppercase prefix, a dash, then
-# plain digits (e.g. "T-001", "CASE-156") — is definitionally foreign to
+# plain digits (e.g. "T-001", "CASE-156"). An id of that shape is foreign to
+# Pinax, so an event that carries one is a leak from another project's tracker.
 _FOREIGN_ID_RE = re.compile(r"^[A-Z]{1,8}-\d+$")
 
 # Payload keys across the type handlers (pinax/fold.py) that carry a
@@ -107,6 +111,78 @@ def _shard_name_for_actor(actor: str) -> str:
     """
     safe = actor.replace("@", "-").replace("/", "-").replace("\\", "-").replace(" ", "-")
     return f"{safe}.jsonl"
+
+
+def normalise_actor(actor: str) -> str:
+    """
+    Lower-case the host part of 'role@host'; the role part is kept exactly.
+
+    'coordinator@Laptop' -> 'coordinator@laptop'. An actor with no '@' is
+    returned unchanged.
+    """
+    role, sep, host = actor.partition("@")
+    if not sep:
+        return actor
+    return f"{role}@{host.lower()}"
+
+
+def shard_path_for_actor(log_dir: str, actor: str) -> str:
+    """
+    The shard file an append for actor goes to, with its name as on disk.
+
+    The candidate is the shard name of the normalised actor. A listed file of
+    exactly that name wins; otherwise the first, in sorted order, of the
+    listed names ending in exactly .jsonl that equal it ignoring case;
+    otherwise a new file of the candidate name.
+    """
+    candidate = _shard_name_for_actor(normalise_actor(actor))
+    # os.path.exists ignores case on Windows, so only the directory listing
+    # can tell which spelling is on disk; git stages that exact spelling.
+    try:
+        listed = os.listdir(log_dir)
+    except OSError:
+        listed = []
+    if candidate in listed:
+        return os.path.join(log_dir, candidate)
+    folded = candidate.casefold()
+    # The fold reads only *.jsonl, which matches case-sensitively on POSIX,
+    # so a name such as actor-host.JSONL would never be read back.
+    matches = sorted(
+        name
+        for name in listed
+        if name.endswith(".jsonl") and name.casefold() == folded
+    )
+    return os.path.join(log_dir, matches[0] if matches else candidate)
+
+
+def prev_for_actor(log_dir: str, actor: str) -> str:
+    """
+    The prev for the next event whose actor field is actor.
+
+    That is the id of the last event, in file order, whose actor field equals
+    actor exactly, in the shard shard_path_for_actor picks for actor; or the
+    empty string when that shard holds none. The predecessor check works per
+    shard and actor, so a prev taken from any other shard would be a broken
+    link in the shard the event is written to.
+    """
+    shard_path = shard_path_for_actor(log_dir, actor)
+    try:
+        with open(shard_path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return ""
+    normalised = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    prev = ""
+    for line in normalised.split(b"\n"):
+        if not line:
+            continue
+        event = parse_line(line)
+        if not isinstance(event, dict):
+            continue
+        eid = event.get("id")
+        if isinstance(eid, str) and eid and event.get("actor") == actor:
+            prev = eid
+    return prev
 
 
 def _append_locked_posix(path: str, line: bytes) -> None:
@@ -201,8 +277,7 @@ def append_event(log_dir: str, event: dict, actor: str | None = None) -> str:
                 "the isolated sandbox this guard exempts."
             )
 
-    shard_name = _shard_name_for_actor(_actor)
-    shard_path = os.path.join(log_dir, shard_name)
+    shard_path = shard_path_for_actor(log_dir, _actor)
 
     line_str = serialise(event)
     # LF-normalise: ensure no CRLF in the serialised line (should be none from

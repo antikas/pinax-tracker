@@ -13,7 +13,7 @@ import os
 import re
 import sys
 
-from ..append import append_event
+from ..append import append_event, prev_for_actor
 from ..event import mint_event
 from ..fold import fold, read_events
 
@@ -25,8 +25,8 @@ def _utc_now_iso() -> str:
 
 
 def _default_actor() -> str:
-    import socket
-    return f"operator@{socket.gethostname()}"
+    from ..doctor import default_actor
+    return default_actor()
 
 
 def _validate_repo_id(repo_id: str) -> None:
@@ -42,8 +42,7 @@ def _validate_repo_id(repo_id: str) -> None:
 def _next_seq_and_prev(log_dir: str, actor: str) -> tuple[int, str, list[dict]]:
     events = read_events(log_dir)
     next_seq = (max(e["seq"] for e in events) + 1) if events else 0
-    actor_events = [e for e in events if e.get("actor") == actor]
-    prev = actor_events[-1]["id"] if actor_events else ""
+    prev = prev_for_actor(log_dir, actor)
     return next_seq, prev, events
 
 

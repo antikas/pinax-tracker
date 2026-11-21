@@ -16,6 +16,37 @@ def _repo_root() -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+_REGENERATED = 0
+_FAILED = 1
+_UNFINISHED = 3
+
+# Run under the interpreter and working directory used for "python -m pinax",
+# so the check and the overview come from the same Pinax. Git refuses a
+# path-limited commit during a cherry-pick, a revert, a merge or a rebase in
+# progress, and the regenerated file would be left behind uncommitted.
+_CHECK_AND_REGENERATE = f"""\
+import sys
+try:
+    from pinax.commands.doctor_cmd import operation_unfinished
+    from pinax.__main__ import main
+except Exception:
+    sys.exit({_FAILED})
+if operation_unfinished(sys.argv[1]):
+    sys.exit({_UNFINISHED})
+try:
+    main(["overview", "--markdown"])
+except SystemExit as exc:
+    if exc.code not in (None, 0):
+        sys.exit({_FAILED})
+"""
+
+
+def _check_and_regenerate(repo_root: str) -> int:
+    return subprocess.run(
+        [sys.executable, "-c", _CHECK_AND_REGENERATE, repo_root], cwd=repo_root
+    ).returncode
+
+
 def main() -> None:
     repo_root = _repo_root()
     if not repo_root or not os.path.isdir(os.path.join(repo_root, ".ergon", "log")):
@@ -25,7 +56,7 @@ def main() -> None:
     ).stdout.strip()
     if subject.startswith(_MARKER):
         return
-    if subprocess.run([sys.executable, "-m", "pinax", "overview", "--markdown"], cwd=repo_root).returncode:
+    if _check_and_regenerate(repo_root) != _REGENERATED:
         return
     if subprocess.run(["git", "diff", "--quiet", "--", "PORTFOLIO.md"], cwd=repo_root).returncode:
         subprocess.run(["git", "commit", "-m", _MARKER, "--", "PORTFOLIO.md"], cwd=repo_root, check=False)

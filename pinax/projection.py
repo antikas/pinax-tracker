@@ -74,6 +74,22 @@ def _lane_index(status: str) -> int:
         return len(_LANE_ORDER)  # unknown statuses go last
 
 
+def _shown_status(item: dict) -> str:
+    """
+    The status the board and the item page show for an item.
+
+    A claim and a status change are separate events, so the fold can hold
+    a claimed item at 'queued' or 'ready'. A live claim (a non-empty owner
+    left by claim reconciliation) shows such an item as 'building', the same
+    rule the status view uses. A released or expired claim clears the owner,
+    and the item shows its fold status again.
+    """
+    status = item.get("status", "queued")
+    if status in ("queued", "ready") and item.get("owner"):
+        return "building"
+    return status
+
+
 # ---------------------------------------------------------------------------
 # Phase ordering helper (mirrors compute_next phase order)
 # ---------------------------------------------------------------------------
@@ -135,7 +151,7 @@ def _board_item_sort_key(item_id: str, item: dict, phases: dict,
     lane, matching the display intent.
     """
     phase_idx = _phase_index_for_item(item, phases, sorted_phases)
-    lane_idx = _lane_index(item.get("status", "queued"))
+    lane_idx = _lane_index(_shown_status(item))
     next_flag = 0 if item_id == next_id else 1
     created_at = item.get("created_at", "")
     event_id_val = item.get("event_id", "")
@@ -200,7 +216,7 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
     # Group by lane.
     lanes: dict[str, list[str]] = {}
     for iid in sorted_item_ids:
-        status = items[iid].get("status", "queued")
+        status = _shown_status(items[iid])
         lanes.setdefault(status, []).append(iid)
 
     lines: list[str] = ["# Board", ""]
@@ -215,7 +231,7 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
         owner = item.get("owner", item.get("created_by", "—")) or "—"
         blockers = blockers_of.get(iid, [])
         blocker_str = ", ".join(blockers) if blockers else "—"
-        status = item.get("status", "queued")
+        status = _shown_status(item)
         marker = " [next]" if iid == next_id else ""
         # rollup is additive: present only on an item with children (see
         # fold._compute_rollups) - a leaf item's line is unchanged.
@@ -493,6 +509,22 @@ def render_overview_markdown(repo_reports: list[dict], stamp: dict) -> str:
 # Per-item file renderer
 # ---------------------------------------------------------------------------
 
+def _one_line(text: object) -> str:
+    return " ".join(str(text).split())
+
+
+def _decision_line(decision: dict) -> str:
+    """The item page's one line for its latest decision."""
+    return (
+        f"- option {_one_line(decision.get('option', ''))} "
+        f"({_one_line(decision.get('label', ''))}), "
+        f"effect {_one_line(decision.get('effect', ''))}, "
+        f"by {_one_line(decision.get('actor', ''))} "
+        f"at {_one_line(decision.get('ts', ''))}: "
+        f"{_one_line(decision.get('reason', ''))}"
+    )
+
+
 def render_item(item_id: str, item: dict, state: dict) -> str:
     """
     Render .ergon/items/<id>.md from the folded item dict.
@@ -517,6 +549,10 @@ def render_item(item_id: str, item: dict, state: dict) -> str:
       ## Briefing
 
       <briefing text if present>
+
+      ## Decision                    (only when the item carries a decision)
+
+      - option <option> (<label>), effect <effect>, by <actor> at <ts>: <reason>
 
       ## Edges
 
@@ -561,7 +597,7 @@ def render_item(item_id: str, item: dict, state: dict) -> str:
         _fm("title", item.get("title", "")),
         _fm("phase", prefix),
         _fm("owner", owner),
-        _fm("status", item.get("status", "queued")),
+        _fm("status", _shown_status(item)),
     ]
     # rollup is additive: present only on an item with children (see
     # fold._compute_rollups) - a leaf item's frontmatter is unchanged.
@@ -596,6 +632,15 @@ def render_item(item_id: str, item: dict, state: dict) -> str:
         lines.append("")
     else:
         lines.append("_(no briefing yet)_")
+        lines.append("")
+
+    # The latest decision, only on an item that carries one, so a page with
+    # no decision is byte-identical to one rendered before decisions existed.
+    decision = item.get("decision")
+    if decision:
+        lines.append("## Decision")
+        lines.append("")
+        lines.append(_decision_line(decision))
         lines.append("")
 
     # Edge type display order is derived from the single-source VALID_EDGE_TYPES enum

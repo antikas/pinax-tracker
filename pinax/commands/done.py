@@ -20,7 +20,7 @@ import json
 import os
 import sys
 
-from .. import sync
+from .. import refusal, sync
 
 
 def _utc_now_iso() -> str:
@@ -28,8 +28,8 @@ def _utc_now_iso() -> str:
 
 
 def _default_actor() -> str:
-    import socket
-    return f"operator@{socket.gethostname()}"
+    from ..doctor import default_actor
+    return default_actor()
 
 
 def run(
@@ -53,16 +53,13 @@ def run(
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
 
-    if not os.path.isdir(log_dir):
-        print("pinax: .ergon/log/ not found - run 'pinax init' first.", file=sys.stderr)
-        sys.exit(1)
+    refusal.require_tracker(log_dir)
 
     if not os.path.isfile(briefing_path):
-        print(
+        refusal.refuse(
             f"pinax: briefing file not found: {briefing_path}",
-            file=sys.stderr,
+            refusal.INVALID_ARGUMENT,
         )
-        sys.exit(1)
 
     with open(briefing_path, "r", encoding="utf-8") as fh:
         briefing_content = fh.read()
@@ -96,6 +93,7 @@ def run(
         "root": ergon_dir,
     }
 
+    result.update(outcome.publication())
     if as_json:
         print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     else:

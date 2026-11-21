@@ -156,9 +156,8 @@ def _utc_now_iso() -> str:
 
 def _default_actor() -> str:
     """Fallback actor string when none is provided."""
-    import socket
-    hostname = socket.gethostname()
-    return f"operator@{hostname}"
+    from ..doctor import default_actor
+    return default_actor()
 
 
 def run(repo_root: str, actor: str | None = None) -> None:

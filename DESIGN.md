@@ -7,12 +7,23 @@ generated projections, committed so they remain readable without the CLI.
 ## Event envelope
 
 ```json
-{"id":"content-hash","seq":12,"ts":"2026-08-17T12:00:00Z","actor":"alex@laptop","type":"item.created","payload":{},"prev":""}
+{"id":"content-hash","seq":12,"ts":"2026-08-17T12:00:00Z","actor":"alex@laptop","type":"item.created","payload":{},"prev":"","v":2}
 ```
 
-`id` is a BLAKE2b hash of canonical JSON for `seq`, `ts`, `actor`, `type`, and
-`payload`. Canonical JSON uses sorted ASCII keys and compact separators. `prev`
-is stored as a predecessor reference but is outside the version 1 hash.
+`id` is a BLAKE2b hash of canonical JSON. Canonical JSON uses sorted ASCII keys
+and compact separators. `prev` is the id of the actor's previous event in its
+shard, or the empty string for the first.
+
+Every event Pinax writes is a version 2 event and carries `"v":2`. The version
+2 id covers `prev` and `v` as well as `seq`, `ts`, `actor`, `type`, and
+`payload`, so each event's hash binds the event before it.
+
+An event with no `v` field is a version 1 event. Its id covers `seq`, `ts`,
+`actor`, `type`, and `payload` only, and it keeps verifying under that rule, so
+logs written before version 2 replay unchanged. A log may hold version 1 events
+followed by version 2 events, and the first version 2 event may name a version
+1 event as its `prev`. An event whose `v` is present but is not the integer 2
+fails verification.
 
 The fold always sorts by `(seq, ts, actor, id)`. It deduplicates equal IDs and
 chooses a deterministic body-sensitive representative for conflicting same-ID
@@ -32,6 +43,10 @@ The log is the source of truth. `board.md` and `items/*.md` are generated from
 the fold and must never be edited by hand. State-changing commands append an
 event and regenerate the projection. `pinax verify` compares a fresh generated
 projection with the files on disk.
+
+A claim and a status change are separate events, so the fold can hold a
+claimed item at `queued` or `ready`. The board and the item page show such an
+item as `building` while its claim is live, the same rule the status view uses.
 
 JSONL files are LF-normalised and use Git's `union` merge driver. The fold is
 order-independent and idempotent, so merge order and duplicate lines do not
@@ -87,6 +102,75 @@ no drift until a project sets strict. Under strict, the publish sequence asks
 `destructive` block with no listed class, with exit 8 and nothing minted.
 `pinax policy check` reports the blocked items for the owner that carry no valid
 class, and fails only under strict.
+
+## Decisions
+
+`pinax decide <id> --option <key> --label <text> --effect release|park
+--reason <text>` appends one `item.decided` event, a version 2 event minted
+like every other, with the payload `{"item_id", "option", "label",
+"effect", "reason"}`. The actor and the time are the envelope's `actor` and
+`ts`. The option, label and reason are strings that are not blank and the
+effect is `release` or `park`; the command refuses anything else with exit
+2 before anything is minted, and the fold records no decision from a record
+of any other shape. The payload's shape is stated once, in `pinax.event`,
+and both the command and the fold read it there. The item must exist, under
+the same target rule every item event follows, so an unknown id ends with
+exit 1 and nothing appended.
+
+With `--effect park` the command also appends an ordinary `item.parked`
+event with the same reason, and both land in one commit: `item.decided`
+first, then `item.parked`, with consecutive sequence numbers, one shared
+timestamp, and the park's `prev` naming the decision. The publish sequence
+does this in one run, with one fetch, one union fold, the target rule on
+each event, one policy check, one projection, one commit whose subject is
+`pinax: item.decided <id>`, and one push. Every other command still
+publishes exactly one event. With `--effect release` only the decision is
+appended, and the item's status, gate and owner-gate class are unchanged;
+the claim follows the expiry rule above, as for any event.
+
+The fold records on the item the latest valid `item.decided` that no valid
+tombstone annuls, by fold order, as `decision`: its option, label, effect,
+reason, actor, time and event id. The item page shows it in a `## Decision`
+section after `## Briefing`, and `pinax status --json` carries it as an
+additive `decision` object on the rows it prints for that item. Decisions
+change nothing in how an item with no decision renders or serialises. A
+decision is never a
+note, so an item's newest note is unchanged by it.
+
+A repeat is harmless, and it delivers what an earlier run left undone.
+The repeat rule is asked on the union fold the publish sequence already
+builds: the working-tree log united with the remote default branch's
+committed shards when fetched. When the latest decision on the item there
+has the same option, label, effect, reason and actor, the actor's host
+compared in lower case, and for `park` the item is parked in that same
+fold, the command appends nothing and continues into the commit and push
+half of the sequence with nothing minted. When the remote default branch,
+as fetched in this run, already records the decision, it makes no commit
+and no push and exits 0 with `"published": true` and `"sync_status":
+"already_published"`. Otherwise a decision left uncommitted by a refused
+commit or a staging failure is committed as a fresh one would be, under
+the subject `pinax: item.decided <id>`, and a retry after a rejected push
+publishes the existing decision without appending: when the default branch
+is checked out, offline mode does not apply and `HEAD` holds commits the
+remote lacks, the command pushes with the same attempts, pull and
+regeneration as a fresh event. Offline, with no reachable remote or with
+another branch checked out it exits 0 with `"published": false` and the
+status a fresh event would report there. A repeat never adds a second
+`item.decided` or `item.parked`.
+
+`policy.decision_actors_set` is a repository-level event, `{"actors":
+[...]}`, written by `pinax policy decision-actors`; each listed actor is a
+`role@host` handle stored with its host in lower case, and the last one in
+fold order is in force. Under flow any actor may decide and the list is
+recorded and not checked. Under strict, the publish sequence asks
+`pinax.owner_gates` on the pre-append union fold, and a decision from an
+actor not on the list, or with no list set, is refused with exit 8 and
+nothing minted.
+
+Every released Pinax before 0.4.0 predates version 2 events and reports
+each version 2 event that no tombstone names as an integrity violation.
+Decision events are version 2 events and are reported the same way. No
+release wrote version 2 events without decisions.
 
 ## Parent-child roll-up
 
@@ -200,6 +284,37 @@ is ignored; the repair is the `.gitignore`, then the commit.
 Every command refuses an actor that is not written as `role@host`, before
 it appends anything.
 
+A write command is one of the commands that run the publish sequence: add,
+claim, done, block, park, decide, release, the four policy setters,
+priority, annul, dep add, dep rm and note add. Given `--json`, a write
+command prints exactly one JSON object on standard output on every exit
+code, and that JSON result carries `published` and `sync_status`.
+`published` is true only when this run's push to the remote default
+branch was accepted, or when the remote default branch already held the
+event when this run fetched it. A push URL that differs from the fetch
+URL is not checked. `sync_status` is the publish sequence's own status
+for the run. When
+the sequence fails, the result is the sequence's own report. Exit 0 also
+covers a commit that stayed local, so a caller which must know a write
+reached other machines reads `published`.
+
+A write command refused before the sequence runs prints a refusal result.
+Its `published` is false, and its `sync_status` names the refusal:
+`invalid_argument`, `not_a_tracker`, `root_mismatch`, `prefix_refused`,
+`invalid_dependency`, `unknown_target` or `internal_error`. Its `error`
+holds the refusal's message, and `exit_code` and `command` name the exit
+code and the subcommand. The CLI entry point parses with the output
+captured and takes the mode from what argparse parsed, for the Python
+running it, so an argument error, an early refusal and an uncaught
+exception are all covered. A `--json` that argparse refuses, such as
+`--json=1` or one before the subcommand, still asks for JSON. A refusal
+is named where it is raised, never read from its message. The exit code
+is the same with or without `--json`. An interrupt prints a result whose
+`sync_status` is `interrupted`, unless the sequence had already printed
+its report, and then ends the process by the interrupt as before. A help
+or version request is the one exception: it prints its text unchanged
+and exits 0.
+
 Every command except `claim` accepts offline mode, requested with
 `--offline` or the `PINAX_OFFLINE=1` environment variable: it skips the
 fetch and the push, and commits locally only. A repository with no
@@ -223,7 +338,10 @@ could not be read; 5 is a push rejected on every attempt; 6 is a claim
 timestamp behind published history, or one the sequence cannot read in the
 envelope's own form, reported apart with nothing appended either way; 7 is
 a commit refused or a staging failure, with the appended event left
-uncommitted either way.
+uncommitted either way; 8 is the project's policy refusing the event under
+strict (a block for the owner without a listed class, or a decision from an
+actor not on the decision-actor list or with no list set), with nothing
+appended.
 
 `registry`, `reconcile`, and `init` never run this sequence; they keep
 their own local behaviour, described in README.md, because none of them
@@ -237,9 +355,66 @@ reason, and a target different from its own ID. It permits a known bad target
 to remain in the append-only audit trail while suppressing that target's fold
 effects. A malformed, forged, or self-annulling tombstone has no exemption.
 
-The predecessor check identifies dangling references within a shard and actor.
-Version 1 cannot prove complete history: `prev` is not in the event hash, and
-there is no remote anchor, signing, or hostile-writer authentication.
+The predecessor check looks for broken links per shard file and actor. For an
+event after the first of its shard and actor, a non-empty `prev` is broken when
+it names no id in that scope. For the first event, a non-empty `prev` is broken
+when it names no id anywhere in the log: a chain may continue from another
+shard file, as in a log written before the shard choice took `prev` only from
+the chosen shard, but the event it names must exist. For a version 2 event that
+is not covered by a valid tombstone, `pinax verify` fails and names the event.
+For a version 1 event, the first of its shard included, the fold warns and
+`pinax verify` passes.
+
+A tombstone covers only the event it names, and the annulled event has no
+effect on the fold. `pinax verify` does not check the content of an annulled
+event, only that some line in the log carries its id. There is no exemption for
+a `prev` that names an annulled event: Pinax's commands only append to the
+log, so they do not remove an annulled event's line, and a `prev` naming it
+finds that id in the log. An
+annulled event whose line was deleted, with no line left carrying its id,
+leaves its successor's `prev` broken, and `pinax verify` fails.
+
+Together these rules catch a change to a hashed field (`seq`, `ts`, `actor`,
+`type`, `payload`, `prev`, `v`) of a version 2 event that leaves its recorded
+id as it was, whatever event follows it: the edited event's id no
+longer verifies. They also catch a deletion of, a repointed `prev` on, or an
+edit that recomputes the id of a version 2 event that a later version 2 event
+names as its `prev`, while that later event is left unchanged and is not
+covered by a valid tombstone: the later event's `prev` no longer names a known
+event, or a repointed event's id no longer verifies. This holds for a chain's
+oldest event too, whatever its new place in sort order, and when the later
+events are moved byte for byte into another shard file of the same actor or
+into another actor's shard file.
+
+Some changes are not caught by the log itself:
+
+- a rewrite that also recomputes every later event of the chain, up to the
+  newest;
+- deletion of a chain's newest events, since no later event names them;
+- deletion of any event that no later event names as its `prev`: after two
+  clones wrote to the same chain and were merged, this includes the newest
+  event of each branch, even while later events of the chain stay unchanged;
+- deletion of an event whose successor is covered by a valid tombstone, since
+  the successor's broken `prev` is exempt with it;
+- replacing an annulled event's line with any line that keeps its id, in place
+  or in another shard file, since an annulled event's content is not checked;
+- deletion of a version 2 event whose next event is a version 1 event written
+  by an earlier client during an upgrade: the broken link sits on the version 1
+  event, so the fold warns and `pinax verify` passes;
+- an edit to a version 2 event that also recomputes its own id, when its next
+  event is a version 1 event written by an earlier client during an upgrade:
+  the broken link sits on the version 1 event, so the fold warns and
+  `pinax verify` passes;
+- any edit to a version 1 event's `prev`, which is outside the version 1 hash;
+- a field added to an event beside the hashed fields, which is outside the hash
+  and which the fold does not read.
+
+Git history is the anchor for these. Once the events were committed, the commit
+that removes them shows them as lines deleted from the shard file, and a clone
+or hub that already fetched them still holds them. Events deleted before any
+commit leave no trace in Git history. Pinax does not compare the log with Git
+history itself. Pinax has no signing keys and no outside
+anchor, and does not authenticate a hostile writer.
 
 ## Operational boundary
 

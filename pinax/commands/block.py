@@ -26,6 +26,7 @@ import json
 import os
 import sys
 
+from .. import refusal
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 
 # pinax.sync imports pinax.projection, which imports pinax.commands.dep at
@@ -55,17 +56,14 @@ def run(
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
 
-    if not os.path.isdir(log_dir):
-        print("pinax: .ergon/log/ not found - run 'pinax init' first.", file=sys.stderr)
-        sys.exit(1)
+    refusal.require_tracker(log_dir)
 
     if gate not in _VALID_GATES:
-        print(
+        refusal.refuse(
             f"pinax: unknown gate '{gate}'. "
             f"Valid: {', '.join(sorted(_VALID_GATES))}",
-            file=sys.stderr,
+            refusal.INVALID_ARGUMENT,
         )
-        sys.exit(1)
 
     from .. import owner_gates, sync
 
@@ -112,6 +110,7 @@ def run(
     if recorded_class is not None:
         result["owner_gate"] = recorded_class
 
+    result.update(outcome.publication())
     if as_json:
         print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     else:

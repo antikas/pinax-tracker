@@ -25,7 +25,7 @@ import json
 import os
 import sys
 
-from .. import sync
+from .. import refusal, sync
 
 
 def run(
@@ -49,9 +49,7 @@ def run(
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
 
-    if not os.path.isdir(log_dir):
-        print("pinax: .ergon/log/ not found - run 'pinax init' first.", file=sys.stderr)
-        sys.exit(1)
+    refusal.require_tracker(log_dir)
 
     # pinax.doctor owns the actor and timestamp helpers every mutating
     # command shares; the import is deferred here for the same reason the
@@ -88,6 +86,7 @@ def run(
         "root": ergon_dir,
     }
 
+    result.update(outcome.publication())
     if as_json:
         print(json.dumps(result, sort_keys=True, ensure_ascii=True))
     else:
