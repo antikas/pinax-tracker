@@ -127,8 +127,8 @@ def cli_repo(empty_repo):
     assert r.returncode == 0, r.stderr
     item_id = json.loads(r.stdout)["item_id"]
     # No follow-up commit here: 'add' now runs the publish sequence
-    # (pinax/sync.py), which commits the shard and the projection itself
-    # (ADR-006); the working tree is already clean by the time this
+    # (pinax/sync.py), which commits the shard and the projection itself;
+    # the working tree is already clean by the time this
     # fixture returns.
     return root, item_id
 
@@ -259,12 +259,12 @@ class TestConfirmationNamesRoot:
     def test_note_add_json_and_plain(self, cli_repo):
         root, item_id = cli_repo
         r = _pinax(
-            root, "note", "add", item_id, "--ref", "docs/some-note.md",
+            root, "note", "add", item_id, "--ref", "https://example.org/some-note",
             "--actor", ACTOR, "--json",
         )
         assert json.loads(r.stdout)["root"] == self._ergon_root(root)
 
-        r = _pinax(root, "note", "add", item_id, "--ref", "docs/another-note.md", "--actor", ACTOR)
+        r = _pinax(root, "note", "add", item_id, "--ref", "https://example.org/another-note", "--actor", ACTOR)
         assert self._ergon_root(root) in r.stdout
 
 

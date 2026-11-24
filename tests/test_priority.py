@@ -430,8 +430,8 @@ def cli_repo(tmp_path):
     _commit_all(root, "init: pinax ergon base")
 
     # No follow-up commit here: 'add' runs the publish sequence
-    # (pinax/sync.py), which commits the shard and the projection itself
-    # (ADR-006); the working tree is already clean by the time it returns.
+    # (pinax/sync.py), which commits the shard and the projection itself;
+    # the working tree is already clean by the time it returns.
     r = _pinax(root, "add", "--title", "Item X", "--prefix", "pnx", "--actor", ACTOR, "--json")
     assert r.returncode == 0, r.stderr
     item_id = json.loads(r.stdout)["item_id"]
@@ -455,7 +455,7 @@ def test_replay_at_ref_reconstructs_priority_history(cli_repo):
     _git(root, "tag", "prio-c1")
     c1_sha = _head_sha(root)
 
-    # No follow-up commit here: 'priority' already commits itself (ADR-006).
+    # No follow-up commit here: 'priority' already commits itself.
     r = _pinax(root, "priority", item_id, "7", "--actor", ACTOR, "--json")
     assert r.returncode == 0, r.stderr
     _git(root, "tag", "prio-c2")
@@ -573,7 +573,7 @@ def test_all_branches_honours_branch_only_priority_over_depth():
         _commit_all(root, "init: pinax ergon base")
 
         # No follow-up commit below: 'add' and 'dep add' already commit
-        # themselves (ADR-006).
+        # themselves.
         # DEEP0 -> DEEP1 blocks chain (depth(DEEP0) = 1); SHALLOW has no edges (depth 0).
         r = _pinax(root, "add", "--title", "DEEP0", "--prefix", "pnx", "--actor", ACTOR, "--json")
         deep0 = json.loads(r.stdout)["item_id"]
@@ -590,8 +590,7 @@ def test_all_branches_honours_branch_only_priority_over_depth():
 
         # Branch-only: prioritise SHALLOW, committed on an unmerged branch only.
         _git(root, "checkout", "-b", "run/spine")
-        # No follow-up commit here: 'priority' already commits itself
-        # (ADR-006).
+        # No follow-up commit here: 'priority' already commits itself.
         r = _pinax(root, "priority", shallow, "0", "--actor", ACTOR, "--json")
         assert r.returncode == 0, r.stderr
         _git(root, "checkout", "main")
@@ -604,7 +603,7 @@ def test_all_branches_honours_branch_only_priority_over_depth():
 
         # --all-branches: the branch-only priority is honoured -> SHALLOW wins.
         # 'next' does not itself expose --all-branches (only ready/report/board do;
-        # see docs/portfolio-views.md) -- confirm readiness is unaffected via 'ready
+        # see docs/commands.md) -- confirm readiness is unaffected via 'ready
         # --all-branches', then prove the priority-aware "next" winner end-to-end
         # via the real 'report --all-branches --json' CLI surface (its "next"
         # field is exactly compute_next(union_state)).

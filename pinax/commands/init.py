@@ -1,7 +1,7 @@
 """
 pinax init — create .ergon/, .ergon/log/, install .ergon/.gitattributes.
 
-ADR-002: .gitattributes content is exactly:
+The .gitattributes content is exactly:
     *.jsonl text eol=lf merge=union
     .ergon/** text eol=lf
 
@@ -217,7 +217,7 @@ def run(repo_root: str, actor: str | None = None) -> None:
     )
     append_event(log_dir, phase_event, actor=_actor)
 
-    # Regenerate the projection atomically after emitting events (ADR-002).
+    # Regenerate the projection atomically after emitting events.
     from ..projection import regenerate
     regenerate(repo_root)
 

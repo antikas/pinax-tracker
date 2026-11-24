@@ -59,6 +59,10 @@ Supported commands:
         (repository-level: appends policy.decision_actors_set, the actors
          who may decide under strict. The last one wins; under strict
          without one nobody may decide, under flow it is not checked)
+    pinax policy note-refs --prefix TEXT [--prefix TEXT ...] [--actor <actor>] [--offline] [--json]
+        (repository-level: appends policy.note_ref_prefixes_set, the prefixes
+         note add accepts besides files in the repository and web addresses.
+         The last one wins; none without one)
     pinax policy check [--json]
         (read-only: lists blocked items for the owner with no valid
          owner-gate class. Exits 0 under flow; under strict, 1 when it
@@ -70,10 +74,10 @@ Supported commands:
          currently-prioritised item; 'bump' = one step ahead of the item's
          own current rank, or 'top' if it has none yet)
     pinax annul  <event-id> --reason <reason> [--actor <actor>] [--offline] [--json]
-        (tombstone a junk/tampered event id — appends event.annulled;
-         fold suppresses ITS SPECIFIC tamper-evidence warning and payload
-         effects on every future fold; raw bytes stay untouched, append-only.
-         Refuses an id that names no event)
+        (cancel one earlier event: appends event.annulled, and the cancelled
+         event stays in the log and no longer counts. Annulling an annulment
+         brings back what it cancelled; the annulment a rejected claim wrote
+         cannot be annulled. Refuses an id that names no event)
     pinax dep add <from_id> --to <to_id> --type <t> [--actor <actor>] [--offline] [--json]
     pinax dep add <from_id> --blocks <to_id> [--actor <actor>] [--offline] [--json]  (back-compat alias)
     pinax dep rm  <from_id> --to <to_id> --type <t> [--actor <actor>] [--offline] [--json]
@@ -84,7 +88,7 @@ Supported commands:
         (--under ITEM_ID restricts ready/next to the transitive
          parent-child descendants of that item; on both, and on status
          below, an item carrying a live claim -- item.claimed reconciled
-         in the fold, ADR-003 -- is never eligible, on every machine that
+         in the fold -- is never eligible, on every machine that
          has folded the claim, regardless of its status field.
          'ready --json' keeps its released bare-array shape when --under
          is not given; with --under it is the envelope
@@ -92,6 +96,9 @@ Supported commands:
          'status --json' were already objects, so they simply gain an
          "under" key, the id or null, either way)
     pinax note add <item_id> --ref <ref> [--caption <text>] [--actor <actor>] [--offline] [--json]
+        (<ref> is a repository-relative path to an existing file, an http or
+         https address, or text that starts with a prefix set by 'pinax
+         policy note-refs')
     pinax metrics [--json]
     pinax report  [--json] [--all-branches]
     pinax dispatch [--max N] [--claim] [--actor <actor>] [--json]
@@ -102,12 +109,15 @@ Supported commands:
          every unmerged local branch's committed .ergon shards -- the
          repo-wide truth view, marking items/events sourced only from a
          branch with that branch's name; board/report/ready all support it)
+    pinax web    [--port PORT]  (loopback-only browser view of this repo's board,
+                 item briefings, and deterministically ordered event history;
+                 default port 0 asks the OS for an available port)
     pinax overview [--json] [--markdown] [--remote] [--roots <r1,r2,...>] [--max-depth <n>]
         (portfolio rollup: discovers repos by scanning roots for .ergon/ --
          default roots ~/src; registry below is an
          additive override/extra-roots supplement, not required.
          --markdown writes the committed PORTFOLIO.md projection, rung 2 of
-         the view ladder, docs/portfolio-views.md.
+         the view ladder, docs/portfolio-and-web.md.
          --remote folds remote repositories instead of local clones: the
          manifest is the url-bearing registry entries in this hub's log;
          each remote's PUSHED tip is sparse-fetched to a per-run temp dir
@@ -155,7 +165,14 @@ Their exit codes are:
        refused; either way the appended event stays uncommitted
     8  the project's policy refuses the event: under the strict process, a
        block for the owner without a listed owner-gate class, or a decide
-       from an actor not on the decision-actor list or with no list set
+       from an actor not on the decision-actor list or with no list set;
+       under any process, a note reference that note add does not accept
+    9  the event log holds a line that cannot be used as an event; every
+       command that reads the log ends this way, except verify, which lists
+       each such line and exits 1
+   10  PINAX_TEST_RUN is 1 and the log is not under the temporary directory;
+       every command that appends an event ends this way, and the event is
+       not written
 
 All commands operate on the repository at the current working directory (CWD),
 resolved by walking up from CWD to the nearest ancestor .git directory.
@@ -179,9 +196,11 @@ import sys
 import traceback
 
 from . import refusal
+from .append import AppendLeakGuardError, UnwritableEventError
+from .event import DamagedLogLine
 
 # Single-source edge-type enum (SSOT: dep.py).  All user-facing text derived here
-# so adding a 6th type is a one-line change in dep.py only (ADR-001).
+# so adding a 6th type is a one-line change in dep.py only.
 from .commands.dep import VALID_EDGE_TYPES as _VALID_EDGE_TYPES_SET
 _VALID_TYPES: list[str] = sorted(_VALID_EDGE_TYPES_SET)   # deterministic alphabetical
 _VALID_TYPES_HELP: str = "|".join(_VALID_TYPES)
@@ -472,6 +491,17 @@ def _cmd_policy_decision_actors(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_policy_note_refs(args: argparse.Namespace) -> None:
+    from .commands.policy import run_note_refs
+    run_note_refs(
+        repo_root=_find_repo_root(_resolve_root_pin(args)),
+        prefixes=args.prefix,
+        actor=args.actor,
+        as_json=args.json,
+        offline=args.offline,
+    )
+
+
 def _cmd_policy_check(args: argparse.Namespace) -> None:
     from .commands.policy import run_check
     run_check(
@@ -664,6 +694,21 @@ def _cmd_board(args: argparse.Namespace) -> None:
         as_json=args.json,
         all_branches=args.all_branches,
     )
+
+
+def _cmd_web(args: argparse.Namespace) -> None:
+    from .commands.web_cmd import run
+    run(repo_root=_find_repo_root(_resolve_root_pin(args)), port=args.port)
+
+
+def _parse_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("--port must be an integer from 0 to 65535") from error
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError("--port must be an integer from 0 to 65535")
+    return port
 
 
 def _cmd_overview(args: argparse.Namespace) -> None:
@@ -1001,7 +1046,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--decider", action="append", required=True, metavar="ROLE@HOST",
         help="One actor who may decide; repeat for each",
     )
-    for parser_ in (p_policy_process, p_policy_gates, p_policy_deciders):
+    p_policy_refs = policy_sub.add_parser(
+        "note-refs",
+        help=(
+            "Set the prefixes a note reference may start with, besides files "
+            "in the repository and web addresses (appends "
+            "policy.note_ref_prefixes_set; none without one)"
+        ),
+    )
+    p_policy_refs.add_argument(
+        "--prefix", action="append", default=None, metavar="TEXT",
+        help="One prefix, without whitespace; repeat for each, at least one",
+    )
+    for parser_ in (p_policy_process, p_policy_gates, p_policy_deciders, p_policy_refs):
         parser_.add_argument("--actor", default=None, help="Actor string (role@handle)")
         parser_.add_argument(
             "--offline", action="store_true",
@@ -1012,6 +1069,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_policy_process.set_defaults(func=_cmd_policy_process)
     p_policy_gates.set_defaults(func=_cmd_policy_owner_gates)
     p_policy_deciders.set_defaults(func=_cmd_policy_decision_actors)
+    p_policy_refs.set_defaults(func=_cmd_policy_note_refs)
 
     p_policy_check = policy_sub.add_parser(
         "check",
@@ -1045,7 +1103,10 @@ def build_parser() -> argparse.ArgumentParser:
     # pinax annul
     p_annul = sub.add_parser(
         "annul",
-        help="Tombstone a junk/tampered event id (appends event.annulled)",
+        help=(
+            "Cancel one earlier event; annulling an annulment brings back what it "
+            "cancelled; the annulment a rejected claim wrote cannot be annulled"
+        ),
     )
     p_annul.add_argument("event_id", help="The target event's content-hash id")
     p_annul.add_argument("--reason", required=True, help="Annulment reason")
@@ -1060,7 +1121,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # pinax dep (sub-subcommand: add / rm)
     # _VALID_TYPES and _VALID_TYPES_HELP are derived at module level from VALID_EDGE_TYPES
-    # (dep.py) — adding a 6th type is a one-line change in dep.py only (SSOT, ADR-001).
+    # (dep.py) — adding a 6th type is a one-line change in dep.py only (SSOT).
     p_dep = sub.add_parser(
         "dep",
         help=f"Manage dependency edges ({_VALID_TYPES_HELP})",
@@ -1170,14 +1231,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify.set_defaults(func=_cmd_verify)
 
     # pinax note (sub-subcommand: add)
-    p_note = sub.add_parser("note", help="Add a typed ref note to an item")
+    p_note = sub.add_parser("note", help="Attach a reference to an item")
     note_sub = p_note.add_subparsers(dest="note_op", required=True)
 
     p_note_add = note_sub.add_parser(
         "add",
         help=(
-            "Append note.added event (ref must match "
-            "^(koine://|~/knowledge/|projects/|docs/); caption <= 200 chars)"
+            "Append note.added event (ref is a repository-relative path, an http "
+            "or https address, or starts with a prefix set by 'pinax policy "
+            "note-refs'; caption <= 200 chars)"
         ),
     )
     p_note_add.add_argument("item_id", help="Item ID to attach the note to")
@@ -1185,8 +1247,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--ref",
         required=True,
         help=(
-            "Typed ref: must match ^(koine://|~/knowledge/|projects/|docs/) - "
-            "a pointer to a knowledge-plane document, never knowledge content"
+            "The reference: a repository-relative path, an "
+            "http or https address, or text that starts with a prefix set by "
+            "'pinax policy note-refs'"
         ),
     )
     p_note_add.add_argument(
@@ -1270,6 +1333,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_board.set_defaults(func=_cmd_board)
 
+    p_web = sub.add_parser(
+        "web",
+        help="Serve this repo's board, item briefings, and event history on loopback",
+    )
+    p_web.add_argument(
+        "--port",
+        type=_parse_port,
+        default=0,
+        metavar="PORT",
+        help="Loopback port (0 selects an available port; default: 0)",
+    )
+    p_web.set_defaults(func=_cmd_web)
+
     # pinax overview
     p_overview = sub.add_parser(
         "overview",
@@ -1289,7 +1365,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_overview.add_argument(
         "--markdown", action="store_true",
         help="Write the committed PORTFOLIO.md projection at the repo root "
-             "(rung 2 of the view ladder, docs/portfolio-views.md) instead "
+             "(rung 2 of the view ladder, docs/portfolio-and-web.md) instead "
              "of printing",
     )
     p_overview.add_argument(
@@ -1419,8 +1495,8 @@ def build_parser() -> argparse.ArgumentParser:
 WRITE_COMMANDS = (
     "add", "claim", "done", "block", "park", "decide", "release",
     "policy claim-expiry", "policy process", "policy owner-gates",
-    "policy decision-actors", "priority", "annul", "dep add", "dep rm",
-    "note add",
+    "policy decision-actors", "policy note-refs", "priority", "annul",
+    "dep add", "dep rm", "note add",
 )
 
 # Subcommands whose second word names the operation.
@@ -1533,6 +1609,64 @@ def _tag_commands(parser: argparse.ArgumentParser, path: tuple = ()) -> None:
     parser.set_defaults(pinax_command=" ".join(path))
 
 
+def _damaged_result(error: DamagedLogLine, command: str) -> dict:
+    from .sync import EXIT_LOG_DAMAGED
+
+    return {
+        "published": False,
+        "sync_status": refusal.LOG_DAMAGED,
+        "error": str(error),
+        "exit_code": EXIT_LOG_DAMAGED,
+        "file": error.file,
+        "line": error.line,
+        "command": command,
+    }
+
+
+def _test_run_result(error: AppendLeakGuardError, command: str) -> dict:
+    from .sync import EXIT_TEST_RUN_REFUSED
+
+    return {
+        "published": False,
+        "sync_status": refusal.TEST_RUN_REFUSED,
+        "error": str(error),
+        "exit_code": EXIT_TEST_RUN_REFUSED,
+        "command": command,
+    }
+
+
+def _unwritable_result(error: UnwritableEventError, command: str) -> dict:
+    return {
+        "published": False,
+        "sync_status": refusal.INVALID_ARGUMENT,
+        "error": str(error),
+        "exit_code": 1,
+        "command": command,
+    }
+
+
+def _run_refusing(parsed: argparse.Namespace) -> None:
+    """
+    Run a command outside the write commands' --json mode, ending it with
+    the one refusal when it meets a damaged log line, when a test run may
+    not write to its log, or when its event may not be written to a log.
+    """
+    command = getattr(parsed, "pinax_command", "")
+    try:
+        _run_parsed(parsed)
+        return
+    except DamagedLogLine as exc:
+        result = _damaged_result(exc, command)
+    except AppendLeakGuardError as exc:
+        result = _test_run_result(exc, command)
+    except UnwritableEventError as exc:
+        result = _unwritable_result(exc, command)
+    print(result["error"], file=sys.stderr)
+    if getattr(parsed, "json", False):
+        print(json.dumps(result, sort_keys=True, ensure_ascii=True))
+    raise refusal.Refusal(result["exit_code"], result["sync_status"])
+
+
 def _run_parsed(parsed: argparse.Namespace) -> None:
     if getattr(parsed, "actor", None):
         from .append import normalise_actor
@@ -1620,6 +1754,7 @@ def _run_with_json_result(
     name = None
     error = None
     interrupt = None
+    refused = None
     try:
         if parsed is None:
             raise refusal.Refusal(parse_code, refusal.INVALID_ARGUMENT)
@@ -1630,6 +1765,18 @@ def _run_with_json_result(
     except SystemExit as exc:
         # A plain exit the command did not name is a value refusal.
         code, name = _exit_code(exc), refusal.INVALID_ARGUMENT
+    except DamagedLogLine as exc:
+        refused = _damaged_result(exc, command)
+        code, name = refused["exit_code"], refused["sync_status"]
+        print(exc, file=sys.stderr)
+    except AppendLeakGuardError as exc:
+        refused = _test_run_result(exc, command)
+        code, name = refused["exit_code"], refused["sync_status"]
+        print(exc, file=sys.stderr)
+    except UnwritableEventError as exc:
+        refused = _unwritable_result(exc, command)
+        code, name = refused["exit_code"], refused["sync_status"]
+        print(exc, file=sys.stderr)
     except KeyboardInterrupt as exc:
         interrupt = exc
         code, name = _INTERRUPT_EXIT_CODE, refusal.INTERRUPTED
@@ -1651,6 +1798,8 @@ def _run_with_json_result(
             others.append(line)
     _write(real_stderr, "".join(line + "\n" for line in others))
 
+    if chosen is None and refused is not None:
+        chosen = refused
     if chosen is None:
         if code == 0:
             name = refusal.INTERNAL_ERROR
@@ -1712,7 +1861,7 @@ def main(argv: list[str] | None = None) -> None:
         _write(real_stdout, captured.getvalue())
         if parsed is None:
             sys.exit(parse_code)
-        _run_parsed(parsed)
+        _run_refusing(parsed)
         return
     _run_with_json_result(parsed, parse_code, command, captured, kept)
 

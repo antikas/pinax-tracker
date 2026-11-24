@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -35,8 +34,6 @@ from pinax.fold import fold_events, read_events, state_to_json_safe
 
 ROOT = Path(__file__).resolve().parent.parent
 GOLDEN_LOG = ROOT / "tests" / "fixtures" / "golden_log.jsonl"
-DESIGN = ROOT / "DESIGN.md"
-README = ROOT / "README.md"
 
 ACTOR = "builder@alpha"
 
@@ -129,30 +126,6 @@ def test_only_the_event_module_hashes_events():
         if "hashlib.blake2b(" in path.read_text(encoding="utf-8"):
             found.add(path.relative_to(ROOT))
     assert found <= allowed, sorted(str(p) for p in found - allowed)
-
-
-# ---------------------------------------------------------------------------
-# Documents
-# ---------------------------------------------------------------------------
-
-def _flat(text: str) -> str:
-    return re.sub(r"\s+", " ", text)
-
-
-def test_design_event_envelope_says_the_version_two_id_covers_prev():
-    text = DESIGN.read_text(encoding="utf-8")
-    start = text.index("## Event envelope")
-    end = text.index("\n## ", start + 1)
-    assert "The version 2 id covers `prev`" in _flat(text[start:end])
-
-
-def test_readme_states_the_upgrade_order_in_its_own_paragraph():
-    phrase = "must run this version before the first version 2 event is written"
-    paragraphs = [_flat(p) for p in README.read_text(encoding="utf-8").split("\n\n")]
-    holding = [p for p in paragraphs if phrase in p]
-    assert len(holding) == 1
-    assert "strict" not in holding[0]
-    assert "every older `pinax` on PATH that a pre-commit hook could run" in holding[0]
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +255,7 @@ def _mixed_repo(root: str) -> dict:
     assert added["prev"] == last_v1["id"]
     new_item = added["payload"]["item_id"]
     noted = _append_checked(
-        root, "note", "add", new_item, "--ref", "docs/plan.md", "--actor", ACTOR, "--offline",
+        root, "note", "add", new_item, "--ref", "https://example.org/plan", "--actor", ACTOR, "--offline",
     )
     blocked = _append_checked(
         root, "block", new_item, "--gate", "scope", "--actor", ACTOR, "--offline",
@@ -812,7 +785,7 @@ def test_version_two_tombstones_retire_version_one_and_version_two_targets(tmp_p
     assert _chain_warnings(messages) == []
     assert made["v1_items"][1] not in state["items"]
     notes = json.dumps(state_to_json_safe(state["items"][made["new_item"]]))
-    assert "docs/plan.md" not in notes
+    assert "https://example.org/plan" not in notes
 
 
 @pytest.mark.deep

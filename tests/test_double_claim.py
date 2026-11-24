@@ -1,7 +1,7 @@
 """
 Tests for deterministic concurrent double-claim reconciliation.
 
-1. Owner is the earliest (ts, actor, id) — ADR-003 claim order.
+1. Owner is the earliest (ts, actor, id), the claim order.
 2. The loser yields a claim.superseded outcome in state["claim_superseded"].
 3. A report warning is surfaced in state["report"]["warnings"].
 4. The result is identical under several seeded file-line shuffles (order-independent).
@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import shutil
 import tempfile
 
@@ -290,6 +291,9 @@ class TestDoubleClaimDifferentTs:
         assert self.ITEM_ID in warning_text, (
             f"{context}: item id {self.ITEM_ID!r} not in warnings: {warnings!r}"
         )
+        for warning in warnings:
+            assert warning.endswith(f"earliest (ts={self.TS_A},actor={self.ACTOR_A}) wins"), warning
+            assert not re.search(r"adr[-_ ]?[0-9]", warning, re.IGNORECASE), warning
 
     def test_canonical_fold(self):
         """Assertion 1-3: canonical fold gives the correct winner + superseded + warning."""
@@ -440,3 +444,33 @@ class TestDoubleClaimSameTs:
                 )
             finally:
                 shutil.rmtree(parent_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# A writer's own repeats are absorbed
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("repeat_actor", ["alex@laptop", "alex@Laptop"])
+@pytest.mark.parametrize("count", [2, 3])
+def test_a_writer_never_supersedes_themselves(count, repeat_actor):
+    log_dir = _make_log_dir()
+    item_id = "app-ce2c"
+    try:
+        _append(log_dir, 0, "2026-11-23T09:00:00Z", "alex@laptop", "item.created",
+                {"item_id": item_id, "title": "Repeat", "prefix": "app"})
+        claims = [
+            _append(log_dir, 1 + n, "2026-11-23T09:00:01Z" if n < 2 else "2026-11-23T09:00:05Z",
+                    "alex@laptop" if n == 0 else repeat_actor,
+                    "item.claimed", {"item_id": item_id})
+            for n in range(count)
+        ]
+        state = _fold(log_dir)
+        live = min(claims, key=lambda event: (event["ts"], event["actor"], event["id"]))
+
+        assert state["claim_superseded"] == []
+        assert state["report"]["warnings"] == []
+        assert state["items"][item_id]["owner"] == live["actor"]
+        assert state["items"][item_id]["claim_event_id"] == live["id"]
+        assert state["items"][item_id]["claimed_at"] == live["ts"]
+    finally:
+        shutil.rmtree(os.path.dirname(log_dir), ignore_errors=True)

@@ -133,7 +133,7 @@ def test_event_ids_identical_lf_vs_crlf():
     1. parse_line(lf_bytes)["id"] == parse_line(crlf_bytes)["id"]  (stored ids match)
     2. event_id(envelope fields) == parse_line(lf_bytes)["id"]  (recomputed == stored)
     3. event_id(envelope fields) == parse_line(crlf_bytes)["id"]  (recomputed == stored for CRLF)
-    ADR-001: hashes are performed on LF-normalised, terminator-excluded bytes.
+    Hashes are performed on LF-normalised, terminator-excluded bytes.
     """
     from pinax.event import event_id as compute_event_id
 
@@ -167,7 +167,7 @@ def test_event_ids_identical_lf_vs_crlf():
 
     assert lf_ids == recomputed_ids, (
         f"Stored event ids do not match recomputed blake2b ids -- "
-        f"hash is NOT platform-independent (ADR-001 violation)\n"
+        f"hash is NOT platform-independent\n"
         f"stored:     {lf_ids}\n"
         f"recomputed: {recomputed_ids}"
     )

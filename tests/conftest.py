@@ -26,15 +26,42 @@ import pytest as _pytest
 
 
 # ---------------------------------------------------------------------------
-# The leak guard in pinax/append.py exempts the OS temp tree, and tests rely on
-# tmp_path being inside it. A runner can place pytest's base temporary directory
-# elsewhere with --basetemp, so this makes that directory the temp tree for the
-# test process: tmp_path stays the sandbox the guard exempts, wherever it is.
+# During a test run the guard in pinax/append.py accepts only logs under the
+# temporary directory, and tests rely on tmp_path being inside it. A runner can
+# place pytest's base temporary directory elsewhere with --basetemp, so this
+# makes that directory the temp tree for the test process and, through the
+# variables tempfile reads, for every subprocess a test starts.
 # ---------------------------------------------------------------------------
 
 @_pytest.fixture(autouse=True, scope="session")
-def _base_temp_is_the_temp_tree(tmp_path_factory: "_pytest.TempPathFactory") -> None:
-    _tempfile.tempdir = str(tmp_path_factory.getbasetemp())
+def _base_temp_is_the_temp_tree(tmp_path_factory: "_pytest.TempPathFactory"):
+    base = str(tmp_path_factory.getbasetemp())
+    _tempfile.tempdir = base
+    with _pytest.MonkeyPatch.context() as patch:
+        for name in ("TMPDIR", "TEMP", "TMP"):
+            patch.setenv(name, base)
+        yield
+
+
+@_pytest.fixture(autouse=True, scope="session")
+def _the_session_is_a_test_run(_base_temp_is_the_temp_tree):
+    with _pytest.MonkeyPatch.context() as patch:
+        patch.setenv("PINAX_TEST_RUN", "1")
+        yield
+
+
+# ---------------------------------------------------------------------------
+# Tests that start the local web view fetch it from 127.0.0.1. A proxy named in
+# the environment would take that request and fail it, so local addresses are
+# marked as never proxied for the whole session.
+# ---------------------------------------------------------------------------
+
+@_pytest.fixture(autouse=True, scope="session")
+def _local_addresses_bypass_any_proxy():
+    with _pytest.MonkeyPatch.context() as patch:
+        for name in ("NO_PROXY", "no_proxy"):
+            patch.setenv(name, "127.0.0.1,localhost")
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +189,7 @@ def pytest_sessionfinish(session: "_pytest.Session", exitstatus: int) -> None:
 # Shared deep-lane fixture: a bare hub for a test whose subject needs a
 # mutating command driven against a reachable `origin` (claim is the one
 # command the publish sequence in pinax/sync.py always requires it for; see
-# docs/decisions/ADR-006-sync-on-mutation.md). One owner for this
+# docs/sharing-and-sync.md). One owner for this
 # construction so it is not copied per test file.
 #
 # Lives entirely under the caller's pytest base temporary directory

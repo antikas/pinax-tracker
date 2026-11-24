@@ -106,8 +106,7 @@ def _pick_remote_branch(symref: str | None, heads: dict[str, str]) -> str | None
     symref) when it resolves to a published branch; else a DOCUMENTED
     deterministic fallback for a misconfigured/dangling remote HEAD —
     refs/heads/main, then refs/heads/master, then the alphabetically-first
-    published branch (same documented-tie-break discipline as the worktree
-    dedup rule in DESIGN.md). None = nothing published at all (empty remote).
+    published branch. None = nothing published at all (empty remote).
     """
     if not heads:
         return None
@@ -180,7 +179,9 @@ def fetch_remote_git(url: str, scratch_dir: str) -> dict:
     raw_events: list[dict] = []
     for shard_path in shard_paths:
         raw = _read_blob(clone_dir, sha, shard_path)
-        for event in parse_shard_bytes(raw, shard_id=shard_path):
+        for event in parse_shard_bytes(
+            raw, shard_id=shard_path, label=f"{branch_ref}:{shard_path}"
+        ):
             if event.get("id") is None:
                 continue  # same id-required guard as replay.read_events_at_ref
             raw_events.append(event)
@@ -320,7 +321,9 @@ def fetch_remote_github_api(url: str, http_get=None) -> dict:
                 f"in {owner}/{repo}"
             )
         shard_id = f"{_LOG_SUBPATH}/{entry.get('name')}"
-        for event in parse_shard_bytes(body, shard_id=shard_id):
+        for event in parse_shard_bytes(
+            body, shard_id=shard_id, label=f"refs/heads/{default_branch}:{shard_id}"
+        ):
             if event.get("id") is None:
                 continue
             raw_events.append(event)
@@ -347,7 +350,8 @@ def fetch_remote_events(
     GitHub contents-API fallback second (GitHub URLs only).
 
     Returns {"sha": <tip sha> | None, "has_log": bool, "events": [...]}.
-    Raises RemoteFetchError when neither transport can serve the remote.
+    Raises RemoteFetchError when neither transport can serve the remote, and
+    DamagedLogLine when the published log holds a damaged line.
 
     `git_fetch` / `http_get` are injectable for tests only — production
     callers pass neither.

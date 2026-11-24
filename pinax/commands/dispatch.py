@@ -152,7 +152,7 @@ def run(
             prev_id = event["id"]
             seq += 1
 
-        # Regenerate projection atomically (ADR-002).
+        # Regenerate projection atomically.
         regenerate(repo_root)
 
         warn_if_log_ignored(repo_root)

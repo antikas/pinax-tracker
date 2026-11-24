@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pinax pre-commit drift lint (ADR-002).
+Pinax pre-commit drift lint.
 
 This hook is shipped in hooks/pre-commit and installed into .git/hooks/
 by 'pinax init'.  It rejects any commit that would leave the projection

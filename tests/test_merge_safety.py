@@ -463,7 +463,7 @@ def test_cross_worktree_double_claim(clone_wired_to_hub):
     # Merge claim-b: the JSONL shards are different files (per-actor-session
     # shard), so the union driver merges them cleanly.  Only the generated
     # projection can conflict, and that is resolved by regenerating it from
-    # the merged log (ADR-002), never by choosing one side of it.
+    # the merged log, never by choosing one side of it.
     merged = subprocess.run(
         ["git", "merge", "--no-ff", "-m", "merge: claim-b", "claim-b"],
         cwd=repo, capture_output=True, text=True, env=_build_env(),
@@ -538,7 +538,7 @@ def test_per_actor_shard_zero_conflict():
     the same shard file → zero merge conflicts in the log (the union driver
     only triggers on files that both branches modified).
 
-    This test verifies the shard-key behavior in DESIGN.md:
+    This test verifies the shard-key behavior in docs/data-model-and-integrity.md:
     - Branch A appends to 'operator-alpha.jsonl' (actor=operator@alpha).
     - Branch B appends to 'reviewer-beta.jsonl' (actor=reviewer@beta).
     - The merge is a fast-forward / trivial union with NO CONFLICT in the log.

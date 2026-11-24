@@ -188,7 +188,7 @@ def test_a_diverged_remote_leaves_other_staged_work_out_of_every_commit(
 
 
 @pytest.mark.parametrize("set_aside", ["commit", "stash"])
-def test_the_recovery_in_adr_006_publishes_a_kept_event(repo, tmp_path_factory, set_aside):
+def test_the_manual_recovery_after_a_rejected_push_publishes_a_kept_event(repo, tmp_path_factory, set_aside):
     item_id, hub = _diverged_remote(repo, tmp_path_factory)
     _other_work(repo)
     assert _pinax(repo, "park", item_id, "--reason", "later", "--actor", "t@h").returncode == 5
@@ -214,7 +214,7 @@ def test_the_recovery_in_adr_006_publishes_a_kept_event(repo, tmp_path_factory, 
 
 
 @pytest.mark.parametrize("set_aside", ["commit", "stash"])
-def test_the_recovery_in_adr_006_claims_after_an_annulled_claim(repo, tmp_path_factory, set_aside):
+def test_the_manual_recovery_after_a_rejected_push_claims_after_an_annulled_claim(repo, tmp_path_factory, set_aside):
     item_id, hub = _diverged_remote(repo, tmp_path_factory)
     _other_work(repo)
     refused = _pinax(repo, "claim", item_id, "--actor", "t@h", "--json")

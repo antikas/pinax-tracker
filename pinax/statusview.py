@@ -12,6 +12,7 @@ import datetime
 import os
 import subprocess
 
+from .event import DamagedLogLine
 from .fold import (
     BUILDING_STATUSES,
     claim_age_hours,
@@ -19,6 +20,7 @@ from .fold import (
     compute_ready,
     descendants,
     fold,
+    registry_from_usable_lines,
 )
 from .visibility import unmerged_tracker_refs
 
@@ -130,6 +132,7 @@ def _summarise_repo(
     all_branches: bool,
     now: datetime.datetime,
     under: str | None = None,
+    report_damage: bool = False,
 ) -> dict:
     root = os.path.abspath(os.path.expanduser(repo_root))
     log_dir = os.path.join(root, ".ergon", "log")
@@ -160,7 +163,15 @@ def _summarise_repo(
         base["all_branches"] = True
         base["source_branches"] = folded.get("source_branches", [])
     else:
-        state = fold(log_dir)
+        try:
+            state = fold(log_dir)
+        except DamagedLogLine as exc:
+            if not report_damage:
+                raise
+            base["initialised"] = True
+            base["damaged"] = exc.facts()
+            base["warnings"] = [f"damaged: {exc.where()}"]
+            return base
         base["warnings"] = _branch_warnings(root)
 
     items: dict = state.get("items", {})
@@ -284,7 +295,7 @@ def _portfolio_repos(start: str | None) -> list[tuple[str, str]]:
     registry: dict = {}
     hub_log = os.path.join(hub_root, ".ergon", "log")
     if os.path.isdir(hub_log):
-        registry = fold(hub_log).get("registry", {})
+        registry = registry_from_usable_lines(hub_log)
     return _discover_repos(hub_root, registry, roots=roots, max_depth=depth)
 
 
@@ -358,6 +369,7 @@ def status_view(
                 since_days=since_days,
                 all_branches=False,
                 now=pinned_now,
+                report_damage=True,
             )
             for repo_id, path in repos
         ],

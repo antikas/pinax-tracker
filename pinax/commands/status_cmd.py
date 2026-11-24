@@ -136,6 +136,14 @@ def _print_repo(repo: dict, *, indent: str = "") -> None:
         print(f"{indent}  not initialised: .ergon/log not found")
         return
 
+    damaged = repo.get("damaged")
+    if damaged:
+        print(
+            f"{indent}  damaged: {damaged['file']} line {damaged['line']}: "
+            f"{damaged['reason']}"
+        )
+        return
+
     building = repo.get("building", [])
     print(f"{indent}  building ({len(building)}):")
     if building:

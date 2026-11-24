@@ -3,7 +3,7 @@ pinax report [--json] [--all-branches]
 
 Read-only summary report over the event log.
 
-ADR-004 / DESIGN.md compliance:
+Compliance:
 - PURE READ FOLD — never writes any value into the knowledge plane.
 - Deterministic: same log → same report, independent of PYTHONHASHSEED,
   wall-clock, or locale.

@@ -229,7 +229,7 @@ def run(
     hash_index: dict[str, str] = {}
     for ev in all_events:
         h = ev.get("payload", {}).get("source_line_hash")
-        if h:
+        if h and isinstance(h, str):
             hash_index[h] = ev["id"]
 
     _reconciler = actor or _default_actor()

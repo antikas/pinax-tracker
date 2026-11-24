@@ -179,8 +179,8 @@ def test_cli_warns_on_stderr_stdout_clean(tmp_path, command):
     _git(root, "commit", "-m", "init: pinax ergon base")
 
     # No follow-up commit here or below: 'add' runs the publish sequence
-    # (pinax/sync.py), which commits the shard and the projection itself
-    # (ADR-006); the working tree is already clean by the time it returns.
+    # (pinax/sync.py), which commits the shard and the projection itself;
+    # the working tree is already clean by the time it returns.
     result = _pinax(root, "add", "--title", "seed item", "--actor", "t@h")
     assert result.returncode == 0, result.stderr
 

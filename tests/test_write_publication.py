@@ -51,6 +51,7 @@ PARENT_KEYS = {
     "policy process": {"actor": "str", "event_id": "str", "process": "str", "root": "str", "seq": "int", "ts": "str", "type": "str"},
     "policy owner-gates": {"actor": "str", "classes": "list", "event_id": "str", "root": "str", "seq": "int", "ts": "str", "type": "str"},
     "policy decision-actors": {"actor": "str", "actors": "list", "event_id": "str", "root": "str", "seq": "int", "ts": "str", "type": "str"},
+    "policy note-refs": {"actor": "str", "event_id": "str", "prefixes": "list", "root": "str", "seq": "int", "ts": "str", "type": "str"},
 }
 
 COMMANDS = list(PARENT_KEYS)
@@ -131,7 +132,7 @@ def template(tmp_path_factory) -> dict:
     second = _ok(repo, "add", "--title", "Second", "--actor", OWNER)["item_id"]
     third = _ok(repo, "add", "--title", "Third", "--actor", OWNER)["item_id"]
     _ok(repo, "dep", "add", third, "--blocks", second, "--actor", OWNER)
-    note = _ok(repo, "note", "add", first, "--ref", "docs/one.md", "--actor", OWNER)
+    note = _ok(repo, "note", "add", first, "--ref", "https://example.org/one", "--actor", OWNER)
     _ok(repo, "claim", third, "--actor", WORKER)
     briefing = root / "briefing.md"
     briefing.write_text("Finished.\n", encoding="utf-8")
@@ -169,7 +170,7 @@ def _args(name: str, w: dict) -> list[str]:
         "priority": ["priority", first, "2", "--actor", OWNER],
         "dep add": ["dep", "add", first, "--blocks", second, "--actor", OWNER],
         "dep rm": ["dep", "rm", third, "--blocks", second, "--actor", OWNER],
-        "note add": ["note", "add", first, "--ref", "docs/two.md", "--actor", OWNER],
+        "note add": ["note", "add", first, "--ref", "https://example.org/two", "--actor", OWNER],
         "annul": ["annul", w["note_event"], "--reason", "wrong note", "--actor", OWNER],
         "decide release": [
             "decide", first, "--option", "A", "--label", "Go on", "--effect",
@@ -185,6 +186,7 @@ def _args(name: str, w: dict) -> list[str]:
         "policy decision-actors": [
             "policy", "decision-actors", "--decider", OWNER, "--actor", OWNER,
         ],
+        "policy note-refs": ["policy", "note-refs", "--prefix", "wiki://", "--actor", OWNER],
     }
     return table[name]
 
@@ -273,7 +275,7 @@ def test_a_refused_commit_is_not_published(work):
     assert report["sync_status"] == "commit_refused"
 
 
-def test_a_superseded_claim_is_published(work):
+def test_a_claim_on_a_held_item_is_not_published(work):
     other = os.path.join(work["root"], "other")
     _git(work["root"], "clone", "-q", work["bare"], other)
     _configure(other)
@@ -285,8 +287,8 @@ def test_a_superseded_claim_is_published(work):
     second = _pinax(other, "claim", work["first"], "--actor", RIVAL, "--json")
     assert second.returncode == 3, second.stdout + second.stderr
     report = _last_json(second.stdout)
-    assert report["published"] is True
-    assert report["sync_status"] == "claim_superseded"
+    assert report["published"] is False
+    assert report["sync_status"] == "claim_held"
 
 
 # ---------------------------------------------------------------------------

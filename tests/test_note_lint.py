@@ -2,11 +2,11 @@
 Tests for note linting, dispatch, and metrics.
 
  test coverages tested here:
-1. note add HARD-rejects a bad ref at the CLI (sys.exit(1)).
+1. note add HARD-rejects a bad ref at the CLI (exit 8).
 2. note add HARD-rejects a >200-char caption at the CLI (sys.exit(1)).
 3. note add ACCEPTS a valid ref + caption (<= 200 chars).
 4. pinax metrics --json is deterministic over a seeded log.
-5. pinax metrics NEVER writes any file to ~/knowledge or the knowledge plane.
+5. pinax metrics NEVER writes any file to the knowledge plane.
 6. pinax dispatch --max N emits the capped ready manifest.
 7. pinax dispatch --max 0 (edge case: zero cap → empty manifest).
 
@@ -113,61 +113,25 @@ def _seed_minimal_repo(repo_dir: str, actor: str = "operator@example.test") -> s
 class TestNoteAddHardRejection:
     """note add rejects bad ref and oversized caption at the CLI (hard error)."""
 
-    def test_unqualified_ref_rejected(self):
-        """A ref that does not match the typed-ref pattern exits with code 1."""
+    @pytest.mark.parametrize("ref", ["/etc/passwd", "../outside.md", "ftp://example.invalid/x"])
+    def test_ref_that_fits_no_rule_rejected(self, ref: str):
+        """A ref that is no relative path, no web address and has no listed prefix exits with code 8."""
         with tempfile.TemporaryDirectory() as repo_dir:
             item_id = _seed_minimal_repo(repo_dir)
             result = subprocess.run(
                 [
                     sys.executable, "-m", "pinax", "note", "add",
                     item_id,
-                    "--ref", "this-is-not-a-typed-ref",
+                    "--ref", ref,
                     "--actor", "operator@example.test",
                 ],
                 capture_output=True, text=True, cwd=repo_dir, env=_build_env(),
             )
-            assert result.returncode == 1, (
-                f"Expected exit code 1 for unqualified ref, got {result.returncode}. "
+            assert result.returncode == 8, (
+                f"Expected exit code 8 for ref {ref!r}, got {result.returncode}. "
                 f"stderr: {result.stderr!r}"
             )
-            assert "REJECTED" in result.stderr or "ref must match" in result.stderr, (
-                f"Expected REJECTED message in stderr, got: {result.stderr!r}"
-            )
-
-    def test_http_url_ref_rejected(self):
-        """An http:// URL is not a typed ref — must be rejected."""
-        with tempfile.TemporaryDirectory() as repo_dir:
-            item_id = _seed_minimal_repo(repo_dir)
-            result = subprocess.run(
-                [
-                    sys.executable, "-m", "pinax", "note", "add",
-                    item_id,
-                    "--ref", "https://example.com/some-doc",
-                    "--actor", "operator@example.test",
-                ],
-                capture_output=True, text=True, cwd=repo_dir, env=_build_env(),
-            )
-            assert result.returncode == 1, (
-                f"Expected exit code 1 for http URL ref, got {result.returncode}. "
-                f"stderr: {result.stderr!r}"
-            )
-
-    def test_bare_path_ref_rejected(self):
-        """A bare filename (no required prefix) is not a typed ref."""
-        with tempfile.TemporaryDirectory() as repo_dir:
-            item_id = _seed_minimal_repo(repo_dir)
-            result = subprocess.run(
-                [
-                    sys.executable, "-m", "pinax", "note", "add",
-                    item_id,
-                    "--ref", "some-document.md",
-                    "--actor", "operator@example.test",
-                ],
-                capture_output=True, text=True, cwd=repo_dir, env=_build_env(),
-            )
-            assert result.returncode == 1, (
-                f"Expected exit code 1 for bare path ref, got {result.returncode}."
-            )
+            assert f"the reference '{ref}' is not a repository-relative path" in result.stderr
 
     def test_caption_over_200_chars_rejected(self):
         """A caption exceeding 200 characters is hard-rejected at the CLI."""
@@ -178,7 +142,7 @@ class TestNoteAddHardRejection:
                 [
                     sys.executable, "-m", "pinax", "note", "add",
                     item_id,
-                    "--ref", "~/knowledge/learnings/test.md",
+                    "--ref", "https://example.org/test",
                     "--caption", oversized_caption,
                     "--actor", "operator@example.test",
                 ],
@@ -201,7 +165,7 @@ class TestNoteAddHardRejection:
                 [
                     sys.executable, "-m", "pinax", "note", "add",
                     item_id,
-                    "--ref", "~/knowledge/learnings/test.md",
+                    "--ref", "https://example.org/test",
                     "--caption", exact_200,
                     "--actor", "operator@example.test",
                 ],
@@ -218,19 +182,20 @@ class TestNoteAddHardRejection:
 # ---------------------------------------------------------------------------
 
 class TestNoteAddValid:
-    """note add accepts all valid typed-ref prefixes."""
+    """note add accepts a repository-relative path and a web address."""
 
-    @pytest.mark.parametrize("ref_prefix", [
-        "koine://",
-        "~/knowledge/",
-        "projects/",
-        "docs/",
+    @pytest.mark.parametrize("ref", [
+        "notes/brief.md",
+        "brief.md",
+        "projects/some/doc.md",
+        "docs/some/doc.md",
+        "https://example.org/some-doc",
+        "http://example.org/some-doc",
     ])
-    def test_valid_ref_prefix_accepted(self, ref_prefix: str):
-        """All four valid ref prefixes are accepted."""
+    def test_valid_ref_accepted(self, ref: str):
+        """A repository-relative path, or a web address, is accepted."""
         with tempfile.TemporaryDirectory() as repo_dir:
             item_id = _seed_minimal_repo(repo_dir)
-            ref = f"{ref_prefix}some/path/doc.md"
             result = subprocess.run(
                 [
                     sys.executable, "-m", "pinax", "note", "add",
@@ -254,7 +219,7 @@ class TestNoteAddValid:
                 [
                     sys.executable, "-m", "pinax", "note", "add",
                     item_id,
-                    "--ref", "~/knowledge/learnings/test.md",
+                    "--ref", "https://example.org/test",
                     "--actor", "operator@example.test",
                 ],
                 capture_output=True, text=True, cwd=repo_dir, env=_build_env(),
@@ -268,7 +233,7 @@ class TestNoteAddValid:
         """After note add, the note appears in the fold state."""
         with tempfile.TemporaryDirectory() as repo_dir:
             item_id = _seed_minimal_repo(repo_dir)
-            ref = "~/knowledge/learnings/test.md"
+            ref = "https://example.org/test"
             caption = "Test caption"
             subprocess.run(
                 [
@@ -371,7 +336,7 @@ class TestMetrics:
         """
         metrics command does not write any file to the knowledge plane.
 
-        We check that no file under ~/knowledge/ or knowledge-plane paths
+        We check that no file under knowledge-plane paths
         is written during a metrics run.  We do this by recording the mtime
         of the sources.toml before/after and asserting it is unchanged.
         """

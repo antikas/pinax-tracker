@@ -12,11 +12,19 @@ it wants to record and this module runs the whole sequence.
   refuse an event that names an item (or, for an annulment, an event) the
     union does not hold, before anything is minted; the rule itself is
     owned by pinax.targets
+  annul every waiting claim of this writer on the item a claim names: a claim
+    in the local log that the fetched remote does not hold is never published
+    by a later claim, which is decided afresh instead
+  refuse a claim on an item another writer already holds in the union fold,
+    and end a repeat when this writer already holds it; neither appends a
+    claim
   refuse a claim whose intended timestamp is behind the newest published
     event by more than the clock tolerance, before anything is minted
   append the event, or the command's events in order (a park decision
     publishes two in one commit)
   regenerate the projection
+  before every push attempt, annul each waiting claim of this writer on an
+    item another writer's live claim holds on the fetched remote
   commit the shard and the projection with the repository's hooks running
     and the resolved tracker root in their environment
   push the remote default branch, and only when it is checked out and
@@ -58,11 +66,12 @@ the repository state and its inputs alone.
 
 The fold also decides how a published claim ends. After an accepted push
 the sequence fetches once more and folds again over the state the remote
-now holds; a claim that fold reports superseded ends with exit 3. The fold
+now holds; a claim that fold does not show holding the item ends with exit 3. The fold
 names a superseded claim by the id of the event it superseded, and this
-module minted the event it is asking about, so its own event is recognised
-by that id alone. There is no ownership check anywhere here, before the
-append or after it: the fold is the sole reconciler.
+module knows the event it is asking about, so its own event is recognised
+by that id alone. The pre-append check on a claim reads the live claim from
+the same fold: the fold is the sole reconciler, before the append and after
+it.
 
 Every git call goes through GitRunner, so a caller can substitute a runner
 and drive the whole sequence with no git process at all. No call in this
@@ -73,17 +82,19 @@ push is written as its two halves, a fetch and a merge, so no local
 configuration can turn it into a rewrite. After that pull the projection is
 regenerated from the merged log and committed before the next push
 attempt, which is also how a conflict in the generated Markdown is
-resolved (ADR-002).
+resolved.
 
 Exit codes are mapped in exactly one place, _exit_code:
 
   0  the event is committed, and pushed when the remote default branch is
-     the checked-out branch
+     the checked-out branch; or the remote already records it
   1  the event names an item that does not exist in the union fold (an
-     annulment: an event that does not exist); nothing was minted
+     annulment: an event that does not exist), or an annulment names the
+     annulment a rejected claim wrote for itself; nothing was minted
   2  the actor handle is not role@host; nothing was minted
-  3  the event is published and the fold over the pushed remote state
-     reports this claim superseded by an earlier one
+  3  another writer's live claim on the item is already in the pre-append
+     union fold (nothing was minted), or the claim is published and the fold
+     over the pushed remote state does not show it holding the item
   4  the remote's state could not be read, the command needed the remote
      and the event could not be published, or repo_root is not the top
      level of its git repository (nothing was minted either way)
@@ -97,6 +108,15 @@ Exit codes are mapped in exactly one place, _exit_code:
      block for the owner without a listed owner-gate class, or a
      strict-process decision from an actor not on the decision-actor list
      or with no list set); nothing was minted
+  9  the local log or the remote default branch holds a damaged line (see
+     pinax.event.DamagedLogLine); nothing was minted, unless the remote
+     gained the line while the command was publishing
+
+An exit that says nothing was minted can still leave the annulment of a
+waiting claim that a refused claim wrote, uncommitted.
+
+ 10  PINAX_TEST_RUN is 1 and the log is not under the temporary directory;
+     append_event refuses, so nothing was written
 
 Every report, and every write command's own result on exit 0, carries
 "published" and "sync_status" from SyncOutcome.publication, the one place
@@ -123,9 +143,20 @@ import sys
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
-from .append import append_event, prev_for_actor, shard_path_for_actor
-from .event import mint_event
-from .fold import _collect_annulled_ids, finalise_events, fold_events, read_raw_events
+from .append import (
+    append_event,
+    normalise_actor,
+    prev_for_actor,
+    shard_path_for_actor,
+)
+from .event import DamagedLogLine, mint_event, valid_annulment
+from .fold import (
+    _collect_annulled_ids,
+    _sort_key,
+    finalise_events,
+    fold_events,
+    read_raw_events,
+)
 from .projection import regenerate
 from .replay import ReplayRefError, read_raw_events_at_ref
 from .targets import unknown_target_message
@@ -148,8 +179,8 @@ _DEFAULT_CLOCK_TOLERANCE_S = 5.0
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 # The generated Markdown the projection owns, relative to .ergon. A pull
-# resolves a conflict in these by regenerating them from the merged log
-# (ADR-002), so the sequence needs to know which files those are.
+# resolves a conflict in these by regenerating them from the merged log,
+# so the sequence needs to know which files those are.
 _BOARD_NAME = "board.md"
 _ITEMS_DIR_NAME = "items"
 
@@ -166,6 +197,8 @@ EXIT_PUSH_EXHAUSTED = 5
 EXIT_CLOCK_BEHIND = 6
 EXIT_COMMIT_REFUSED = 7
 EXIT_POLICY_REFUSED = 8
+EXIT_LOG_DAMAGED = 9
+EXIT_TEST_RUN_REFUSED = 10
 
 INVALID_ACTOR = "invalid_actor"
 UNKNOWN_TARGET = "unknown_target"
@@ -180,10 +213,15 @@ STAGE_FAILED = "stage_failed"
 COMMIT_REFUSED = "commit_refused"
 PUSH_REJECTED = "push_rejected"
 CLAIM_SUPERSEDED = "claim_superseded"
+CLAIM_HELD = "claim_held"
 CLOCK_BEHIND_REMOTE = "clock_behind_remote"
 UNREADABLE_TIMESTAMP = "unreadable_timestamp"
+FINAL_ANNULMENT = "final_annulment"
 POLICY_REFUSED = "policy_refused"
+LOG_DAMAGED = "log_damaged"
+TEST_RUN_REFUSED = "test_run_refused"
 ALREADY_PUBLISHED = "already_published"
+ALREADY_CLAIMED = "already_claimed"
 
 # Outcomes that published nothing but left the repository consistent. They
 # are acceptable for a command that tolerates local-only work and are a
@@ -202,6 +240,9 @@ _EXIT_BY_STATUS = {
     # The event names an item (or, for an annulment, an event) that the
     # union fold does not hold; nothing was minted.
     UNKNOWN_TARGET: EXIT_UNKNOWN_TARGET,
+    # Nothing was minted: the annulment names the one a rejected claim wrote
+    # for its own event.
+    FINAL_ANNULMENT: EXIT_UNKNOWN_TARGET,
     # repo_root sits inside a different repository's history: the sequence
     # cannot publish there for any command, required-remote or not.
     FOREIGN_REPOSITORY: EXIT_REMOTE_REQUIRED,
@@ -214,6 +255,9 @@ _EXIT_BY_STATUS = {
     # The event is published; the fold over the pushed remote state says
     # an earlier claim owns the item.
     CLAIM_SUPERSEDED: EXIT_CLAIM_SUPERSEDED,
+    # Nothing was minted: the pre-append union fold shows another writer's
+    # live claim on the item.
+    CLAIM_HELD: EXIT_CLAIM_SUPERSEDED,
     # Nothing was minted: the claim's own timestamp sits behind published
     # history by more than the tolerance, or cannot be read at all. The
     # two are reported apart and end the command the same way, as a
@@ -222,9 +266,17 @@ _EXIT_BY_STATUS = {
     UNREADABLE_TIMESTAMP: EXIT_CLOCK_BEHIND,
     # Nothing was minted: the project's policy refuses the event as given.
     POLICY_REFUSED: EXIT_POLICY_REFUSED,
+    # A line of the local log or of the remote's cannot be used as an event.
+    LOG_DAMAGED: EXIT_LOG_DAMAGED,
+    # Nothing was written: PINAX_TEST_RUN is 1 and the log is not under the
+    # temporary directory.
+    TEST_RUN_REFUSED: EXIT_TEST_RUN_REFUSED,
     # Nothing was minted: the remote default branch, as fetched in this
     # run, already records what the command would append.
     ALREADY_PUBLISHED: EXIT_OK,
+    # Nothing was minted: this writer already holds the item, and their
+    # claim is published.
+    ALREADY_CLAIMED: EXIT_OK,
 }
 
 
@@ -378,6 +430,7 @@ class SyncOutcome:
     exit_code: int
     report: dict
     notes: list[str] = field(default_factory=list)
+    # The first event this run minted, or the live claim a repeated claim found.
     event: dict | None = None
     shard_path: str | None = None
     remote_branch: str | None = None
@@ -386,6 +439,8 @@ class SyncOutcome:
     events: list[dict] = field(default_factory=list)
     # True once this run's push was accepted by the remote.
     push_accepted: bool = False
+    # The union of the local log and the remote's, as folded before the append.
+    union_events: list[dict] = field(default_factory=list)
 
     def publication(self) -> dict:
         """
@@ -394,7 +449,9 @@ class SyncOutcome:
         branch as fetched already held the events, and this run's status.
         The one place publication is decided.
         """
-        published = self.push_accepted or self.status == ALREADY_PUBLISHED
+        published = self.push_accepted or self.status in (
+            ALREADY_PUBLISHED, ALREADY_CLAIMED
+        )
         return {"published": published, "sync_status": self.status}
 
 
@@ -506,8 +563,8 @@ def _parse_ts(value) -> datetime.datetime | None:
 
 def _newest_live_remote_event(remote_raw: list[dict]) -> tuple[dict | None, object]:
     """
-    The remote event carrying the greatest timestamp that a valid
-    event.annulled tombstone does not name.
+    The remote event carrying the greatest timestamp that no event.annulled
+    tombstone in effect names.
 
     Annulment is asked of pinax.fold._collect_annulled_ids, the one owner
     of "which ids are annulled", over the same pool, so a retired
@@ -575,7 +632,7 @@ def _superseded_by(state: dict, event: dict) -> dict | None:
     The one place a published event is recognised as a superseded claim.
 
     The fold records every superseded claim with the id of the event it
-    superseded, and this module minted the event it is asking about, so the
+    superseded, and this module knows the event it is asking about, so the
     two are matched by that id and nothing else. No second reconciliation
     rule is needed to tell this command's own claim from the winner's.
     """
@@ -583,6 +640,166 @@ def _superseded_by(state: dict, event: dict) -> dict | None:
         if entry.get("superseded_event_id") == event.get("id"):
             return entry
     return None
+
+
+def _live_claim(events: list[dict], state: dict, item_id: str, ts: str) -> dict | None:
+    """
+    The claim event that holds item_id at ts, or None when the item is free.
+
+    A claim expires at the first event past its deadline, and the claim
+    being considered may itself be that event. The fold is therefore asked
+    again with a placeholder event of no effect at ts, so an expired claim
+    does not hold the item against the claim that would end it.
+    """
+    if not state.get("items", {}).get(item_id, {}).get("claim_event_id"):
+        return None
+    moment = {
+        "id": "", "seq": _next_seq(events), "ts": ts, "actor": "", "type": "", "payload": {},
+    }
+    at_ts = fold_events([*events, moment])
+    holding_id = at_ts["items"][item_id].get("claim_event_id")
+    for event in events:
+        if holding_id and event.get("id") == holding_id:
+            return event
+    return None
+
+
+def _claim_not_holding(state: dict, item_id: str, claim: dict) -> dict | None:
+    """
+    None when claim holds item_id in this fold, else the winner fields.
+
+    Both winner fields are None when nobody holds the item.
+    """
+    superseded = _superseded_by(state, claim)
+    if superseded is not None:
+        return superseded
+    item = state.get("items", {}).get(item_id, {})
+    if item.get("claim_event_id") == claim["id"]:
+        return None
+    return {
+        "winner_event_id": item.get("claim_event_id"),
+        "winner_actor": item.get("owner"),
+    }
+
+
+def _same_writer(event: dict, actor: str) -> bool:
+    return normalise_actor(event["actor"]) == normalise_actor(actor)
+
+
+def _waiting_claims(
+    events: list[dict], remote_raw: list[dict], actor: str, minted: list[dict]
+) -> list[dict]:
+    """
+    The writer's claims that the fetched remote lacks and this run did not mint.
+
+    A claim counts as annulled only when it stays annulled without the events
+    other writers have not published, because this run's push may leave those
+    behind.
+    """
+    remote_ids = {event["id"] for event in remote_raw}
+    minted_ids = {event["id"] for event in minted}
+    pushed = [
+        event for event in events
+        if event["id"] in remote_ids or _same_writer(event, actor)
+    ]
+    annulled = _collect_annulled_ids(events) & _collect_annulled_ids(pushed)
+    return [
+        event for event in events
+        if event["type"] == "item.claimed"
+        and isinstance(event["payload"].get("item_id"), str)
+        and event["id"] not in remote_ids | minted_ids | annulled
+        and _same_writer(event, actor)
+    ]
+
+
+def _holder_on_remote(
+    events: list[dict], remote_raw: list[dict], item_id: str, actor: str
+) -> dict | None:
+    """
+    Another writer's claim that holds item_id on the fetched remote, or None.
+
+    The item's creation may be local only, and the fold ignores a claim on an
+    item it does not know, so the creation is always folded too.
+    """
+    remote_ids = {event["id"] for event in remote_raw}
+    published = [
+        event for event in events
+        if event["id"] in remote_ids
+        or event["type"] == "item.created"
+        and event["payload"].get("item_id") == item_id
+    ]
+    item = fold_events(published).get("items", {}).get(item_id, {})
+    for event in published:
+        if event["id"] == item.get("claim_event_id"):
+            return None if _same_writer(event, actor) else event
+    return None
+
+
+def _claims_held_by_others(
+    events: list[dict], remote_raw: list[dict], actor: str, minted: list[dict]
+) -> list[tuple[dict, dict]]:
+    """Each waiting claim on an item another writer holds on the remote, with that claim."""
+    pairs = []
+    for claim in _waiting_claims(events, remote_raw, actor, minted):
+        item_id = claim["payload"]["item_id"]
+        holder = _holder_on_remote(events, remote_raw, item_id, actor)
+        if holder is not None:
+            pairs.append((claim, holder))
+    return pairs
+
+
+def _held_on_remote_note(claim: dict, holder: dict) -> str:
+    return (
+        f"pinax: the waiting claim {claim['id']} on {claim['payload']['item_id']} "
+        f"was annulled, because {holder['actor']} already holds the item on the remote"
+    )
+
+
+def _annul_waiting(
+    log_dir: str, actor: str, ts: str, claims: list[dict], events: list[dict]
+) -> list[dict]:
+    """
+    Append an annulment for each claim; events is the pool they are numbered
+    after. The command's own ts is used, so an annulment never expires a
+    claim the command itself would not.
+    """
+    annulments: list[dict] = []
+    for claim in claims:
+        annulment = mint_event(
+            seq=_next_seq([*events, *annulments]),
+            ts=ts,
+            actor=actor,
+            etype="event.annulled",
+            payload={"target_id": claim["id"], "reason": _ANNUL_REASON},
+            prev=prev_for_actor(log_dir, actor),
+        )
+        append_event(log_dir, annulment, actor=actor)
+        annulments.append(annulment)
+    return annulments
+
+
+def _head_lacks_an_annulment(
+    events: list[dict], remote_raw: list[dict], head_raw: list[dict], actor: str
+) -> bool:
+    """
+    True when HEAD holds an unpublished claim of this writer whose annulment
+    is not in HEAD, so that pushing HEAD as it is would publish the claim.
+    """
+    head_ids = {event["id"] for event in head_raw}
+    remote_ids = {event["id"] for event in remote_raw}
+    claims = {
+        event["id"] for event in events
+        if event["type"] == "item.claimed"
+        and event["id"] in head_ids - remote_ids
+        and _same_writer(event, actor)
+    }
+    return any(
+        event["type"] == "event.annulled"
+        and event["payload"].get("target_id") in claims
+        and event["id"] not in head_ids
+        and _same_writer(event, actor)
+        for event in events
+    )
 
 
 def _next_seq(events: list[dict]) -> int:
@@ -653,7 +870,7 @@ def _commit_message(event_type: str, item_id: str) -> str:
     """
     The commit subject every sync commit carries.
 
-    A repository-level event names no item (ADR-007's expiry policy is the
+    A repository-level event names no item (the claim expiry policy is the
     first of them), so its subject is the event type alone rather than the
     type followed by nothing.
     """
@@ -690,13 +907,19 @@ def _projection_bytes(ergon_dir: str) -> dict[str, bytes]:
 
 
 def _regenerate_after_pull(
-    git, repo_root: str, ergon_dir: str, shard_path: str, merged: GitResult, message: str
+    git,
+    repo_root: str,
+    ergon_dir: str,
+    shard_path: str,
+    merged: GitResult,
+    message: str,
+    annul_waiting: Callable[[], bool],
 ) -> str:
     """
     Bring the generated Markdown back in line with the merged log, and
     commit it, before the next push attempt.
 
-    ADR-002 owns the rule: board.md and items/*.md are regenerated from the
+    board.md and items/*.md are regenerated from the
     merged log and never merged, by hand or by a driver. That is how a
     conflict in them is resolved, and staging the regenerated files also
     concludes a merge they conflicted in. It runs whether or not git
@@ -706,6 +929,10 @@ def _regenerate_after_pull(
     A merge that conflicted anywhere else is left for git to refuse: the
     commit fails, and its own words become the obstacle returned here. An
     empty string means there is nothing standing in the way.
+
+    annul_waiting runs once the merge is in the working tree, because an
+    uncommitted shard could stop the merge itself; it answers whether it
+    appended anything, which is then committed whatever the projection says.
     """
     # A merge git refused before starting leaves no MERGE_HEAD: nothing was
     # merged, and the work staged beside the tracker files must not be
@@ -716,8 +943,9 @@ def _regenerate_after_pull(
     if not merged.ok and not concluding:
         return merged.output() or "git merge failed"
     before = _projection_bytes(ergon_dir)
+    appended = annul_waiting()
     regenerate(repo_root)
-    if merged.ok and _projection_bytes(ergon_dir) == before:
+    if merged.ok and not appended and _projection_bytes(ergon_dir) == before:
         return ""
     _phase, committed = _commit(
         git,
@@ -730,13 +958,30 @@ def _regenerate_after_pull(
     return "" if committed.ok else committed.output()
 
 
-def _fold_warnings(state: dict) -> list[str]:
-    """Warnings the union fold raised, so they reach the operator."""
+def _fold_warnings(state: dict, own_event: dict | None = None) -> list[str]:
+    """
+    Warnings the union fold raised, so they reach the operator.
+
+    A settled claim conflict is told only to the command whose own event was
+    superseded; the views list every one.
+    """
     warnings = state.get("report", {}).get("warnings", [])
-    return [f"pinax: {warning}" for warning in warnings]
+    own = (
+        f"(event {own_event['id'][:12]}...) superseded by"
+        if own_event is not None
+        else None
+    )
+    return [
+        f"pinax: {warning}"
+        for warning in warnings
+        if not warning.startswith("claim.superseded:")
+        or (own is not None and own in warning)
+    ]
 
 
-def _note_fold_warnings(notes: list[str], state: dict) -> None:
+def _note_fold_warnings(
+    notes: list[str], state: dict, own_event: dict | None = None
+) -> None:
     """
     Put this fold's warnings in front of the operator, each line once.
 
@@ -747,9 +992,41 @@ def _note_fold_warnings(notes: list[str], state: dict) -> None:
     operator once per fold, which reads as several findings rather than
     one.
     """
-    for warning in _fold_warnings(state):
+    for warning in _fold_warnings(state, own_event):
         if warning not in notes:
             notes.append(warning)
+
+
+def _final_annulment_message(
+    event_type: str, payload: dict, events: list[dict]
+) -> str | None:
+    """
+    None when the event may be appended; otherwise the refusal of an
+    annulment whose target is one _annul_own_event or _annul_waiting wrote.
+
+    Undoing that one would bring back a claim that was never published. The
+    log marks it only by its fixed reason, its writer being the writer of
+    the event it names, and that event being a claim. A target missing from
+    the pool may still arrive, so it does not lift the refusal.
+    """
+    if event_type != "event.annulled":
+        return None
+    by_id = {event.get("id"): event for event in events}
+    named = by_id.get(payload.get("target_id"))
+    if named is None or not valid_annulment(named):
+        return None
+    if named["payload"]["reason"] != _ANNUL_REASON:
+        return None
+    claim = by_id.get(named["payload"]["target_id"])
+    if claim is not None and (
+        claim.get("type") != "item.claimed" or not _same_writer(claim, named["actor"])
+    ):
+        return None
+    return (
+        f"pinax: event {named['id']} is the annulment a rejected claim wrote for "
+        "itself and cannot be annulled, because its claim was never published, "
+        "so nothing was appended"
+    )
 
 
 def _annul_own_event(repo_root: str, event: dict, actor: str, record: dict) -> None:
@@ -828,6 +1105,47 @@ def _unreadable_outcome(
     )
 
 
+def _damaged_outcome(
+    error: DamagedLogLine,
+    report_base: dict,
+    *,
+    appended: bool,
+    committed: bool = False,
+    notes: list[str] | None = None,
+    event: dict | None = None,
+    shard_path: str | None = None,
+    remote_branch: str | None = None,
+    state: dict | None = None,
+    push_accepted: bool = False,
+) -> SyncOutcome:
+    """The outcome for a log that holds a damaged line."""
+    exit_code = _exit_code(LOG_DAMAGED, False)
+    message = str(error)
+    return SyncOutcome(
+        status=LOG_DAMAGED,
+        exit_code=exit_code,
+        report=dict(
+            report_base,
+            status=LOG_DAMAGED,
+            remote_branch=remote_branch,
+            appended=appended,
+            committed=committed,
+            pushed=push_accepted,
+            exit_code=exit_code,
+            error=message,
+            file=error.file,
+            line=error.line,
+            message=message,
+        ),
+        notes=list(notes or []) + [message],
+        event=event,
+        shard_path=shard_path,
+        remote_branch=remote_branch,
+        state=state if state is not None else {},
+        push_accepted=push_accepted,
+    )
+
+
 def run_sequence(
     repo_root: str,
     *,
@@ -838,6 +1156,7 @@ def run_sequence(
     item_id: str,
     requires_remote: bool = False,
     guard_clock: bool = False,
+    guard_holder: bool = False,
     offline: bool = False,
     policy_check: Callable[[dict], str | None] | None = None,
     follow_on: Sequence[tuple[str, dict]] = (),
@@ -868,6 +1187,14 @@ def run_sequence(
     minted, when its intended timestamp is earlier than the newest live
     event on the remote by more than the clock tolerance. Only claim asks
     for it, because only a claim asserts ownership from a moment in time.
+
+    guard_holder marks a claim. First every waiting claim of this writer on
+    item_id is annulled, and the report names those in "annulled". When the
+    pre-append union fold then shows a live claim by another writer on
+    item_id, the command ends with exit 3 and status claim_held, before the
+    clock rule and with no claim minted. When the live claim is this
+    writer's own it is published, and the command ends with status
+    already_claimed and exit 0. The outcome's event is then that claim.
 
     offline is the caller's --offline flag. Offline mode also applies when
     the PINAX_OFFLINE=1 environment variable is set (checked here, in this
@@ -917,6 +1244,7 @@ def run_sequence(
         item_id=item_id,
         requires_remote=requires_remote,
         guard_clock=guard_clock,
+        guard_holder=guard_holder,
         offline=offline,
         policy_check=policy_check,
         follow_on=tuple(follow_on),
@@ -939,6 +1267,7 @@ def _run_sequence(
     item_id: str,
     requires_remote: bool,
     guard_clock: bool,
+    guard_holder: bool,
     offline: bool,
     policy_check: Callable[[dict], str | None] | None,
     follow_on: tuple[tuple[str, dict], ...],
@@ -1086,6 +1415,12 @@ def _run_sequence(
         return _unreadable_outcome(
             exc, report_base, appended=False, requires_remote=requires_remote
         )
+    except DamagedLogLine as exc:
+        # Only the refusal: the notes gathered so far describe how an event
+        # would have been recorded, and none is.
+        return _damaged_outcome(
+            exc, report_base, appended=False, remote_branch=remote_branch
+        )
     _note_fold_warnings(notes, state)
 
     # The target rule, on the pre-append union fold and before anything is
@@ -1120,6 +1455,25 @@ def _run_sequence(
             state=state,
         )
 
+    final = _final_annulment_message(event_type, payload, events)
+    if final is not None:
+        return SyncOutcome(
+            status=FINAL_ANNULMENT,
+            exit_code=_exit_code(FINAL_ANNULMENT, requires_remote),
+            report=dict(
+                report_base,
+                status=FINAL_ANNULMENT,
+                remote_branch=remote_branch,
+                appended=False,
+                committed=False,
+                pushed=False,
+                message=final,
+            ),
+            notes=[final + "."],
+            remote_branch=remote_branch,
+            state=state,
+        )
+
     # The command's policy rule, on the same pre-append union fold and
     # before anything is minted.
     refusal = policy_check(state) if policy_check is not None else None
@@ -1141,6 +1495,78 @@ def _run_sequence(
             state=state,
         )
 
+    # A waiting claim's time can be hours old, so publishing it could take the
+    # item from a writer who claimed and started since.
+    annulled_note = ""
+    if guard_holder:
+        waiting = [
+            claim for claim in _waiting_claims(events, remote_raw, actor, minted)
+            if claim["payload"]["item_id"] == item_id
+        ]
+        if waiting:
+            annulments = _annul_waiting(log_dir, actor, ts, waiting, events)
+            regenerate(repo_root)
+            events = sorted([*events, *annulments], key=_sort_key)
+            state = fold_events(events)
+            holder = _live_claim(events, state, item_id, ts)
+            if holder is not None and (
+                _same_writer(holder, actor)
+                or holder["id"] not in {event["id"] for event in remote_raw}
+            ):
+                holder = None
+            lines = [
+                _held_on_remote_note(claim, holder) if holder is not None else (
+                    f"pinax: the waiting claim {claim['id']} on {item_id} was "
+                    "annulled, because pinax claim does not publish a waiting claim"
+                )
+                for claim in waiting
+            ]
+            notes.extend(lines)
+            ids = [claim["id"] for claim in waiting]
+            annulled_note = "; the waiting claim " + ", ".join(ids) + " was annulled"
+            report_base["annulled"] = {
+                "target_id": ids[0],
+                "target_ids": ids,
+                "reason": _ANNUL_REASON,
+                "item_id": item_id,
+                "output": "\n".join(lines),
+            }
+    nothing = "no claim" if annulled_note else "nothing"
+
+    # The holder rule, on the same pre-append union fold. It must precede
+    # the clock rule: a claim timed inside the tolerance but before a
+    # published holder's would otherwise displace that holder.
+    held = _live_claim(events, state, item_id, ts) if guard_holder else None
+    if held is not None and normalise_actor(held["actor"]) != normalise_actor(actor):
+        summary = (
+            f"item {item_id} is already claimed by {held['actor']} since "
+            f"{held['ts']}, so {nothing} was appended{annulled_note}"
+        )
+        notes.append("pinax: " + summary + ".")
+        return SyncOutcome(
+            status=CLAIM_HELD,
+            exit_code=_exit_code(CLAIM_HELD, requires_remote),
+            report=dict(
+                report_base,
+                status=CLAIM_HELD,
+                remote_branch=remote_branch,
+                appended=False,
+                committed=False,
+                pushed=False,
+                holder_actor=held["actor"],
+                holder_event_id=held["id"],
+                claimed_at=held["ts"],
+                message=summary,
+            ),
+            notes=notes,
+            remote_branch=remote_branch,
+            state=state,
+        )
+    if held is not None:
+        def already_recorded(folded: dict) -> bool:
+            item = folded.get("items", {}).get(item_id, {})
+            return item.get("claim_event_id") == held["id"]
+
     # The repeat rule, on the same pre-append union fold and before
     # anything is minted. A repeat delivers the existing record through the
     # same commit and push half a fresh event runs.
@@ -1153,20 +1579,22 @@ def _run_sequence(
             appended=False,
         )
         if remote_raw and already_recorded(fold_events(finalise_events(list(remote_raw)))):
+            status = ALREADY_PUBLISHED if held is None else ALREADY_CLAIMED
             return SyncOutcome(
-                status=ALREADY_PUBLISHED,
-                exit_code=_exit_code(ALREADY_PUBLISHED, requires_remote),
+                status=status,
+                exit_code=_exit_code(status, requires_remote),
                 report=dict(
                     repeat_base,
-                    status=ALREADY_PUBLISHED,
+                    status=status,
                     committed=True,
                     pushed=False,
                     message=(
-                        f"{remote_branch} already records this, so nothing was "
-                        "appended, committed or pushed"
+                        f"{remote_branch} already records this, so {nothing} was "
+                        f"appended, committed or pushed{annulled_note}"
                     ),
                 ),
-                notes=_fold_warnings(state),
+                notes=notes if annulled_note else _fold_warnings(state),
+                event=held,
                 remote_branch=remote_branch,
                 state=state,
             )
@@ -1178,10 +1606,16 @@ def _run_sequence(
                 return _unreadable_outcome(
                     exc, repeat_base, appended=False, requires_remote=requires_remote
                 )
+            except DamagedLogLine as exc:
+                return _damaged_outcome(
+                    exc, repeat_base, appended=False, remote_branch=remote_branch
+                )
             committed_fold = fold_events(
                 finalise_events(list(head_raw or []) + list(remote_raw))
             )
-            commit_needed = not already_recorded(committed_fold)
+            commit_needed = not already_recorded(
+                committed_fold
+            ) or _head_lacks_an_annulment(events, remote_raw, head_raw or [], actor)
         return _deliver(
             git,
             repo_root=repo_root,
@@ -1201,7 +1635,12 @@ def _run_sequence(
             requires_remote=requires_remote,
             item_id=item_id,
             actor=actor,
+            ts=ts,
+            events=events,
+            remote_raw=remote_raw,
+            minted=minted,
             commit_needed=commit_needed,
+            held=held,
         )
 
     # The clock rule, on the pre-append fold and before anything is minted:
@@ -1215,7 +1654,7 @@ def _run_sequence(
         summary = (
             f"the timestamp {behind['intended_ts']!r} this command minted is "
             f"not written as {_TS_FORMAT}, so it cannot be compared with "
-            "published history and nothing was appended"
+            f"published history and {nothing} was appended{annulled_note}"
         )
         notes.append("pinax: " + summary + ".")
         return SyncOutcome(
@@ -1251,8 +1690,8 @@ def _run_sequence(
             f"{behind['behind_s']:g} seconds behind the newest published "
             f"event {behind['remote_newest_ts']} from "
             f"{behind['offending_actor']}, more than the "
-            f"{behind['tolerance_s']:g} second tolerance, so nothing was "
-            "appended"
+            f"{behind['tolerance_s']:g} second tolerance, so {nothing} was "
+            f"appended{annulled_note}"
         )
         if behind["tolerance_note"]:
             notes.append(behind["tolerance_note"])
@@ -1317,7 +1756,7 @@ def _run_sequence(
     if follow_on:
         report_base["follow_on_event_ids"] = [e["id"] for e in minted[1:]]
 
-    return _deliver(
+    outcome = _deliver(
         git,
         repo_root=repo_root,
         ergon_dir=ergon_dir,
@@ -1336,7 +1775,14 @@ def _run_sequence(
         requires_remote=requires_remote,
         item_id=item_id,
         actor=actor,
+        ts=ts,
+        events=events,
+        remote_raw=remote_raw,
+        minted=minted,
+        claiming=guard_holder,
     )
+    outcome.union_events = events
+    return outcome
 
 
 def _ahead_of_remote(git, remote_ref: str) -> bool:
@@ -1370,7 +1816,13 @@ def _deliver(
     requires_remote: bool,
     item_id: str,
     actor: str,
+    ts: str,
+    events: list[dict],
+    remote_raw: list[dict],
+    minted: list[dict],
     commit_needed: bool = True,
+    claiming: bool = False,
+    held: dict | None = None,
 ) -> SyncOutcome:
     """
     The commit and push half of the sequence, for events already in the
@@ -1379,8 +1831,13 @@ def _deliver(
     event is the first event this run minted, or None for a repeat that
     delivers events an earlier run appended. A repeat passes
     commit_needed=False when HEAD already holds them, and is pushed only
-    when HEAD holds commits the remote default branch lacks.
+    when HEAD holds commits the remote default branch lacks. held is the
+    live claim a repeated claim found; the confirming fold decides its end
+    as it does a fresh claim's, which claiming marks. events and remote_raw
+    are the fold the events were appended after, and minted is what this run
+    appended to it.
     """
+    own_event = event if event is not None else held
     repeat = event is None
     subject = "the recorded event" if repeat else "the event"
     event_label = (
@@ -1409,6 +1866,25 @@ def _deliver(
             remote_branch=None,
             state=state,
         )
+
+    def annul_waiting(union: list[dict], remote: list[dict]) -> bool:
+        seen = {recorded["id"] for recorded in union}
+        pool = [*union, *(new for new in minted if new["id"] not in seen)]
+        pairs = _claims_held_by_others(pool, remote, actor, minted)
+        if not pairs:
+            return False
+        _annul_waiting(log_dir, actor, ts, [claim for claim, _ in pairs], pool)
+        notes.extend(_held_on_remote_note(claim, holder) for claim, holder in pairs)
+        return True
+
+    if remote_branch is not None:
+        # HEAD cannot be resolved before the branch's first commit, and the
+        # commit below would make it pushable.
+        head = git.run("rev-parse", "--abbrev-ref", "HEAD")
+        pushable = not head.ok or head.stdout.strip() == remote_branch
+        if pushable and annul_waiting(events, remote_raw):
+            regenerate(repo_root)
+            commit_needed = True
 
     if commit_needed:
         if repeat:
@@ -1562,19 +2038,61 @@ def _deliver(
                     state=state,
                     push_accepted=True,
                 )
-            _note_fold_warnings(notes, state)
-            superseded = _superseded_by(state, event) if event is not None else None
-            if superseded is not None:
-                summary = (
-                    f"the claim on {item_id} is superseded by an earlier claim "
-                    f"from {superseded.get('winner_actor')}, so the item is not "
-                    "owned by this actor"
-                )
+            except DamagedLogLine as exc:
                 notes.append(
-                    "pinax: " + summary + "; the winning event is "
-                    f"{superseded.get('winner_event_id')} and this claim stays "
-                    "in the log, published and superseded."
+                    f"pinax: {subject} is committed and published on {remote_branch}."
                 )
+                return _damaged_outcome(
+                    exc,
+                    report_base,
+                    appended=not repeat,
+                    committed=True,
+                    notes=notes,
+                    event=event,
+                    shard_path=shard_path,
+                    remote_branch=remote_branch,
+                    state=state,
+                    push_accepted=True,
+                )
+            _note_fold_warnings(notes, state, own_event)
+            superseded = (
+                _claim_not_holding(state, item_id, own_event)
+                if claiming or held is not None
+                else None
+            )
+            if superseded is not None:
+                winner = superseded["winner_actor"]
+                if not winner:
+                    summary = (
+                        f"the claim on {item_id} has already ended and nobody "
+                        "holds the item, so the item is not owned by this actor"
+                    )
+                    ending = "; this claim stays in the log, published and ended."
+                elif normalise_actor(winner) == normalise_actor(actor):
+                    summary = (
+                        f"the claim on {item_id} does not hold it, because another "
+                        f"claim by {winner} already does"
+                    )
+                    ending = (
+                        f"; that claim is {superseded['winner_event_id']} and "
+                        "this claim stays in the log, published."
+                    )
+                else:
+                    earlier = (
+                        "an earlier claim"
+                        if _superseded_by(state, own_event) is not None
+                        else "a claim"
+                    )
+                    summary = (
+                        f"the claim on {item_id} is superseded by {earlier} "
+                        f"from {winner}, so the item is not "
+                        "owned by this actor"
+                    )
+                    ending = (
+                        f"; the winning event is {superseded['winner_event_id']} "
+                        "and this claim stays in the log, published and superseded."
+                    )
+                notes.append("pinax: " + summary + ending)
                 return SyncOutcome(
                     status=CLAIM_SUPERSEDED,
                     exit_code=_exit_code(CLAIM_SUPERSEDED, requires_remote),
@@ -1586,7 +2104,7 @@ def _deliver(
                         attempts=attempts,
                         winner_event_id=superseded.get("winner_event_id"),
                         winner_actor=superseded.get("winner_actor"),
-                        superseded_event_id=event["id"],
+                        superseded_event_id=own_event["id"],
                         superseded_actor=actor,
                         message=summary,
                     ),
@@ -1597,19 +2115,20 @@ def _deliver(
                     state=state,
                     push_accepted=True,
                 )
+            status = PUSHED if held is None else ALREADY_CLAIMED
             return SyncOutcome(
-                status=PUSHED,
-                exit_code=_exit_code(PUSHED, requires_remote),
+                status=status,
+                exit_code=_exit_code(status, requires_remote),
                 report=dict(
                     report_base,
-                    status=PUSHED,
+                    status=status,
                     committed=True,
                     pushed=True,
                     attempts=attempts,
                     message=f"{subject} is committed and published on {remote_branch}",
                 ),
                 notes=notes,
-                event=event,
+                event=own_event,
                 shard_path=shard_path,
                 remote_branch=remote_branch,
                 state=state,
@@ -1624,22 +2143,8 @@ def _deliver(
         if not refreshed.ok:
             obstacle = refreshed.output()
             break
-        merged = git.run("merge", "--no-edit", "FETCH_HEAD")
-        # The generated Markdown is brought back in line with the merged log
-        # and committed before the next attempt, which is also how a conflict
-        # in it is resolved (ADR-002). A conflict anywhere else stops here in
-        # git's own words.
-        blocked = _regenerate_after_pull(
-            git,
-            repo_root,
-            ergon_dir,
-            shard_path,
-            merged,
-            _pull_commit_message(remote_branch),
-        )
-        if blocked:
-            obstacle = blocked
-            break
+        # The union is the log the merge would leave. Folding it first keeps a
+        # damaged remote line from being merged in here.
         try:
             events, state, remote_raw = _union_fold(log_dir, git, remote_ref)
         except RemoteReadError as exc:
@@ -1655,7 +2160,37 @@ def _deliver(
                 remote_branch=remote_branch,
                 state=state,
             )
-        _note_fold_warnings(notes, state)
+        except DamagedLogLine as exc:
+            notes.append(f"pinax: {subject} is committed locally and not published.")
+            return _damaged_outcome(
+                exc,
+                report_base,
+                appended=not repeat,
+                committed=True,
+                notes=notes,
+                event=event,
+                shard_path=shard_path,
+                remote_branch=remote_branch,
+                state=state,
+            )
+        _note_fold_warnings(notes, state, own_event)
+        merged = git.run("merge", "--no-edit", "FETCH_HEAD")
+        # The generated Markdown is brought back in line with the merged log
+        # and committed before the next attempt, which is also how a conflict
+        # in it is resolved. A conflict anywhere else stops here in
+        # git's own words.
+        blocked = _regenerate_after_pull(
+            git,
+            repo_root,
+            ergon_dir,
+            shard_path,
+            merged,
+            _pull_commit_message(remote_branch),
+            lambda: annul_waiting(events, remote_raw),
+        )
+        if blocked:
+            obstacle = blocked
+            break
 
     remote_head = git.run("rev-parse", remote_ref)
     report = dict(
@@ -1671,6 +2206,9 @@ def _deliver(
     if requires_remote and event is not None:
         annulment = {
             "target_id": event["id"],
+            "target_ids": [
+                *report_base.get("annulled", {}).get("target_ids", []), event["id"],
+            ],
             "reason": _ANNUL_REASON,
             "item_id": item_id,
             "output": "",

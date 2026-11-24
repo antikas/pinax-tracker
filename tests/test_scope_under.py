@@ -7,7 +7,7 @@ Covers:
    the scope; a blocks edge crossing the scope boundary still gates
    readiness (the full graph is still evaluated, only the final candidate
    set is restricted); an unknown ancestor raises ValueError.
-3. A live claim (a reconciled item.claimed, ADR-003) makes an item
+3. A live claim (a reconciled item.claimed) makes an item
    ineligible for ready/next everywhere, independent of `under` and
    independent of the item's status field -- a claim and a status change
    are two different events.

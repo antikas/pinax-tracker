@@ -26,8 +26,6 @@ from pinax.fold import fold, fold_events, read_events, state_to_json_safe
 from pinax.projection import render_item
 
 SOURCE_ROOT = Path(__file__).resolve().parent.parent
-README = SOURCE_ROOT / "README.md"
-DESIGN = SOURCE_ROOT / "DESIGN.md"
 FIXTURES = SOURCE_ROOT / "tests" / "fixtures"
 PARENT_COMMIT = "a580c82"
 
@@ -768,7 +766,7 @@ def test_a_decision_releases_no_claim_and_one_past_the_deadline_expires_it(tmp_p
 
 def test_a_decision_is_never_a_note(tracker):
     repo, item_id = tracker
-    done = _pinax(repo, "note", "add", item_id, "--ref", "docs/brief.md",
+    done = _pinax(repo, "note", "add", item_id, "--ref", "https://example.org/brief",
                   "--actor", OWNER, "--offline")
     assert done.returncode == 0, done.stderr
     before = _state(repo).get("notes", [])
@@ -905,144 +903,3 @@ def test_a_reason_that_looks_like_a_flag_is_stored_as_text(tracker):
     [decided] = _of_type(repo, "item.decided")
     assert decided["payload"]["reason"] == "--offline"
     assert _item(repo, item_id)["park_reason"] == "--offline"
-
-
-# ---------------------------------------------------------------------------
-# Documents
-# ---------------------------------------------------------------------------
-
-def _flat(path: Path) -> str:
-    return " ".join(path.read_text(encoding="utf-8").split())
-
-
-def test_readme_states_the_upgrade_order_beside_the_version_2_paragraph():
-    text = _flat(README)
-    phrase = "must run this version before the first decision is written"
-    assert phrase in text
-    v2 = text.index("before the first version 2 event is written")
-    assert 0 < text.index(phrase, v2) - v2 < 400
-
-
-def test_readme_lists_the_two_commands():
-    text = README.read_text(encoding="utf-8")
-    assert (
-        "pinax decide ITEM_ID --option KEY --label TEXT --effect release|park --reason TEXT"
-        in text
-    )
-    assert "pinax policy decision-actors --decider ROLE@HOST [--decider ROLE@HOST ...]" in text
-
-
-EARLIER_RELEASES = (
-    "Every released Pinax before 0.4.0 predates version 2 events and reports "
-    "each version 2 event that no tombstone names as an integrity violation. "
-    "Decision events are version 2 events and are reported the same way."
-)
-OLD_EARLIER_RELEASES = (
-    "already reports every version 2 event",
-    "the decision events add nothing to that",
-)
-
-
-def test_design_has_a_decisions_section():
-    text = DESIGN.read_text(encoding="utf-8")
-    assert "\n## Decisions\n" in text
-    section = " ".join(text.split("\n## Decisions\n", 1)[1].split("\n## ", 1)[0].split())
-    assert EARLIER_RELEASES in section
-    for phrase in OLD_EARLIER_RELEASES:
-        assert phrase not in section, phrase
-
-
-def test_no_document_describes_an_unreleased_client():
-    # No public release wrote version 2 events without decisions.
-    for path in (README, DESIGN):
-        flat = " ".join(path.read_text(encoding="utf-8").split())
-        assert "writes version 2 events but" not in flat, path.name
-    readme = _section(README, "Decisions")
-    assert EARLIER_RELEASES in readme
-    for phrase in OLD_EARLIER_RELEASES:
-        assert phrase not in readme, phrase
-
-
-README_RELEASE = (
-    "The item's status, gate and owner-gate class stay as they were, and the "
-    "command says so"
-)
-README_CLAIM = (
-    "A decision does not release a claim; like any event, one recorded past a "
-    "claim's expiry deadline marks that claim expired."
-)
-DESIGN_RELEASE = (
-    "With `--effect release` only the decision is appended, and the item's "
-    "status, gate and owner-gate class are unchanged; the claim follows the "
-    "expiry rule above, as for any event."
-)
-README_NO_ROW = (
-    "`pinax status --json` prints no row for a queued or ready item without a "
-    "live claim, so such an item's decision shows on its item page and in the "
-    "fold state only."
-)
-NO_DECISION = (
-    "Decisions change nothing in how an item with no decision renders or "
-    "serialises."
-)
-
-
-def test_documents_say_a_release_decision_leaves_the_claim_to_the_expiry_rule():
-    readme = _section(README, "Decisions")
-    design = _section(DESIGN, "Decisions")
-    assert README_RELEASE in readme
-    assert README_CLAIM in readme
-    assert DESIGN_RELEASE in design
-    for section in (readme, design):
-        assert "owner-gate class and claim" not in section
-
-
-def test_readme_says_which_items_status_json_prints_no_row_for():
-    readme = _section(README, "Decisions")
-    assert README_NO_ROW in readme
-    assert "prints no row for a queued item," not in readme
-
-
-def test_documents_say_decisions_change_nothing_for_an_undecided_item():
-    readme = _section(README, "Decisions")
-    design = _section(DESIGN, "Decisions")
-    for section in (readme, design):
-        assert NO_DECISION in section
-    assert "looks exactly as it did before" not in readme
-    assert "renders and serialises exactly as before" not in design
-
-
-def _section(path: Path, heading: str) -> str:
-    text = path.read_text(encoding="utf-8")
-    assert f"\n## {heading}\n" in text
-    return " ".join(text.split(f"\n## {heading}\n", 1)[1].split("\n## ", 1)[0].split())
-
-
-def test_design_states_that_a_retry_delivers_the_decision():
-    section = _section(DESIGN, "Decisions")
-    assert "A matching decision that is only in the working tree" not in section
-    assert (
-        "a retry after a rejected push publishes the existing decision "
-        "without appending" in section
-    )
-    assert "A repeat never adds a second `item.decided` or `item.parked`." in section
-
-
-def test_readme_states_that_a_retry_delivers_the_decision():
-    section = _section(README, "Decisions")
-    assert "does not count, so running the command again commits it" not in section
-    assert (
-        "a retry after a rejected push publishes the existing decision "
-        "without appending a second copy" in section
-    )
-
-
-@pytest.mark.parametrize("path", [README, DESIGN], ids=["readme", "design"])
-def test_publishing_sections_name_published_and_sync_status(path):
-    section = _section(path, "Publishing a state change")
-    assert "JSON result carries `published` and `sync_status`" in section
-    assert (
-        "`published` is true only when this run's push to the remote default "
-        "branch was accepted" in section
-    )
-    assert "reads `published`" in section

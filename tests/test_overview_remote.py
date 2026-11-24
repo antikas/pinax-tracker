@@ -190,6 +190,23 @@ class TestRemoteFoldRealGit:
         r = _pinax_ok(self.hub, "overview", "--remote", "--json")
         return json.loads(r.stdout)
 
+    def test_a_damaged_line_in_the_hubs_own_log_refuses(self):
+        shard = os.path.join(self.hub, ".ergon", "log", "operator-example.test.jsonl")
+        with open(shard, "ab") as fh:
+            fh.write(b"[1, 2, 3]\n")
+        with open(shard, "rb") as fh:
+            line = len(fh.read().splitlines())
+
+        r = _pinax(self.hub, "overview", "--remote")
+
+        assert r.returncode == 9
+        assert r.stdout == ""
+        assert r.stderr == (
+            "pinax: the event log is damaged: .ergon/log/operator-example.test.jsonl "
+            f"line {line}: the line is a JSON array, not an object. "
+            "Run 'pinax verify' to list every damaged line.\n"
+        )
+
     def test_two_remotes_folded_with_correct_counts_and_shas(self):
         payload = self._remote_json()
         by_id = {rep["id"]: rep for rep in payload["repos"]}
@@ -218,7 +235,7 @@ class TestRemoteFoldRealGit:
         in this view — committed-but-unpushed work is invisible BY DESIGN
         (git's own publish contract), and appears exactly on push."""
         # No follow-up commit here: 'add' already commits itself through the
-        # publish sequence (pinax/sync.py, ADR-006). proj_a carries no
+        # publish sequence (pinax/sync.py). proj_a carries no
         # 'origin' remote (only a direct URL push to bare_a in setup_method),
         # so the sequence commits the event locally and does not push,
         # leaving exactly the committed-but-unpushed state this test's

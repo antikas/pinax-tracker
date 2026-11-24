@@ -761,7 +761,7 @@ def test_a_projection_conflict_in_the_pull_is_resolved_by_regeneration(repo):
     """
     A pull that conflicts in the generated Markdown does not stop the
     retry. The projection is regenerated from the merged log and committed,
-    which is also what resolves the conflict (ADR-002), and the next push
+    which is also what resolves the conflict, and the next push
     carries it. A conflict anywhere else is git's to refuse; that case is
     covered in tests/test_sync_bare_hub.py.
     """
@@ -899,7 +899,7 @@ def test_no_history_rewrite_command_anywhere_in_pinax():
     Nothing under pinax/ can re-apply commits onto a new base, overwrite a
     remote branch, discard a commit, rewrite one, or delete a branch or a
     remote ref. The log is append-only and published history is never
-    rewritten (ADR-001).
+    rewritten.
 
     Strength of this gate: it is a per-line pattern check over the source
     text, so it catches the literal forms a change would normally
@@ -926,7 +926,7 @@ def test_the_rewrite_scan_lets_only_the_state_directory_names_through(line, hit)
 def test_no_clock_read_in_the_fold_path():
     """
     The fold and the sequence's fold path are pure functions of the events
-    they read (ADR-001). A command still mints its event timestamp; that is
+    they read. A command still mints its event timestamp; that is
     the caller's job and stays in the command.
 
     Same strength and same blind spot as the gate above: it reads the source
@@ -1042,7 +1042,7 @@ def test_dep_rm_runs_the_sequence_once_with_its_own_subject(repo):
 def test_note_add_runs_the_sequence_once_with_its_own_subject(repo):
     git = FakeGit(remote_events=[])
 
-    note_run(repo, ITEM_ID, "docs/example.md", None, actor=ACTOR, runner=git)
+    note_run(repo, ITEM_ID, "https://example.org/example", None, actor=ACTOR, runner=git)
 
     assert ("commit", "-m", f"pinax: note.added {ITEM_ID}") in git.calls
     assert git.named("push")

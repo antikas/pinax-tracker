@@ -146,8 +146,8 @@ def _build_fixture(tmpdir: str):
     _init_ergon(repo, actor="operator@example.test")
 
     # No follow-up commit here: 'add' runs the publish sequence
-    # (pinax/sync.py), which commits the shard and the projection itself
-    # (ADR-006); the working tree is already clean by the time it returns.
+    # (pinax/sync.py), which commits the shard and the projection itself;
+    # the working tree is already clean by the time it returns.
     _pinax(repo, "add", "--title", "Alpha", "--prefix", "pnx", "--actor", "operator@example.test")
     _git(repo, "tag", "replay-c1")
     c1_sha = _head_sha(repo)
@@ -447,5 +447,29 @@ def test_replay_at_ref_matches_canonical_golden_fixture():
         cli_full = _pinax(repo, "replay", "--at", "golden-full", "--json")
         assert json.loads(cli_k3.stdout)["state"] == golden_state_k3
         assert json.loads(cli_full.stdout)["state"] == golden_state_full
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@requires_git
+def test_replay_before_and_after_an_annulment_is_annulled():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        repo = _make_git_repo(tmpdir)
+        _init_ergon(repo, actor="operator@laptop")
+        added = json.loads(_pinax(repo, "add", "--title", "Alpha", "--prefix", "pnx", "--json").stdout)
+        first = json.loads(
+            _pinax(repo, "annul", added["event_id"], "--reason", "mistake", "--json").stdout
+        )
+        before = _head_sha(repo)
+        _pinax(repo, "annul", first["event_id"], "--reason", "undo")
+        after = _head_sha(repo)
+
+        def items_at(sha: str) -> set:
+            shown = _pinax(repo, "replay", "--at", sha, "--json")
+            return set(json.loads(shown.stdout)["state"].get("items", {}))
+
+        assert items_at(before) == set()
+        assert items_at(after) == {added["item_id"]}
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

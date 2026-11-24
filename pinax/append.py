@@ -1,7 +1,7 @@
 """
 pinax.append — locked, LF-normalised append to a JSONL shard.
 
-ADR-001 / ADR-002 compliance:
+Append rules:
 - Append a single line + LF under an OS file lock.
 - msvcrt.locking on Windows (os.name == 'nt'); fcntl.flock on POSIX — both stdlib.
 - LF-normalised: the stored line always uses LF, regardless of platform autocrlf.
@@ -19,42 +19,52 @@ Shard key:
 
 from __future__ import annotations
 
+import json
 import os
-import re
 import sys
 import tempfile
 
-from .event import parse_line, serialise
+from .event import MAX_SEQ, parse_line, serialise
+
+
+_TEST_RUN_ENV_VAR = "PINAX_TEST_RUN"
 
 
 class AppendLeakGuardError(RuntimeError):
     """
-    Raised by append_event when an event looks like a test/fixture or
-    foreign-project leak being appended into a real, non-isolated log
-    directory. The guard rejects clear fixture markers only in persistent
-    logs. Isolated temporary directories remain available for hermetic tests.
+    Raised by append_event during a test run (PINAX_TEST_RUN is 1) for a log
+    that does not resolve inside the temporary directory. Its text is the
+    whole message a command prints.
     """
 
 
-# Pinax IDs are always <lowercase-prefix>-<lowercase base32 hash>. By contrast,
-# an external ticket tracker's scheme uses an uppercase prefix, a dash, then
-# plain digits (e.g. "T-001", "CASE-156"). An id of that shape is foreign to
-# Pinax, so an event that carries one is a leak from another project's tracker.
-_FOREIGN_ID_RE = re.compile(r"^[A-Z]{1,8}-\d+$")
+class UnwritableEventError(ValueError):
+    """
+    Raised by append_event for an event a log must not hold. Its text is the
+    whole message a command prints.
+    """
 
-# Payload keys across the type handlers (pinax/fold.py) that carry a
-# reference to another event/item's id.
-_ID_PAYLOAD_KEYS = (
-    "item_id", "target_id", "parent_id", "child_id",
-    "from_id", "to_id", "repo_id",
-)
+
+def _refuse_unwritable(event: dict) -> None:
+    try:
+        json.dumps(event, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        raise UnwritableEventError(
+            "pinax: the text given holds a character UTF-8 cannot encode "
+            "(a lone surrogate), so it was not appended"
+        ) from None
+    if event["seq"] > MAX_SEQ:
+        raise UnwritableEventError(
+            f"pinax: the log has used the largest sequence number, {MAX_SEQ}, "
+            "so nothing was appended"
+        )
 
 
 def _is_isolated_log_dir(log_dir: str) -> bool:
     """
     True if log_dir resolves inside the OS temp tree. Temporary directories
-    are isolated from persistent tracker logs, so fixture records are allowed
-    there without affecting a repository.
+    are isolated from persistent tracker logs, so a test run may write there
+    without affecting a repository.
 
     Anything NOT under the OS temp tree is treated as "a real, persistent
     log directory" for guard purposes — this covers both the actual
@@ -72,34 +82,6 @@ def _is_isolated_log_dir(log_dir: str) -> bool:
         # commonpath raises on e.g. mixed Windows drives — different
         # drives can never be "under" the same temp tree.
         return False
-
-
-def _test_leak_reason(event: dict, actor: str) -> str | None:
-    """
-    Return a short human-readable reason if `event`/`actor` matches an
-    obvious test-fixture or foreign-project marker pattern; None if clean.
-
-    Two independent signals, either sufficient on its own:
-      1. actor contains "test" (case-insensitive) — the general
-         test-fixture marker.
-      2. a payload id field (see _ID_PAYLOAD_KEYS) has the foreign
-         <UPPER>-<digits> ticket shape (see _FOREIGN_ID_RE) — the exact
-         shape of an unrelated ticket identifier such as "T-001".
-    """
-    if "test" in (actor or "").lower():
-        return f"actor {actor!r} contains a test marker"
-
-    payload = event.get("payload")
-    if isinstance(payload, dict):
-        for key in _ID_PAYLOAD_KEYS:
-            value = payload.get(key)
-            if isinstance(value, str) and _FOREIGN_ID_RE.match(value):
-                return (
-                    f"payload.{key}={value!r} has a foreign ticket-id shape "
-                    "(UPPER-prefix + digits), not this repo's own id scheme "
-                    "(lowercase-prefix + base32 hash, ADR-003)"
-                )
-    return None
 
 
 def _shard_name_for_actor(actor: str) -> str:
@@ -262,20 +244,15 @@ def append_event(log_dir: str, event: dict, actor: str | None = None) -> str:
     """
     _actor = actor if actor is not None else event.get("actor", "default")
 
-    # foreign-project-looking event into a real, non-isolated log
-    # directory.  Scoped off entirely inside the OS temp tree, so every
-    # hermetic test in this suite (all of which write to
-    # tempfile.mkdtemp()/tmp_path) is unaffected.
-    if not _is_isolated_log_dir(log_dir):
-        leak_reason = _test_leak_reason(event, _actor)
-        if leak_reason is not None:
-            raise AppendLeakGuardError(
-                "pinax: refusing to append a test/foreign-looking event into "
-                f"a live log directory ({log_dir}): {leak_reason}. If this is "
-                "genuinely intentional, write it into a directory under the "
-                "OS temp tree instead (tempfile.mkdtemp()/tmp_path) — that is "
-                "the isolated sandbox this guard exempts."
-            )
+    if os.environ.get(_TEST_RUN_ENV_VAR) == "1" and not _is_isolated_log_dir(log_dir):
+        raise AppendLeakGuardError(
+            f"pinax: refusing to write to {log_dir} during a test run "
+            f"({_TEST_RUN_ENV_VAR}=1): a test may write only to a log under "
+            f"{tempfile.gettempdir()}; unset {_TEST_RUN_ENV_VAR} to write to a "
+            "real tracker"
+        )
+
+    _refuse_unwritable(event)
 
     shard_path = shard_path_for_actor(log_dir, _actor)
 

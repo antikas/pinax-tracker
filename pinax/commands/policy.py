@@ -3,6 +3,7 @@ pinax policy claim-expiry --hours N [--actor ...] [--offline] [--json]
 pinax policy process --mode flow|strict [--actor ...] [--offline] [--json]
 pinax policy owner-gates --class TEXT [--class TEXT ...] [--actor ...] [--offline] [--json]
 pinax policy decision-actors --decider ROLE@HOST [--decider ROLE@HOST ...] [--actor ...] [--offline] [--json]
+pinax policy note-refs --prefix TEXT [--prefix TEXT ...] [--actor ...] [--offline] [--json]
 pinax policy check [--json]
 
 The setting commands each publish one repository-level event:
@@ -12,6 +13,9 @@ The setting commands each publish one repository-level event:
 - owner-gates: policy.owner_gate_classes_set, carrying the whole list.
 - decision-actors: policy.decision_actors_set, carrying the whole list of
   actors who may decide under strict. --actor stays the writer.
+- note-refs: policy.note_ref_prefixes_set, carrying the whole list of
+  prefixes a note reference may start with besides naming a file in the
+  repository or a web address.
 
 Each runs the publish sequence (pinax.sync) exactly as park and release
 do: mint the event, then fetch (unless offline), fold, append, commit and
@@ -20,14 +24,16 @@ anything; see pinax.sync for the exit codes and offline rules. Each event
 names no item, so its commit subject is the event type alone.
 
 A claim expiry applies to every claim from its own position in claim
-order onward (ADR-007): the policy in force for a claim is the last such
+order onward: the policy in force for a claim is the last such
 event at or before that claim, and twenty-four hours when the log carries
 none before it. Setting a policy today therefore never changes how a claim
 already folded on any machine.
 
 For the process and the class list, the last event of each in fold order
 is the one in force, with flow and the built-in class list when the log
-carries none (pinax.owner_gates owns the rule).
+carries none (pinax.owner_gates owns the rule). The prefix list follows
+the same order and is empty when the log carries none (pinax.commands.note
+owns the rule).
 
 check is read-only: it folds the local log and lists the blocked items for
 the owner that carry no valid owner-gate class, exiting 0 under flow and 1
@@ -36,7 +42,8 @@ under strict when it lists any.
 Refusals, before anything is minted: a claim expiry that is not a positive
 number of hours; a process that is neither flow nor strict; a class list
 that is empty, holds an empty class or names one class twice; a decider
-that is not role@host (exit 2). Nothing else
+that is not role@host (exit 2); a prefix list that is empty, holds an empty
+prefix or one with whitespace, or names one prefix twice. Nothing else
 is checked here - the fold reads the event and decides.
 """
 
@@ -51,7 +58,7 @@ from .. import refusal
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 
 STRICT_UPGRADE_WARNING = (
-    "pinax: every clone, and every older pinax on PATH, must run 0.4.0 or later "
+    "pinax: every clone, and every older pinax on PATH, must run 0.5.0 or later "
     "before this is used; an older client will report drift, and after "
     "upgrading, pinax verify --fix repairs it."
 )
@@ -311,6 +318,38 @@ def run_decision_actors(
         repo_root, "policy.decision_actors_set", {"actors": listed},
         actor, as_json, offline, runner,
         f"decision actors set ({'; '.join(listed)})",
+    )
+
+
+def run_note_refs(
+    repo_root: str,
+    prefixes: list[str],
+    actor: str | None = None,
+    as_json: bool = False,
+    offline: bool = False,
+    runner=None,
+) -> None:
+    """
+    Execute pinax policy note-refs in repo_root.
+
+    Hands a repository-level policy.note_ref_prefixes_set event, carrying
+    the whole list, to the publish sequence. Refuses, before anything is
+    minted, a list event.note_ref_prefixes_problem finds fault with.
+
+    runner is injectable for tests only; the CLI passes none.
+    """
+    from ..event import NOTE_REF_PREFIXES_SET, note_ref_prefixes_problem
+
+    ergon_dir = os.path.join(repo_root, ".ergon")
+    _require_log(ergon_dir)
+    listed = list(prefixes or [])
+    problem = note_ref_prefixes_problem(listed)
+    if problem is not None:
+        refusal.refuse(f"pinax: {problem}.", refusal.INVALID_ARGUMENT)
+    _publish_policy(
+        repo_root, NOTE_REF_PREFIXES_SET, {"prefixes": listed},
+        actor, as_json, offline, runner,
+        f"note reference prefixes set ({'; '.join(listed)})",
     )
 
 

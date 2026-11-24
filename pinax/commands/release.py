@@ -7,7 +7,7 @@ fold, append, commit and push. Refuses an actor handle that is not
 role@host before minting anything; see pinax.sync for the exit codes and
 offline rules.
 
-Any actor may release any live claim (ADR-007). The case a release exists
+Any actor may release any live claim. The case a release exists
 for is a worker that has stopped, and the actor who can say so is never
 the one holding the claim; restricting the release to the owner would
 leave that case unserved. The reason is required and the releasing actor
@@ -23,7 +23,7 @@ the log does not know, an item carrying no live claim, and an empty
 reason. The local fold is read first because the live claim's owner is read
 from the item; the unknown-item rule itself is pinax.targets', the same one
 the publish sequence applies to every command. Reading it decides nothing
-about ownership, which stays with the fold alone (ADR-006).
+about ownership, which stays with the fold alone.
 """
 
 from __future__ import annotations

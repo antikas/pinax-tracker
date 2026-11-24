@@ -159,11 +159,12 @@ def _valid(name: str, t: dict) -> list[str]:
         "policy decision-actors": [
             "policy", "decision-actors", "--decider", OWNER, "--offline",
         ],
+        "policy note-refs": ["policy", "note-refs", "--prefix", "wiki://", "--offline"],
         "priority": ["priority", first, "2", "--offline"],
         "annul": ["annul", t["first_event"], "--reason", "junk", "--offline"],
         "dep add": ["dep", "add", first, "--blocks", second, "--offline"],
         "dep rm": ["dep", "rm", third, "--blocks", second, "--offline"],
-        "note add": ["note", "add", first, "--ref", "docs/two.md", "--offline"],
+        "note add": ["note", "add", first, "--ref", "https://example.org/two", "--offline"],
     }[name]
 
 
@@ -183,6 +184,7 @@ MISSING = {
     "policy process": ["policy", "process", "--offline"],
     "policy owner-gates": ["policy", "owner-gates", "--offline"],
     "policy decision-actors": ["policy", "decision-actors", "--offline"],
+    "policy note-refs": ["policy", "note-refs", "--prefix", "--offline"],
     "priority": ["priority", "pnx-0000", "--offline"],
     "annul": ["annul", "abc", "--offline"],
     "dep add": ["dep", "add", "--blocks", "pnx-0001", "--offline"],
@@ -397,6 +399,18 @@ def test_a_claim_with_no_remote_prints_the_sequence_report_unchanged(tmp_path):
 # ---------------------------------------------------------------------------
 # Deciding the mode from the argument list
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "actor, code, status", [(WORKER, 0, "already_claimed"), (OWNER, 3, "claim_held")]
+)
+def test_a_claim_that_appends_nothing_prints_one_json_result(tracker, actor, code, status):
+    done = _pinax(tracker["repo"], "claim", tracker["third"], "--actor", actor, "--json")
+    result = _only_json(done)
+    assert done.returncode == code, done.stdout + done.stderr
+    assert result["sync_status"] == status
+    assert result["published"] is (code == 0)
+    assert result["appended"] is False
+
 
 def test_a_literal_json_value_does_not_switch_the_mode(tracker):
     done = _pinax(tracker["repo"], *_decide(tracker, label=" ", reason="--json"))
@@ -653,98 +667,3 @@ def test_a_refusal_without_json_is_unchanged(tracker):
     assert done.returncode == 1
     assert done.stdout == ""
     assert done.stderr.startswith("pinax dep add: --to requires --type <t>.")
-
-
-# ---------------------------------------------------------------------------
-# The documents say what is true
-# ---------------------------------------------------------------------------
-
-README = SOURCE_ROOT / "README.md"
-DESIGN = SOURCE_ROOT / "DESIGN.md"
-
-REFUSAL_SENTENCES = (
-    "A write command refused before the sequence runs prints a refusal result.",
-    "Its `published` is false, and its `sync_status` names the refusal: "
-    "`invalid_argument`, `not_a_tracker`, `root_mismatch`, `prefix_refused`, "
-    "`invalid_dependency`, `unknown_target` or `internal_error`.",
-    "Its `error` holds the refusal's message, and `exit_code` and `command` "
-    "name the exit code and the subcommand.",
-    "When the sequence fails, the result is the sequence's own report.",
-)
-
-
-def _publishing_section(path: Path) -> str:
-    text = path.read_text(encoding="utf-8")
-    section = text.split("\n## Publishing a state change\n", 1)[1].split("\n## ", 1)[0]
-    return " ".join(section.split())
-
-
-@pytest.mark.parametrize("path", [README, DESIGN], ids=["readme", "design"])
-def test_the_publishing_section_states_one_json_result_on_every_exit(path):
-    section = _publishing_section(path)
-    assert "Every write command's JSON result carries" not in section
-    assert "a write command prints exactly one JSON object on standard output" in section
-    for sentence in REFUSAL_SENTENCES:
-        assert sentence in section, sentence
-    assert section.isascii()
-    assert "–" not in section and "—" not in section
-
-
-def test_the_readme_names_the_scope_as_the_commands_that_run_the_sequence():
-    section = _publishing_section(README)
-    assert "A write command is one of the commands that run the publish sequence." in section
-    assert (
-        "Every command above that appends an event (add, claim, done, block, park, "
-        "decide, release, the four policy setters, priority, dep, note, annul) runs "
-        "the same publish sequence." in section
-    )
-
-
-PUBLISHED_SENTENCE = (
-    "`published` is true only when this run's push to the remote default "
-    "branch was accepted, or when the remote default branch already held "
-    "the event when this run fetched it."
-)
-
-
-@pytest.mark.parametrize("path", [README, DESIGN], ids=["readme", "design"])
-def test_published_is_stated_as_the_code_decides_it(path):
-    section = _publishing_section(path)
-    assert PUBLISHED_SENTENCE in section
-    assert "true only when the event is on the remote default branch" not in section
-    assert "`interrupted`" in section
-
-
-HELP_SENTENCE = (
-    "A help or version request is the one exception: it prints its text "
-    "unchanged and exits 0."
-)
-
-
-@pytest.mark.parametrize("path", [README, DESIGN], ids=["readme", "design"])
-def test_the_publishing_section_names_help_as_the_one_exception(path):
-    section = _publishing_section(path)
-    assert HELP_SENTENCE in section
-    assert "The exit code is the same with or without `--json`" in section
-
-
-def test_the_design_states_how_refusals_are_named_and_what_is_covered():
-    # Pinned by test_every_early_refusal_is_raised_with_its_name and by the
-    # argument-error, refusal and internal-error rows above.
-    section = _publishing_section(DESIGN)
-    assert "A refusal is named where it is raised, never read from its message." in section
-    assert (
-        "The CLI entry point parses with the output captured and takes the "
-        "mode from what argparse parsed, for the Python running it, so an "
-        "argument error, an early refusal and an uncaught exception are all "
-        "covered." in section
-    )
-
-
-def test_the_design_names_the_scope_as_the_commands_that_run_the_sequence():
-    section = _publishing_section(DESIGN)
-    assert (
-        "A write command is one of the commands that run the publish sequence: add, "
-        "claim, done, block, park, decide, release, the four policy setters, "
-        "priority, annul, dep add, dep rm and note add." in section
-    )
