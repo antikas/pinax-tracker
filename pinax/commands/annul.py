@@ -12,7 +12,7 @@ Formally and auditably retires a junk/tampered event so the fold skips it
 silently on every future run instead of warning forever - append-only
 preserved: the target event's raw bytes are NEVER rewritten, reordered, or
 deleted from its shard. The tombstone is itself a normal, hash-verified,
-totally-ordered event (ADR-001) - annulling is audit-trailed, deterministic,
+totally-ordered event - annulling is audit-trailed, deterministic,
 idempotent, and order-independent exactly like every other event in the fold.
 
 The target is addressed by its content-hash `id`, never by `seq` alone: seq
@@ -20,8 +20,12 @@ is only unique per-shard-per-actor, not globally across a repo's multiple log
 shards (two different shards can legitimately reuse the same seq for unrelated
 events), so seq cannot address one specific event on its own.
 
+A target that is itself an annulment is undone: what it annulled takes part
+in the fold again. The one annulment the sequence refuses as a target is the
+one a rejected claim wrote for itself (see append_local below).
+
 The fold materialises the annulment two ways:
-1. The target event's own ADR-001 tamper-evidence WARNING (id-integrity or
+1. The target event's own tamper-evidence WARNING (id-integrity or
    prev-chain) is suppressed for that SPECIFIC id only - every other,
    not-yet-annulled tampered event still warns exactly as before.
 2. The target event's own type handler is no longer applied - its payload
@@ -46,8 +50,8 @@ import sys
 from .. import refusal
 from ..append import append_event, prev_for_actor
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
-from ..event import mint_event
-from ..fold import read_events
+from ..event import mint_event, valid_annulment
+from ..fold import _annulments_in_effect, read_events
 
 # pinax.sync imports pinax.projection, which imports pinax.commands.dep at
 # its own top level; deferred to run() below rather than imported here, to
@@ -121,6 +125,30 @@ def run(
         # visible the moment it happens.
         print(f"pinax: event {target_id} annulled (reason={reason!r}) by {_actor} in {ergon_dir}")
         print(f"       event_id={event['id'][:12]}... seq={event['seq']}")
+        restored = _restored_by(event, outcome.union_events + read_events(log_dir))
+        if restored is not None:
+            print(f"pinax: event {restored} is in effect again")
+
+
+def _restored_by(annulment: dict, pool: list[dict]) -> str | None:
+    """The id of the event in pool that annulment brought back, else None."""
+    by_id = {event["id"]: event for event in pool}
+    named = by_id.get(annulment["payload"]["target_id"], {})
+    if not valid_annulment(named):
+        return None
+    target_id = named["payload"]["target_id"]
+    target = by_id.get(target_id)
+    if target is None:
+        return None
+
+    def effective(events: list[dict]) -> bool:
+        in_effect = _annulments_in_effect(events)
+        if target["type"] == "event.annulled":
+            return target_id in in_effect
+        return target_id not in in_effect.values()
+
+    earlier = [event for event in pool if event["id"] != annulment["id"]]
+    return target_id if effective(pool) and not effective(earlier) else None
 
 
 def append_local(
@@ -159,7 +187,7 @@ def append_local(
     )
     append_event(log_dir, event, actor=actor)
 
-    # Regenerate the projection atomically after the append (ADR-002).
+    # Regenerate the projection atomically after the append.
     from ..projection import regenerate
     regenerate(repo_root)
 

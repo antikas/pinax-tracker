@@ -170,7 +170,7 @@ class TestProjectionByteDeterminism:
             with open(path, "rb") as fh:
                 raw = fh.read()
             assert b"\r\n" not in raw, (
-                f"{fname} contains CRLF line endings — must be LF-only (ADR-002).\n"
+                f"{fname} contains CRLF line endings — must be LF-only.\n"
                 f"Content (first 200 bytes): {raw[:200]!r}"
             )
 

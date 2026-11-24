@@ -4,18 +4,24 @@ tests/test_release_workflow.py: the release workflow's download and verify steps
 Runs the two shell steps of .github/workflows/release.yml, as their own text,
 in a temporary layout shaped like the hosted publishing job, and checks that
 the private workflow differs from the public one only inside those steps and
-that the public export carries it.
+that the public export carries it. Also checks that the exported test modules
+need no folder that the export does not hold.
 """
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import os
+import posixpath
+import re
 import shlex
 import shutil
 import stat
 import subprocess
+import sys
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
 import pytest
@@ -474,7 +480,8 @@ def test_export_carries_the_release_workflow(tmp_path):
     source = tmp_path / "source"
     _git(tmp_path, "clone", "-q", "--no-hardlinks", str(REPO_ROOT), str(source))
     _git(source, "config", "core.hooksPath", str(hooks))
-    for relative in (".github/workflows/release.yml", "tools/export_public.py"):
+    exporter = _load_exporter()
+    for relative in ("tools/export_public.py", *exporter.FILES):
         destination = source / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(REPO_ROOT / relative, destination)
@@ -488,9 +495,288 @@ def test_export_carries_the_release_workflow(tmp_path):
     public_workflow.parent.mkdir(parents=True)
     public_workflow.write_bytes(PUBLIC_TEXT.encode("utf-8"))
     _git(target, "add", "--", ".github/workflows/release.yml")
+    # Split so that this file does not itself hold the old names.
+    retired = ("DESIGN" + ".md", "docs/" + "decisions/old.md", "docs/" + "portfolio-" + "views.md")
+    for name in retired:
+        old = target / name
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_text("old\n", encoding="utf-8")
+        _git(target, "add", "--", name)
     _git(target, "commit", "-q", "-m", "test: public workflow")
 
-    _load_exporter().export(source, "HEAD", target)
+    exporter.export(source, "HEAD", target)
 
     assert public_workflow.is_file(), "the export deleted the release workflow"
     assert public_workflow.read_bytes() == WORKFLOW.read_bytes()
+    assert (target / "docs/data-model-and-integrity.md").is_file()
+    documents = {p.relative_to(target).as_posix() for p in (target / "docs").rglob("*") if p.is_file()}
+    assert documents == {name for name in exporter.FILES if name.startswith("docs/")}
+    for name in retired:
+        assert not (target / name).exists(), name
+
+
+# ---------------------------------------------------------------------------
+# The exported tests need nothing the export leaves out
+# ---------------------------------------------------------------------------
+
+# Stands for the repository root while a module's paths are worked out.
+_MARK = "/@repository@"
+
+
+class _RootPaths:
+    """
+    The strings a module's expressions can hold, worked out from __file__
+    without running the module. A name stands for every value the module gives
+    it, whatever the scope. A path built from a function argument is not seen.
+    """
+
+    def __init__(self, tree: ast.Module, relative: str):
+        self.tree = tree
+        self.file = f"{_MARK}/{relative}"
+        self.bound: dict[str, list[ast.expr]] = {}
+        self.busy: set[str] = set()
+        self.imported: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    self._bind(target, node.value)
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value:
+                self._bind(node.target, node.value)
+            elif isinstance(node, (ast.For, ast.comprehension)):
+                self._bind(node.target, node.iter)
+            elif isinstance(node, ast.ImportFrom):
+                self.imported.update({alias.asname or alias.name: alias.name for alias in node.names})
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Return) and inner.value:
+                        self.bound.setdefault(node.name, []).append(inner.value)
+
+    def _bind(self, target: ast.expr, value: ast.expr) -> None:
+        if isinstance(target, ast.Name):
+            self.bound.setdefault(target.id, []).append(value)
+
+    def values(self, node: ast.expr) -> set[str]:
+        if isinstance(node, ast.Constant):
+            return {node.value} if isinstance(node.value, str) else set()
+        if isinstance(node, ast.Name):
+            if node.id == "__file__":
+                return {self.file}
+            return self._given(node.id)
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return {v for element in node.elts for v in self.values(element)}
+        if isinstance(node, ast.Starred):
+            return self.values(node.value)
+        if isinstance(node, ast.Attribute):
+            if node.attr == "__file__" and isinstance(node.value, ast.Name) and node.value.id == "pinax":
+                return {f"{_MARK}/pinax/__init__.py"}
+            if node.attr == "parent":
+                return {posixpath.dirname(v) for v in self.values(node.value)}
+            return self._given(node.attr) if isinstance(node.value, ast.Name) else set()
+        if isinstance(node, ast.Subscript):
+            owner, index = node.value, node.slice
+            if (
+                isinstance(owner, ast.Attribute) and owner.attr == "parents"
+                and isinstance(index, ast.Constant) and isinstance(index.value, int)
+            ):
+                found = self.values(owner.value)
+                for _ in range(index.value + 1):
+                    found = {posixpath.dirname(v) for v in found}
+                return found
+            return set()
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            return self._joined([node.left, node.right])
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return {a + b for a in self.values(node.left) for b in self.values(node.right)}
+        if isinstance(node, ast.JoinedStr):
+            texts = {""}
+            for part in node.values:
+                inner = part.value if isinstance(part, ast.FormattedValue) else part
+                texts = {t + v for t in texts for v in (self.values(inner) or {"?"})}
+            return texts
+        if isinstance(node, ast.Call):
+            return self._called(node)
+        return set()
+
+    def _given(self, name: str) -> set[str]:
+        if name in self.busy:
+            return set()
+        self.busy.add(name)
+        found = {v for value in self.bound.get(name, ()) for v in self.values(value)}
+        self.busy.discard(name)
+        return found
+
+    def _called(self, node: ast.Call) -> set[str]:
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if isinstance(func, ast.Name):
+            name = self.imported.get(name, name)
+        if name in {"Path", "PurePath", "str", "fspath", "abspath", "realpath", "normpath"}:
+            return self._joined(node.args)
+        if name == "dirname":
+            return {posixpath.dirname(v) for arg in node.args for v in self.values(arg)}
+        if name == "join" and not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Constant)):
+            return self._joined(node.args)
+        if isinstance(func, ast.Attribute) and name == "joinpath":
+            return self._joined([func.value, *node.args])
+        if isinstance(func, ast.Attribute) and name in {"resolve", "absolute", "as_posix"}:
+            return self.values(func.value)
+        return self._given(name) if isinstance(func, ast.Name) else set()
+
+    def _joined(self, parts: list[ast.expr]) -> set[str]:
+        """The joined paths; a part with no known value ends the path."""
+        paths = {""}
+        for part in parts:
+            known = self.values(part)
+            if not known:
+                break
+            paths = {posixpath.join(p, v) for p in paths for v in known}
+        return {p for p in paths if p}
+
+    def folders(self) -> set[str]:
+        """The first part of every path below the root, and every imported package."""
+        found: set[str] = set()
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Import):
+                found.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                found.add(node.module.split(".")[0])
+            if not isinstance(node, ast.expr):
+                continue
+            texts = self.values(node)
+            if isinstance(node, ast.Call):
+                for keyword in node.keywords:
+                    if keyword.arg == "cwd":
+                        texts = texts | {
+                            posixpath.join(base, text)
+                            for base in self.values(keyword.value) if base.startswith(_MARK)
+                            for arg in node.args for text in self.values(arg)
+                        }
+            for text in texts:
+                if text.startswith(_MARK):
+                    text = posixpath.normpath(text)
+                found.update(re.findall(re.escape(_MARK) + r"/+([^/\s\"']+)", text))
+        return found
+
+
+def _pytest_cases(tree: Path, module: str, report: Path) -> tuple[list[str], list[str]]:
+    """Run one module of a tree in both lanes: what failed, and the skip reasons."""
+    env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "PYTEST_ADDOPTS"}}
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-o", "addopts=", "-p", "no:cacheprovider",
+         f"--junitxml={report}", module],
+        cwd=tree, env=env, capture_output=True, text=True, timeout=100,
+    )
+    # 5 is pytest's code for a run that collected no test, as when a module skips whole.
+    assert result.returncode in (0, 1, 2, 5) and report.is_file(), result.stdout + result.stderr
+    broken, reasons = [], []
+    for case in ElementTree.parse(report).iter("testcase"):
+        if case.find("failure") is not None or case.find("error") is not None:
+            broken.append(case.get("name"))
+        for skip in case.iter("skipped"):
+            reasons.append(f"{skip.get('message') or ''} {skip.text or ''}")
+    return broken, reasons
+
+
+def _names_folder(reason: str, folder: str) -> bool:
+    return re.search(r"(?<![\w./-])" + re.escape(folder) + r"(?![\w.-])", reason) is not None
+
+
+def _tree_with_working_tests(tmp_path: Path, exporter) -> Path:
+    """A clone of the current commit that carries the working tree's public files."""
+    hooks = tmp_path / "hooks-empty"
+    hooks.mkdir()
+    source = tmp_path / "source"
+    _git(tmp_path, "clone", "-q", "--no-hardlinks", str(REPO_ROOT), str(source))
+    _git(source, "config", "core.hooksPath", str(hooks))
+    listed = _git(
+        REPO_ROOT, "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--",
+        *exporter.FILES, *exporter.TREE_PREFIXES,
+    )
+    for relative in sorted(set(listed.split("\0")) - {""}):
+        destination = source / relative
+        if (REPO_ROOT / relative).is_file():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(REPO_ROOT / relative, destination)
+        else:
+            destination.unlink(missing_ok=True)
+    _git(source, "add", "-A")
+    _git(source, "commit", "-q", "--allow-empty", "-m", "test: working tree public files")
+    return source
+
+
+@pytest.mark.deep
+@pytest.mark.timeout(300)
+def test_no_exported_test_module_needs_a_folder_the_export_leaves_out(tmp_path):
+    if not EXPORTER.is_file():
+        pytest.skip("tools/export_public.py is absent, as it is in the exported tree")
+    if shutil.which("git") is None:
+        pytest.skip("git is not on PATH")
+    exporter = _load_exporter()
+    source = _tree_with_working_tests(tmp_path, exporter)
+    target = tmp_path / "target"
+    _git(tmp_path, "init", "-q", str(target))
+    exporter.export(source, "HEAD", target)
+
+    folders = _git(source, "ls-tree", "-d", "--name-only", "HEAD").splitlines()
+    left_out = {name for name in folders if not (target / name).is_dir()}
+    referring: dict[str, set[str]] = {}
+    for path in sorted((target / "tests").rglob("*.py")):
+        relative = path.relative_to(target).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        named = _RootPaths(tree, relative).folders() & left_out
+        if named:
+            referring[relative] = named
+    assert "tools" in referring.get("tests/test_release_workflow.py", ()), referring
+
+    problems = []
+    for number, (module, named) in enumerate(sorted(referring.items())):
+        broken, reasons = _pytest_cases(target, module, tmp_path / f"report-{number}.xml")
+        for folder in sorted(named):
+            if broken or not any(_names_folder(reason, folder) for reason in reasons):
+                problems.append(
+                    f"{module} refers to the folder {folder!r}, which the export does not hold, "
+                    f"and does not skip without it; failed: {broken}"
+                )
+    assert not problems, "\n".join(problems)
+
+
+@pytest.mark.parametrize("source", [
+    'from pathlib import Path\nX = Path(__file__).resolve().parents[1] / "demo" / "a.sh"',
+    'from pathlib import Path\nR = Path(__file__).parent.parent\ndef f():\n    return R.joinpath("demo/a.sh")',
+    'import os\nR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\nX = os.path.join(R, "demo", "a")',
+    'from pathlib import Path\nR = Path(__file__).parent.parent\nX = f\'source "{R}/demo/a.sh"\'',
+    'from pathlib import Path\nR = Path(__file__).parent.parent\nfor n in ("pinax", "demo"):\n    print(R / n)',
+    'from pathlib import Path\nR = Path(__file__).parent.parent\nrun(["sh", "demo/a.sh"], cwd=R)',
+    'from pathlib import Path\nX = Path(__file__).parent / ".." / "demo"',
+    'from pathlib import Path as P\nX = P(__file__).parent.parent / "demo"',
+    'from os.path import dirname, join\nX = join(dirname(dirname(__file__)), "demo", "a.sh")',
+    'from pathlib import Path\ndef root():\n    return Path(__file__).parent.parent\nX = root() / "demo"',
+    'from pathlib import Path\nclass T:\n    R = Path(__file__).parent.parent\n    def f(self):\n        return self.R / "demo"',
+    'from demo.tool import x',
+])
+def test_a_reference_to_a_top_level_folder_is_seen(source):
+    assert "demo" in _RootPaths(ast.parse(source), "tests/test_x.py").folders()
+
+
+@pytest.mark.parametrize("source", [
+    'def f(tmp_path):\n    return tmp_path / "demo" / "a.sh"',
+    'from pathlib import Path\nX = Path(__file__).parent / "fixtures" / "demo"',
+    'X = "demo/a.sh"',
+])
+def test_a_path_outside_the_top_level_is_no_reference(source):
+    assert "demo" not in _RootPaths(ast.parse(source), "tests/test_x.py").folders()
+
+
+@pytest.mark.deep
+def test_the_demo_capture_module_is_skipped_whole_without_the_demo_folder(tmp_path):
+    copy = tmp_path / "copy"
+    ignore = shutil.ignore_patterns("__pycache__")
+    for folder in ("pinax", "tests"):
+        shutil.copytree(REPO_ROOT / folder, copy / folder, ignore=ignore)
+    shutil.copyfile(REPO_ROOT / "pyproject.toml", copy / "pyproject.toml")
+    assert not (copy / "demo").exists()
+
+    broken, reasons = _pytest_cases(copy, "tests/test_demo_capture_hygiene.py", tmp_path / "report.xml")
+
+    assert broken == []
+    assert len(reasons) == 1 and "the demo folder is absent" in reasons[0]

@@ -110,8 +110,8 @@ def repo(tmp_path):
 @requires_git
 def test_no_unmerged_branches_output_identical(repo):
     # No follow-up commit here: 'add' now runs the publish sequence
-    # (pinax/sync.py), which commits the shard and the projection itself
-    # (ADR-006); the working tree is already clean by the time it returns.
+    # (pinax/sync.py), which commits the shard and the projection itself;
+    # the working tree is already clean by the time it returns.
     r = _pinax(repo, "add", "--title", "main item", "--actor", "t@h")
     assert r.returncode == 0, r.stderr
 
@@ -132,7 +132,7 @@ def test_no_unmerged_branches_output_identical(repo):
 
 @requires_git
 def test_no_unmerged_branches_ready_json_identical_shape(repo):
-    # No follow-up commit here: 'add' already commits itself (ADR-006).
+    # No follow-up commit here: 'add' already commits itself.
     r = _pinax(repo, "add", "--title", "main item", "--actor", "t@h")
     assert r.returncode == 0, r.stderr
 
@@ -149,8 +149,7 @@ def test_no_unmerged_branches_ready_json_identical_shape(repo):
 
 @requires_git
 def test_unmerged_branch_item_marked_and_absent_from_default(repo):
-    # No follow-up commit here or below: 'add' already commits itself
-    # (ADR-006).
+    # No follow-up commit here or below: 'add' already commits itself.
     r = _pinax(repo, "add", "--title", "main item", "--actor", "t@h")
     assert r.returncode == 0, r.stderr
 
@@ -192,7 +191,7 @@ def test_unmerged_branch_item_marked_and_absent_from_default(repo):
 @requires_git
 def test_unmerged_branch_parked_item_marked_in_report(repo):
     # No follow-up commit here or below: 'add' and 'park' already commit
-    # themselves (ADR-006).
+    # themselves.
     r = _pinax(repo, "add", "--title", "main item", "--actor", "t@h")
     assert r.returncode == 0, r.stderr
 
@@ -224,8 +223,8 @@ def test_unmerged_branch_parked_item_marked_in_report(repo):
 
 @requires_git
 def test_shared_item_deduped_no_spurious_marker(repo):
-    # No follow-up commit here or below: 'add' already commits itself
-    # (ADR-006), which is also what puts the shared item on HEAD before the
+    # No follow-up commit here or below: 'add' already commits itself,
+    # which is also what puts the shared item on HEAD before the
     # branch below is cut from it.
     r = _pinax(repo, "add", "--title", "shared item", "--actor", "t@h", "--json")
     assert r.returncode == 0, r.stderr
@@ -274,8 +273,7 @@ def test_shared_item_deduped_no_spurious_marker(repo):
 
 @requires_git
 def test_all_branches_json_deterministic_and_ascii(repo):
-    # No follow-up commit here or below: 'add' already commits itself
-    # (ADR-006).
+    # No follow-up commit here or below: 'add' already commits itself.
     r = _pinax(repo, "add", "--title", "main item", "--actor", "t@h")
     assert r.returncode == 0, r.stderr
 
@@ -312,8 +310,7 @@ def test_all_branches_json_deterministic_and_ascii(repo):
 
 @requires_git
 def test_multiple_unmerged_branches_sorted_and_attributed(repo):
-    # No follow-up commit here or below: 'add' already commits itself
-    # (ADR-006).
+    # No follow-up commit here or below: 'add' already commits itself.
     r = _pinax(repo, "add", "--title", "main item", "--actor", "t@h")
     assert r.returncode == 0, r.stderr
 

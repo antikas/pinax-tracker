@@ -1,7 +1,7 @@
 """
 pinax verify — drift lint: regenerate the projection and diff against committed.
 
-ADR-002: the projection is never hand-edited.  This command catches any drift
+The projection is never hand-edited.  This command catches any drift
 between the committed projection and the regenerated-from-log version.
 
 Exit codes:
@@ -17,13 +17,15 @@ import os
 import sys
 
 
-def _inspect(repo_root: str) -> tuple[list[str] | None, list[dict]]:
+def _inspect(repo_root: str) -> tuple[list[str] | None, list]:
     """
     Check event hashes and compare the projection against a fresh log fold.
 
-    Returns ``(drifted_files, invalid_events)``. ``drifted_files`` is None
-    when there is no log to verify. Formally annulled events are excluded from
-    ``invalid_events`` because annulment is Pinax's audit-preserving mechanism
+    Returns ``(drifted_files, invalid)``. ``drifted_files`` is None when there
+    is no log to verify. ``invalid`` holds a DamagedLogLine per line that
+    cannot be used as an event, whatever any annulment names, and each
+    invalid event. Formally annulled events are excluded from
+    ``invalid`` because annulment is Pinax's audit-preserving mechanism
     for retiring a known bad event.
     """
     from ..fold import (
@@ -35,7 +37,7 @@ def _inspect(repo_root: str) -> tuple[list[str] | None, list[dict]]:
         read_raw_events,
     )
     from ..event import EVENT_VERSION, event_version, valid_annulment, verify_id
-    from ..projection import render_board, render_item
+    from ..projection import projection_pages, render_board
 
     ergon_dir = os.path.join(repo_root, ".ergon")
     log_dir = os.path.join(ergon_dir, "log")
@@ -47,7 +49,8 @@ def _inspect(repo_root: str) -> tuple[list[str] | None, list[dict]]:
 
     # Verify the physical parsed lines before same-id deduplication.  The fold
     # still receives its canonical deduplicated representation afterwards.
-    raw_events = read_raw_events(log_dir, include_invalid=True)
+    damaged: list = []
+    raw_events = read_raw_events(log_dir, include_invalid=True, damaged=damaged)
     annulled_ids = _collect_annulled_ids(raw_events)
     invalid_events = [
         event
@@ -61,7 +64,7 @@ def _inspect(repo_root: str) -> tuple[list[str] | None, list[dict]]:
     # Do not sort or fold a malformed physical record. Besides reporting the
     # integrity failure first, this keeps --fix from deriving a replacement
     # projection from invalid history.
-    if not invalid_events:
+    if not invalid_events and not damaged:
         invalid_events = [
             event
             for _shard, _actor, event in broken_prev_links(
@@ -70,8 +73,8 @@ def _inspect(repo_root: str) -> tuple[list[str] | None, list[dict]]:
             if event_version(event) == EVENT_VERSION
         ]
 
-    if invalid_events:
-        return [], invalid_events
+    if invalid_events or damaged:
+        return [], damaged + invalid_events
 
     events = finalise_events(raw_events)
     state = fold_events(events)
@@ -94,9 +97,9 @@ def _inspect(repo_root: str) -> tuple[list[str] | None, list[dict]]:
             drift_files.append(".ergon/board.md (missing)")
 
     # Check per-item files.
-    for item_id, item in sorted(items.items()):
+    pages = projection_pages(state)
+    for item_id, generated_item in pages.items():
         item_path = os.path.join(items_dir, f"{item_id}.md")
-        generated_item = render_item(item_id, item, state)
         if os.path.isfile(item_path):
             with open(item_path, "r", encoding="utf-8", newline="") as fh:
                 committed_item = fh.read()
@@ -111,23 +114,45 @@ def _inspect(repo_root: str) -> tuple[list[str] | None, list[dict]]:
         for fname in sorted(os.listdir(items_dir)):
             if fname.endswith(".md"):
                 stale_id = fname[:-3]
-                if stale_id not in items:
+                if stale_id not in pages:
                     drift_files.append(f".ergon/items/{stale_id}.md (stale)")
 
-    return drift_files, invalid_events
+    return drift_files, []
 
 
-def _fail_on_invalid_events(invalid_events: list[dict]) -> None:
+def _fail_on_invalid_log(invalid: list) -> None:
     """Fail closed before projection comparison can hide tampering."""
+    from ..event import DamagedLogLine
+
+    damaged = [entry for entry in invalid if isinstance(entry, DamagedLogLine)]
+    invalid_events = [entry for entry in invalid if isinstance(entry, dict)]
+    if damaged:
+        print(
+            "pinax verify: EVENT LOG INTEGRITY FAILURE - "
+            f"{len(damaged)} line(s) of the event log cannot be used as events.\n"
+            "  Damaged lines:\n"
+            + "\n".join(f"    {error.where()}" for error in damaged)
+            + "\n\n"
+            "  Restore each line from known-good history. Annulling an event does\n"
+            "  not recover a damaged line, and every other command refuses until\n"
+            "  the lines are restored.",
+            file=sys.stderr,
+        )
     if not invalid_events:
+        if damaged:
+            sys.exit(1)
         return
 
+    from ..fold import shard_label
+
     details = "\n".join(
-        "    id={id} seq={seq} actor={actor} type={type}".format(
+        "    id={id} seq={seq} actor={actor} type={type} at {file} line {line}".format(
             id=event.get("id", "<missing>"),
             seq=event.get("seq", "<missing>"),
             actor=event.get("actor", "<missing>"),
             type=event.get("type", "<missing>"),
+            file=shard_label(event["_shard"]),
+            line=event["_line"],
         )
         for event in invalid_events
     )
@@ -174,7 +199,7 @@ def run(repo_root: str, fix: bool = False) -> None:
     would currently be git-ignored, even when the projection itself is
     drift-free.
     """
-    drift_files, invalid_events = _inspect(repo_root)
+    drift_files, invalid = _inspect(repo_root)
 
     if drift_files is None:
         print("pinax verify: .ergon/log/ not found - nothing to verify.", file=sys.stderr)
@@ -183,7 +208,7 @@ def run(repo_root: str, fix: bool = False) -> None:
     # This is deliberately before drift handling and --fix. A projection can
     # be regenerated from mutated history and appear byte-clean; event hashes
     # are the independent append-only boundary that must fail first.
-    _fail_on_invalid_events(invalid_events)
+    _fail_on_invalid_log(invalid)
 
     tracking = _check_log_tracking(repo_root)
     swallowed = bool(tracking.get("available") and tracking.get("ignored"))
@@ -215,7 +240,7 @@ def run(repo_root: str, fix: bool = False) -> None:
             + "\n\n"
             "  Run 'pinax verify --fix' to regenerate, or run any state-changing\n"
             "  command (which regenerates atomically).\n"
-            "  The projection must never be hand-edited (ADR-002).",
+            "  The projection must never be hand-edited.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -235,7 +260,7 @@ def run(repo_root: str, fix: bool = False) -> None:
     regenerate(repo_root)
 
     remaining, remaining_invalid = _inspect(repo_root)
-    _fail_on_invalid_events(remaining_invalid)
+    _fail_on_invalid_log(remaining_invalid)
     if remaining:
         print(
             "pinax verify --fix: regeneration did not clear all drift.\n"

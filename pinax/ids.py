@@ -1,5 +1,5 @@
 """
-pinax.ids — item ID minting per ADR-003.
+pinax.ids — item ID minting.
 
 ID = <prefix>-<short base32 blake2b of (seq, title, actor, worktree_id, nonce)>
 - nonce = timestamp_ns + title + actor + worktree_id (ensures two agents creating

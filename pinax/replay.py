@@ -1,8 +1,8 @@
 """
 pinax.replay — time-travel fold to any git reference.
 
-ADR-001 / DESIGN.md: "Replay = fold the event log up to a git ref; no
-secondary state store is needed."  This module is the git-ref-sourced sibling
+Replay folds the event log up to a git ref; no secondary state store is
+needed.  This module is the git-ref-sourced sibling
 of pinax.fold.read_events: it sources raw shard bytes from the git object
 store AS COMMITTED at <ref> (a branch, tag, or commit sha) instead of from the
 current working tree, then hands off to the identical determinism layer
@@ -114,7 +114,8 @@ def read_raw_events_at_ref(
     `read_events_at_ref(repo_root, ref, log_subpath)` equals
     `finalise_events(read_raw_events_at_ref(repo_root, ref, log_subpath))`.
 
-    Raises ReplayRefError if <ref> does not resolve to a commit in repo_root.
+    Raises ReplayRefError if <ref> does not resolve to a commit in repo_root,
+    and DamagedLogLine, naming <ref> and the shard path, at a damaged line.
     """
     commit_sha = _resolve_commit(repo_root, ref)
     shard_paths = _list_shard_paths(repo_root, commit_sha, log_subpath)
@@ -122,7 +123,9 @@ def read_raw_events_at_ref(
     raw_events: list[dict] = []
     for shard_path in shard_paths:
         raw = _read_blob(repo_root, commit_sha, shard_path)
-        for event in parse_shard_bytes(raw, shard_id=shard_path):
+        for event in parse_shard_bytes(
+            raw, shard_id=shard_path, label=f"{ref}:{shard_path}"
+        ):
             eid = event.get("id")
             if eid is None:
                 logger.warning(

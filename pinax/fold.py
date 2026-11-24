@@ -16,7 +16,8 @@ priority, critical-path depth, age, and item id.
 An `event.annulled` record identifies one hash-valid event by id. Annulment
 suppresses that target's handler effects and integrity warning while retaining
 its original bytes in the append-only log. Invalid annulment records do not
-suppress any target.
+suppress any target, and an annulment that another annulment in effect names
+suppresses nothing either, so its target takes part in the fold again.
 """
 from __future__ import annotations
 
@@ -25,17 +26,22 @@ import glob
 import json
 import logging
 import os
+import unicodedata
 from collections import OrderedDict, defaultdict
 from typing import Iterator
 
+from .append import normalise_actor
 from .event import (
+    DamagedLogLine,
     decided_item,
     declared_decision_actors,
     declared_expiry_hours,
+    declared_note_ref_prefixes,
     declared_owner_gate_classes,
     declared_process,
     parse_line,
     released_item,
+    unusable_line,
     valid_annulment,
     verify_id,
 )
@@ -59,10 +65,33 @@ BUILDING_STATUSES = frozenset({"building", "blind-verify", "adjudicate"})
 # Determinism layer
 # ---------------------------------------------------------------------------
 
-def parse_shard_bytes(raw: bytes, shard_id: str) -> Iterator[dict]:
+# The reader's own annotations on a raw event; never part of the event.
+_PRIVATE_KEYS = ("_shard", "_line")
+
+
+def shard_label(path: str) -> str:
+    """A working-tree shard's path relative to its repository."""
+    log_dir, name = os.path.split(os.path.abspath(path))
+    ergon_dir, log_name = os.path.split(log_dir)
+    if log_name == "log" and os.path.basename(ergon_dir) == ".ergon":
+        return f".ergon/log/{name}"
+    return path
+
+
+def parse_shard_bytes(
+    raw: bytes,
+    shard_id: str,
+    *,
+    label: str | None = None,
+    damaged: list[DamagedLogLine] | None = None,
+) -> Iterator[dict]:
     """
     Parse one shard's raw bytes into event dicts.  LF-normalises; tolerates a
     torn/partial trailing line.
+
+    A line pinax.event.unusable_line rejects raises DamagedLogLine, naming
+    label (shard_id when no label is given) and the line; with a damaged
+    list, each such error is added to it and the reading goes on.
 
     Shared by _read_shard (filesystem shards) and pinax.replay's git-ref shard
     reader — the byte-parsing half of the determinism layer is the
@@ -77,7 +106,8 @@ def parse_shard_bytes(raw: bytes, shard_id: str) -> Iterator[dict]:
     _check_prev_chain to group the chain check by shard (not by actor),
     grouping chains by shard: one actor may legitimately write multiple
     shards, each beginning with `prev=''`. The '_shard' key is
-    stripped before the fold state handlers receive events.
+    stripped before the fold state handlers receive events. '_line', the
+    1-based line number, is carried and stripped the same way.
     """
     # Split on LF after normalising CRLF.  Each element is one line's bytes
     # (without the terminator).
@@ -88,8 +118,21 @@ def parse_shard_bytes(raw: bytes, shard_id: str) -> Iterator[dict]:
         if not line_bytes:
             # Empty line — could be the trailing newline split or a blank; skip.
             continue
-        event = parse_line(line_bytes)
-        if event is None:
+        try:
+            event = parse_line(line_bytes)
+            # JSON null parses to the same None an unparseable line gives.
+            absent = event is None and line_bytes.strip() != b"null"
+            reason = None if absent else unusable_line(event)
+            if reason is not None:
+                raise DamagedLogLine(reason)
+        except DamagedLogLine as error:
+            error.file = label if label is not None else shard_id
+            error.line = i + 1
+            if damaged is None:
+                raise
+            damaged.append(error)
+            continue
+        if absent:
             if i == len(lines) - 1:
                 # Torn trailing line — the common crash-mid-append case.
                 logger.warning(
@@ -102,10 +145,13 @@ def parse_shard_bytes(raw: bytes, shard_id: str) -> Iterator[dict]:
             continue
         # Annotate with shard provenance for _check_prev_chain.
         event["_shard"] = shard_id
+        event["_line"] = i + 1
         yield event
 
 
-def _read_shard(path: str) -> Iterator[dict]:
+def _read_shard(
+    path: str, damaged: list[DamagedLogLine] | None = None
+) -> Iterator[dict]:
     """
     Read one JSONL shard from the filesystem, yielding parsed event dicts.
 
@@ -114,12 +160,12 @@ def _read_shard(path: str) -> Iterator[dict]:
     """
     with open(path, "rb") as fh:
         raw = fh.read()
-    yield from parse_shard_bytes(raw, path)
+    yield from parse_shard_bytes(raw, path, label=shard_label(path), damaged=damaged)
 
 
 def _sort_key(event: dict):
     """
-    Total-order sort key per ADR-001: (seq, ts, actor, id).
+    Total-order sort key: (seq, ts, actor, id).
 
     seq is the primary key (explicit Lamport counter).
     ts is secondary (metadata tie-break).
@@ -131,7 +177,7 @@ def _sort_key(event: dict):
 
 def _check_id_integrity(events: list[dict], annulled_ids: frozenset[str] = frozenset()) -> None:
     """
-    ADR-001 tamper-evidence: verify each event's id matches its recomputed hash.
+    Tamper-evidence: verify each event's id matches its recomputed hash.
 
     A mismatch means the payload (or any envelope field) was mutated after the
     event was written — a tampered or corrupted event.  Emit a WARNING for each
@@ -160,7 +206,7 @@ def _check_id_integrity(events: list[dict], annulled_ids: frozenset[str] = froze
 
 def _check_prev_chain(events: list[dict], annulled_ids: frozenset[str] = frozenset()) -> None:
     """
-    ADR-001 tamper-evidence: verify the prev-chain per (shard, actor) group.
+    Tamper-evidence: verify the prev-chain per (shard, actor) group.
 
     ``annulled_ids`` scopes suppression to specific event ids that have
     been formally tombstoned via `event.annulled` — an event whose own id is in
@@ -201,12 +247,13 @@ def _check_prev_chain(events: list[dict], annulled_ids: frozenset[str] = frozens
         last event, and after a union merge of two clones of one actor the
         tip of each fork branch), deleting an event whose successor is
         annulled, or a rewrite that recomputes every later event up to the
-        last; see DESIGN.md, "Verification and tombstones".
+        last; see docs/data-model-and-integrity.md, "What `verify` catches".
       - DOES NOT CHECK: the content of an annulled event; any line that keeps
         its id satisfies a prev that names it.
       - WARNS ONLY: a broken link on a version 1 event, the anchor included;
         `pinax verify` fails only for version 2 events.
-      - DOES NOT DETECT: seq-monotonicity violations (documented in DESIGN.md, "Verification and tombstones").
+      - DOES NOT DETECT: seq-monotonicity violations (documented in
+        docs/data-model-and-integrity.md, "What `verify` catches").
       - DOES NOT DETECT: a fork (multiple events sharing the same prev — legitimate
         after a union merge; this is intentional).
 
@@ -281,38 +328,67 @@ def broken_prev_links(
     return broken
 
 
+def _annulments_in_effect(events: list) -> dict[str, str]:
+    """
+    Return annulment id -> target id for every annulment that is in effect.
+
+    An annulment is in effect when it is valid and no annulment in effect
+    names it. An annulment on a cycle of annulments naming each other is not
+    in effect.
+
+    Pure and order-independent: only the set of valid annulments in the pool
+    matters, never where one sits relative to its target. Invalid
+    event.annulled events are simply not counted here.
+    """
+    target_of = {
+        event["id"]: event["payload"]["target_id"]
+        for event in events
+        if valid_annulment(event)
+    }
+    unresolved = dict.fromkeys(target_of, 0)
+    for target in target_of.values():
+        if target in unresolved:
+            unresolved[target] += 1
+
+    # An annulment is settled only once every annulment naming it is, so a
+    # member of a cycle is never reached.
+    in_effect: dict[str, str] = {}
+    suppressed: set[str] = set()
+    settled = [aid for aid, count in unresolved.items() if count == 0]
+    while settled:
+        aid = settled.pop()
+        target = target_of[aid]
+        if aid not in suppressed:
+            in_effect[aid] = target
+            suppressed.add(target)
+        if target in unresolved:
+            unresolved[target] -= 1
+            if unresolved[target] == 0:
+                settled.append(target)
+    return in_effect
+
+
 def _collect_annulled_ids(events: list) -> frozenset[str]:
     """
-    Scan an event list for `event.annulled` events and return the set of
-    target event ids they tombstone.
+    The ids of the events an annulment in effect names.
 
-    SSOT for "which ids are annulled" — used both by finalise_events (to scope
-    the ADR-001 tamper-evidence WARNING suppression to specific ids) and by
-    fold_events (to skip applying an annulled event's own payload effects).
-
-    Pure and order-independent: a target is annulled if ANY `event.annulled`
-    event anywhere in the stream names it, regardless of where in total order
-    the annulment falls relative to its target. Malformed event.annulled
-    events (missing target_id) are simply not counted here — the handler
-    layer (_handle_event_annulled) logs its own warning for those when it runs.
+    SSOT for "which ids are annulled": finalise_events and `pinax verify`
+    (to scope the integrity checks), fold_events (to skip an annulled event's
+    own payload effects) and the clock rule of `pinax claim`.
     """
-    annulled: set[str] = set()
-    for event in events:
-        if valid_annulment(event):
-            annulled.add(event["payload"]["target_id"])
-    return frozenset(annulled)
+    return frozenset(_annulments_in_effect(events).values())
 
 
 def _canonical_event_bytes(event: dict) -> bytes:
     """
-    Return canonical JSON bytes for an event, excluding the private '_shard' key.
+    Return canonical JSON bytes for an event, excluding the reader's private keys.
 
     Used by _dedupe_by_id to pick a body-sensitive deterministic representative
     from a same-id duplicate group.
     """
     # Build a copy without the private annotation; use canonical JSON so the
     # comparison is byte-deterministic and PYTHONHASHSEED-independent.
-    clean = {k: v for k, v in event.items() if k != "_shard"}
+    clean = {k: v for k, v in event.items() if k not in _PRIVATE_KEYS}
     return json.dumps(clean, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -376,7 +452,7 @@ def finalise_events(raw_events: list[dict]) -> list[dict]:
     behaviour is byte-identical (same-id duplicates in a valid log are
     byte-identical; min of identical bytes equals that one value).
 
-    After sorting+deduplication, performs two integrity checks (ADR-001 tamper-evidence):
+    After sorting+deduplication, performs two integrity checks (tamper-evidence):
     - id-verification: each event's stored id is recomputed and compared.
     - prev-chain check (set-membership, broken_prev_links): warns when an
       event's prev is non-empty and references no known id in its (shard,actor)
@@ -384,11 +460,11 @@ def finalise_events(raw_events: list[dict]) -> list[dict]:
       dangling prev = deleted/tampered predecessor).  A fork — multiple events
       chaining from the same known id after a git merge=union — produces ZERO
       false warnings. Tip tamper and seq-monotonicity are NOT detected;
-      documented in DESIGN.md, "Verification and tombstones".
+      documented in docs/data-model-and-integrity.md, "What `verify` catches".
     Both checks emit WARNING log messages on violation; neither drops events
     (detection is the guarantee; the fold still applies all events).
 
-    The '_shard' annotation added by parse_shard_bytes is stripped before
+    The annotations added by parse_shard_bytes are stripped before
     returning so fold handlers never see it.
 
     Returns the ordered, deduped event list — the canonical input to fold_events.
@@ -406,21 +482,28 @@ def finalise_events(raw_events: list[dict]) -> list[dict]:
     # Dedupe remains the deterministic fold input after physical-line checks.
     events = _dedupe_by_id(raw_events)
 
-    # Strip the private '_shard' annotation — fold handlers must not see it.
+    # Strip the private annotations — fold handlers must not see them.
     for event in events:
-        event.pop("_shard", None)
+        for key in _PRIVATE_KEYS:
+            event.pop(key, None)
 
     return events
 
 
-def read_raw_events(log_dir: str, *, include_invalid: bool = False) -> list[dict]:
+def read_raw_events(
+    log_dir: str,
+    *,
+    include_invalid: bool = False,
+    damaged: list[DamagedLogLine] | None = None,
+) -> list[dict]:
     """
     Read all shards in log_dir as RAW events — unsorted, undeduped, no
     integrity checks applied. By default records without an identifier are
     omitted so callers that sort the canonical event pool retain their
     established behaviour. Verification passes ``include_invalid`` to
-    inspect every successfully parsed JSON object before that filtering. This
-    is the filesystem-sourced half of
+    inspect every successfully parsed JSON object before that filtering. A
+    damaged line raises DamagedLogLine, or is added to damaged when a list
+    is given (see parse_shard_bytes). This is the filesystem-sourced half of
     read_events(), extracted so pinax.all_branches can union this
     raw pool with git-blob-sourced raw pools (pinax.replay.read_raw_events_at_ref,
     one per unmerged branch tip) BEFORE a single finalise_events call over the
@@ -433,7 +516,7 @@ def read_raw_events(log_dir: str, *, include_invalid: bool = False) -> list[dict
     raw_events: list[dict] = []
 
     for shard_path in shards:
-        for event in _read_shard(shard_path):
+        for event in _read_shard(shard_path, damaged):
             eid = event.get("id")
             if eid is None:
                 logger.warning("Event without id in shard %s - ignored.", shard_path)
@@ -462,6 +545,25 @@ def read_events(log_dir: str) -> list[dict]:
 # Per-type handlers
 # ---------------------------------------------------------------------------
 
+def _wrong_type(event: dict, *keys: str, nullable: tuple[str, ...] = ()) -> bool:
+    """
+    True, after a warning, when a payload field named in keys or nullable is
+    present and not a string. A nullable field may also be null.
+    """
+    payload = event["payload"]
+    for key in keys + nullable:
+        if key not in payload or isinstance(payload[key], str):
+            continue
+        if payload[key] is None and key in nullable:
+            continue
+        logger.warning(
+            "%s event with a %s that is not a string - ignored: %s",
+            event.get("type"), key, event.get("id"),
+        )
+        return True
+    return False
+
+
 def _handle_ergon_created(state: dict, event: dict) -> None:
     """Record the ergon initialisation marker in fold state."""
     if "ergon" not in state:
@@ -475,10 +577,12 @@ def _handle_phase_opened(state: dict, event: dict) -> None:
 
      Store `opened_seq` (the event seq) alongside `opened_at`.
     compute_next sorts phases by (opened_seq, opened_at, opened_by) — the seq
-    is the total-order primary key (ADR-001: timestamps are metadata, never
+    is the total-order primary key (timestamps are metadata, never
     the sort key).  Same-second same-seq collisions resolve by opened_at then
     opened_by for a complete total order.
     """
+    if _wrong_type(event, "phase"):
+        return
     phases = state.setdefault("phases", {})
     name = event["payload"].get("phase", "default")
     phases[name] = {
@@ -489,6 +593,18 @@ def _handle_phase_opened(state: dict, event: dict) -> None:
     }
 
 
+def _is_file_name(item_id: str) -> bool:
+    """True when item_id can be a file name on every supported system."""
+    return (
+        item_id not in ("", ".", "..")
+        and not item_id.endswith((" ", "."))
+        and not any(
+            char in '/\\:*?"<>|' or unicodedata.category(char) == "Cc"
+            for char in item_id
+        )
+    )
+
+
 def _handle_item_created(state: dict, event: dict) -> None:
     """Record a new item in the items dict."""
     items = state.setdefault("items", {})
@@ -496,6 +612,15 @@ def _handle_item_created(state: dict, event: dict) -> None:
     item_id = payload.get("item_id")
     if item_id is None:
         logger.warning("item.created event missing item_id: %s", event.get("id"))
+        return
+    if _wrong_type(event, "item_id", "title", "prefix", "status"):
+        return
+    if not _is_file_name(item_id):
+        logger.warning(
+            "item.created event with an item_id that cannot be a file name - "
+            "ignored: %s",
+            event.get("id"),
+        )
         return
     items[item_id] = {
         "id": item_id,
@@ -525,6 +650,8 @@ def _handle_item_status_changed(state: dict, event: dict) -> None:
             "item.status_changed event missing item_id: %s", event.get("id")
         )
         return
+    if _wrong_type(event, "item_id", "status"):
+        return
     if item_id not in items:
         logger.warning(
             "item.status_changed for unknown item %s - ignored.", item_id
@@ -543,7 +670,7 @@ def _handle_item_claimed(state: dict, event: dict) -> None:
 
     Collects all claim events into state["_pending_claims"][item_id] so that
     _reconcile_claims() can resolve double-claims after the full event stream
-    has been folded (order-independent, idempotent — ADR-003).
+    has been folded (order-independent, idempotent).
 
     The status field is NOT updated here; _reconcile_claims() sets
     items[item_id]["owner"] and emits claim.superseded outcomes for losers.
@@ -552,6 +679,8 @@ def _handle_item_claimed(state: dict, event: dict) -> None:
     item_id = payload.get("item_id")
     if item_id is None:
         logger.warning("item.claimed event missing item_id: %s", event.get("id"))
+        return
+    if _wrong_type(event, "item_id"):
         return
     # Accumulate all claim events for this item for later reconciliation.
     pending = state.setdefault("_pending_claims", {})
@@ -659,6 +788,24 @@ def _handle_policy_decision_actors_set(state: dict, event: dict) -> None:
     state["decision_actors_policy"] = dict(_policy_record(event), actors=listed)
 
 
+def _handle_policy_note_ref_prefixes_set(state: dict, event: dict) -> None:
+    """
+    Record a policy.note_ref_prefixes_set event: extra note reference prefixes.
+
+    Repository-level and latest-by-total-order wins, as the process is. A log
+    without one produces no key, and pinax.commands.note reads that as an
+    empty list. A malformed record is warned about and sets nothing.
+    """
+    listed = declared_note_ref_prefixes(event)
+    if listed is None:
+        logger.warning(
+            "policy.note_ref_prefixes_set event without a list of prefixes: %s",
+            event.get("id"),
+        )
+        return
+    state["note_ref_policy"] = dict(_policy_record(event), prefixes=listed)
+
+
 def _handle_item_decided(state: dict, event: dict) -> None:
     """
     Record an item.decided event as the item's latest decision.
@@ -707,6 +854,8 @@ def _handle_item_blocked(state: dict, event: dict) -> None:
     if item_id is None:
         logger.warning("item.blocked event missing item_id: %s", event.get("id"))
         return
+    if _wrong_type(event, "item_id", "gate"):
+        return
     if item_id not in items:
         logger.warning("item.blocked for unknown item %s - ignored.", item_id)
         return
@@ -736,6 +885,8 @@ def _handle_item_completed(state: dict, event: dict) -> None:
     if item_id is None:
         logger.warning("item.completed event missing item_id: %s", event.get("id"))
         return
+    if _wrong_type(event, "item_id", nullable=("briefing",)):
+        return
     if item_id not in items:
         logger.warning("item.completed for unknown item %s - ignored.", item_id)
         return
@@ -759,6 +910,8 @@ def _handle_item_parked(state: dict, event: dict) -> None:
     item_id = payload.get("item_id")
     if item_id is None:
         logger.warning("item.parked event missing item_id: %s", event.get("id"))
+        return
+    if _wrong_type(event, "item_id", "reason"):
         return
     if item_id not in items:
         logger.warning("item.parked for unknown item %s - ignored.", item_id)
@@ -789,6 +942,8 @@ def _handle_item_priority_set(state: dict, event: dict) -> None:
     if item_id is None:
         logger.warning("item.priority_set event missing item_id: %s", event.get("id"))
         return
+    if _wrong_type(event, "item_id"):
+        return
     if item_id not in items:
         logger.warning("item.priority_set for unknown item %s - ignored.", item_id)
         return
@@ -808,7 +963,7 @@ def _dep_event_key(event: dict) -> tuple:
     """
     Total-order sort key for a dep event: (seq, ts, actor, id).
 
-    Matches ADR-001's fold total-order key.  Used by _handle_dep_added /
+    Matches the fold's total-order key.  Used by _handle_dep_added /
     _handle_dep_removed to record the last-by-total-order operation for each
     (type, from_id, to_id) triple so that _resolve_dep_ops() can apply
     last-write-wins per (type, from, to) independently.
@@ -852,6 +1007,8 @@ def _handle_dep_added(state: dict, event: dict) -> None:
             "dep.added event missing from_id or to_id: %s", event.get("id")
         )
         return
+    if _wrong_type(event, "from_id", "to_id", "type"):
+        return
     # Key includes the edge type: (type, from_id, to_id) — fully independent per type.
     triple_key = (edge_type, from_id, to_id)
     ops: dict = state.setdefault("_dep_ops", {})
@@ -865,9 +1022,9 @@ def _handle_note_added(state: dict, event: dict) -> None:
     """
     Record a note.added event in the fold state.
 
-    ADR-004 / DESIGN.md: note.added carries a typed ref (pointing to a
-    knowledge-plane document) + an optional caption (capped at 200 chars,
-    enforced at CLI write-time — not re-validated here).
+    note.added carries a reference and an optional caption. Which references
+    are accepted and the caption cap are enforced at CLI write-time and not
+    re-validated here.
 
     The note is recorded in state["notes"] as a list of note records.
     Notes are recorded but do not change item status.
@@ -876,6 +1033,8 @@ def _handle_note_added(state: dict, event: dict) -> None:
     item_id = payload.get("item_id")
     ref = payload.get("ref", "")
     caption = payload.get("caption")
+    if _wrong_type(event, "item_id", "ref", nullable=("caption",)):
+        return
 
     notes = state.setdefault("notes", [])
     note_record = {
@@ -914,6 +1073,8 @@ def _handle_dep_removed(state: dict, event: dict) -> None:
             "dep.removed event missing from_id or to_id: %s", event.get("id")
         )
         return
+    if _wrong_type(event, "from_id", "to_id", "type"):
+        return
     # Key includes the edge type: (type, from_id, to_id) — fully independent per type.
     triple_key = (edge_type, from_id, to_id)
     ops: dict = state.setdefault("_dep_ops", {})
@@ -932,9 +1093,10 @@ def _handle_event_annulled(state: dict, event: dict) -> None:
 
     Payload: {"target_id": <id of the annulled event>, "reason": <text>}
 
-    This handler ONLY records bookkeeping (state["annulled"][target_id]) for
+    Runs only for an annulment in effect, or for an invalid one, which it
+    reports. It ONLY records bookkeeping (state["annulled"][target_id]) for
     audit/report purposes — it does NOT suppress the target's own warning or
-    handler application; that happens earlier via _collect_annulled_ids, which
+    handler application; that happens earlier via _annulments_in_effect, which
     fold_events() and finalise_events() both consult directly from the raw
     event stream (so suppression works correctly regardless of total-order
     position of this event relative to its target).
@@ -998,6 +1160,8 @@ def _handle_registry_repo_added(state: dict, event: dict) -> None:
             "registry.repo_added event missing repo_id or path/url: %s", event.get("id")
         )
         return
+    if _wrong_type(event, "repo_id", nullable=("path", "url")):
+        return
     ops: dict = state.setdefault("_registry_ops", {})
     key = _registry_event_key(event)
     current = ops.get(repo_id)
@@ -1031,6 +1195,8 @@ def _handle_registry_repo_removed(state: dict, event: dict) -> None:
         logger.warning(
             "registry.repo_removed event missing repo_id: %s", event.get("id")
         )
+        return
+    if _wrong_type(event, "repo_id"):
         return
     ops: dict = state.setdefault("_registry_ops", {})
     key = _registry_event_key(event)
@@ -1092,6 +1258,7 @@ _HANDLERS = {
     "item.priority_set": _handle_item_priority_set,
     "item.decided": _handle_item_decided,
     "policy.decision_actors_set": _handle_policy_decision_actors_set,
+    "policy.note_ref_prefixes_set": _handle_policy_note_ref_prefixes_set,
     "dep.added": _handle_dep_added,
     "dep.removed": _handle_dep_removed,
     "note.added": _handle_note_added,
@@ -1102,18 +1269,18 @@ _HANDLERS = {
 
 
 # ---------------------------------------------------------------------------
-# Claim reconciliation (fold-time, ADR-003)
+# Claim reconciliation (fold-time)
 # ---------------------------------------------------------------------------
 
 def _claim_sort_key(event: dict) -> tuple:
     """
-    Sort key for claim reconciliation per ADR-003: (ts, actor, id).
+    Sort key for claim reconciliation: (ts, actor, id).
 
-    ts is the primary key (wall-clock-first — ADR-003 is explicit that claim
-    is wall-clock-first, NOT seq-first).  actor and id are tiebreakers.
+    ts is the primary key (claim order is wall-clock-first,
+    NOT seq-first).  actor and id are tiebreakers.
     This is DIFFERENT from the fold total-order key (seq, ts, actor, id).
 
-    ADR-007 orders release and policy events against claims in this same
+    Release and policy events are ordered against claims in this same
     order, so every event the claim rules compare is keyed here and nowhere
     else.  Missing envelope fields read as the empty string rather than
     raising: the key orders whatever the log holds, and integrity checking
@@ -1124,7 +1291,7 @@ def _claim_sort_key(event: dict) -> tuple:
 
 def _resolve_expiry_policy(state: dict, policy_events: list[dict]) -> None:
     """
-    Build state["policy"] from the repository-level policy events (ADR-007).
+    Build state["policy"] from the repository-level policy events.
 
     The repository's current expiry is the LAST policy event in claim order.
     That is a different question from the policy in force for one claim
@@ -1148,7 +1315,7 @@ def _resolve_expiry_policy(state: dict, policy_events: list[dict]) -> None:
 
 def claim_expiry_policy_hours(state: dict) -> float:
     """
-    The claim expiry the folded repository runs on, in hours (ADR-007).
+    The claim expiry the folded repository runs on, in hours.
 
     The folded policy when the log carries one, and
     DEFAULT_CLAIM_EXPIRY_HOURS otherwise.  The one place that question is
@@ -1166,7 +1333,7 @@ def claim_expiry_policy_hours(state: dict) -> float:
 
 def _expiry_hours_in_force(policy_events: list[dict], claim_key: tuple) -> float:
     """
-    The expiry policy in force for one claim, in hours (ADR-007).
+    The expiry policy in force for one claim, in hours.
 
     The last policy event at or before that claim in claim order, and
     DEFAULT_CLAIM_EXPIRY_HOURS when the log carries none before it.  The one
@@ -1196,7 +1363,7 @@ def _claim_end(
     """
     Where a live claim ends in claim order, or None while it still holds.
 
-    A claim ends at the EARLIER of two points (ADR-007):
+    A claim ends at the EARLIER of two points:
       - the first item.claim_released for its item after it, or
       - the first event of any type after it whose timestamp is at or past
         the claim's own timestamp plus the policy in force for that claim.
@@ -1229,8 +1396,14 @@ def _claim_end(
 
     hours = _expiry_hours_in_force(policy_events, claim_key)
     claimed_at = _parse_event_ts(claim.get("ts", ""))
+    deadline = None
     if claimed_at is not None:
-        deadline = claimed_at + datetime.timedelta(hours=hours)
+        try:
+            deadline = claimed_at + datetime.timedelta(hours=hours)
+        except OverflowError:
+            # Past the last date datetime can hold, so no event reaches it.
+            pass
+    if deadline is not None:
         for event, moment in zip(timeline, timeline_ts):
             if moment is None or moment < deadline:
                 continue
@@ -1253,7 +1426,7 @@ def _claim_end(
 def _record_claim_end(state: dict, item_id: str, claim: dict, end: dict) -> None:
     """
     Record how one claim ended, in state["claim_released"] or
-    state["claim_expired"] (ADR-007).
+    state["claim_expired"].
 
     The one place either outcome is written.  Each entry names the claim it
     ended, the actor that held it, and the event that ended it, so a reader
@@ -1291,15 +1464,16 @@ def _record_claim_end(state: dict, item_id: str, claim: dict, end: dict) -> None
 
 def _reconcile_claims(state: dict, timeline: list[dict]) -> None:
     """
-    Fold-time claim reconciliation (ADR-003), with release and expiry
-    (ADR-007).
+    Fold-time claim reconciliation, with release and expiry.
 
     After the full event stream has been folded, walk each item's claims in
     claim order `(ts, actor, id)` keeping ONE live claim at a time:
     - The first claim is live: it sets items[id]["owner"],
       ["claimed_at"] and ["claim_event_id"].
-    - A claim that arrives while another is live produces a claim.superseded
-      outcome stored in state["claim_superseded"] (a list of dicts, each with
+    - A claim that arrives while a claim by the same writer is live is
+      absorbed: it changes nothing, so a writer never supersedes themselves.
+    - A claim that arrives while another writer's is live produces a
+      claim.superseded outcome stored in state["claim_superseded"] (a list of dicts, each with
       item_id, superseded_event_id, superseded_actor, winner_event_id,
       winner_actor) and a report warning.
     - A live claim ends where _claim_end() says it does: released, or expired
@@ -1345,7 +1519,7 @@ def _reconcile_claims(state: dict, timeline: list[dict]) -> None:
             )
             continue
 
-        # Sort by (ts, actor, id) — ADR-003 claim order.
+        # Sort by (ts, actor, id), the claim order.
         sorted_claims = sorted(claim_events, key=_claim_sort_key)
         item_releases = sorted(releases.get(item_id, []), key=_claim_sort_key)
 
@@ -1365,6 +1539,8 @@ def _reconcile_claims(state: dict, timeline: list[dict]) -> None:
                     claim, item_releases, timeline, timeline_ts, policy_events
                 )
                 continue
+            if normalise_actor(str(claim["actor"])) == normalise_actor(str(live["actor"])):
+                continue
             losers.append((claim, live))
 
         if live is not None and end is not None:
@@ -1376,7 +1552,7 @@ def _reconcile_claims(state: dict, timeline: list[dict]) -> None:
             items[item_id]["claimed_at"] = live["ts"]
             items[item_id]["claim_event_id"] = live["id"]
 
-        # Every claim that arrived while another was live is superseded by
+        # Every claim that arrived while another writer's was live is superseded by
         # the claim that was live at that moment.
         for loser, winner in losers:
             superseded_entry = {
@@ -1391,7 +1567,7 @@ def _reconcile_claims(state: dict, timeline: list[dict]) -> None:
                 f"claim.superseded: item {item_id} claimed by "
                 f"{loser['actor']} (event {loser['id'][:12]}...) superseded by "
                 f"earlier claim from {winner['actor']} (event {winner['id'][:12]}...) - "
-                f"earliest (ts={winner['ts']},actor={winner['actor']}) wins per ADR-003"
+                f"earliest (ts={winner['ts']},actor={winner['actor']}) wins"
             )
             warnings.append(warning_msg)
 
@@ -1803,7 +1979,7 @@ def compute_ready(state: dict, under: str | None = None) -> list[str]:
     1. Its status is 'queued' or 'ready'.
     2. It is NOT in any _INELIGIBLE_STATUSES (redundant with #1 but explicit).
     3. It carries no live claim: state["items"][id]["owner"] is unset. A
-       reconciled claim (ADR-003) makes an item ineligible on every machine
+       reconciled claim makes an item ineligible on every machine
        that folds it, from the moment the fold sees the winning
        item.claimed event, regardless of the item's status field - a claim
        and a status change are two different events, so an item can be
@@ -2268,7 +2444,7 @@ def fold_events(events: list[dict]) -> dict:
     but do not mutate any other state key.
 
     After the handler pass, runs _reconcile_claims() as a pure
-    post-pass to resolve any double-claims (ADR-003).
+    post-pass to resolve any double-claims.
 
     Before claim reconciliation, runs
     _resolve_dep_ops() to build state["deps"] via last-write-wins by total-order
@@ -2278,33 +2454,42 @@ def fold_events(events: list[dict]) -> dict:
     compute_ready() and compute_next() derive all ordering from the public fold
     state (state["phases"], state["items"], state["deps"]) — no private keys.
 
-    Events whose id is named by a valid `event.annulled` tombstone have
+    Events whose id is named by an `event.annulled` tombstone in effect have
     their own type handler SKIPPED entirely (their payload effects are never
     applied — e.g. an annulled item.completed never sets status=done and never
-    logs "unknown item").  The event.annulled event itself is exempt from this
-    skip (an annulment always runs its own handler, _handle_event_annulled, so
-    the tombstone is itself recorded).  This is a pure derivation over the
-    already-sorted, already-deduped stream (_collect_annulled_ids) — it does
+    logs "unknown item").  A valid event.annulled event that is not in effect is
+    skipped the same way, so it records nothing.  This is a pure derivation over
+    the already-sorted, already-deduped stream (_annulments_in_effect) — it does
     not matter where the annulling event sits relative to its target.
     """
     state: dict = {}
-    annulled_ids = _collect_annulled_ids(events)
+    in_effect = _annulments_in_effect(events)
+    annulled_ids = frozenset(in_effect.values())
     # Every event whose effects the fold actually applies, collected here and
     # handed to _reconcile_claims in claim order: a claim expires against the
-    # log's own events (ADR-007), and an event whose effects are suppressed
+    # log's own events, and an event whose effects are suppressed
     # never was one of them.
     applied: list[dict] = []
 
     for event in events:
         etype = event.get("type", "")
-        if etype != "event.annulled" and event.get("id") in annulled_ids:
+        valid = etype == "event.annulled" and valid_annulment(event)
+        if event.get("id") in annulled_ids or (valid and event["id"] not in in_effect):
             # Tombstoned — suppress this event's payload effects silently.
             # Raw bytes stay in the shard untouched; only fold-time application
             # of THIS specific event's handler is skipped.
+            if etype == "event.annulled" and not valid:
+                # Naming an invalid annulment does not excuse its invalidity.
+                _handle_event_annulled(state, event)
             continue
         applied.append(event)
         handler = _HANDLERS.get(etype)
-        if handler:
+        if handler and not isinstance(event.get("payload", {}), dict):
+            logger.warning(
+                "%s event with a payload that is not an object - ignored: %s",
+                etype, event.get("id"),
+            )
+        elif handler:
             handler(state, event)
         else:
             # Forward-compatible: unknown types are accepted without error.
@@ -2359,6 +2544,15 @@ def fold(log_dir: str) -> dict:
     """
     events = read_events(log_dir)
     return fold_events(events)
+
+
+def registry_from_usable_lines(log_dir: str) -> dict:
+    """
+    The folded registry, read past any damaged line, so a portfolio view of
+    a hub with a damaged log can still go on to the other repositories.
+    """
+    raw_events = read_raw_events(log_dir, damaged=[])
+    return fold_events(finalise_events(raw_events)).get("registry", {})
 
 
 def fold_prefix(log_dir: str, n: int) -> dict:

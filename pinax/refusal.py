@@ -23,6 +23,12 @@ ROOT_MISMATCH = "root_mismatch"
 PREFIX_REFUSED = "prefix_refused"
 INVALID_DEPENDENCY = "invalid_dependency"
 INTERNAL_ERROR = "internal_error"
+# The log holds a line that cannot be used as an event. The publish sequence
+# has a status of the same name; a command that reads the log before the
+# sequence ends under this one.
+LOG_DAMAGED = "log_damaged"
+# PINAX_TEST_RUN is 1 and the log is not under the temporary directory.
+TEST_RUN_REFUSED = "test_run_refused"
 # An interrupt (KeyboardInterrupt) ended the command; not raised as a
 # Refusal, since the process still ends by the interrupt itself.
 INTERRUPTED = "interrupted"

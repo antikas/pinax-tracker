@@ -7,7 +7,7 @@ default branch, append the item.created event, regenerate the projection,
 commit, and push. Refuses an actor handle that is not role@host before
 minting anything; see pinax.sync for the exit codes and offline rules.
 
-ADR-003: ID = <prefix>-<short base32 blake2b of (seq, title, actor, worktree_id, nonce)>
+ID = <prefix>-<short base32 blake2b of (seq, title, actor, worktree_id, nonce)>
 with auto-extend on collision against current fold state. The seq used
 here is entropy for the id hash only, read from the local fold before the
 sequence runs; it is independent of the seq the sequence itself assigns
@@ -20,12 +20,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 from .. import refusal
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 from ..fold import fold, read_events
 from ..ids import mint_item_id
+
+_PREFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 # pinax.sync imports pinax.projection, which imports pinax.commands.dep at
 # its own top level; a top-level "from .. import sync" here is safe today
@@ -62,6 +65,14 @@ def run(
     log_dir = os.path.join(ergon_dir, "log")
 
     refusal.require_tracker(log_dir)
+
+    if _PREFIX_RE.fullmatch(prefix) is None:
+        refusal.refuse(
+            f"pinax add: the prefix {prefix!a} is not allowed - use ASCII letters, "
+            "digits, '-' and '_', starting with a letter or a digit, so nothing "
+            "was appended.",
+            refusal.INVALID_ARGUMENT,
+        )
 
     # Local fold and log only: the id-mint entropy and the prefix-collision
     # guard are pre-append sanity checks against what this worktree can

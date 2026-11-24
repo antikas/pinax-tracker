@@ -1,125 +1,48 @@
 # Pinax
 
-Pinax is a Git-native tracker for software delivery work. It stores an
-append-only JSONL event log in the repository, derives the current board from
-that log, and commits the generated Markdown board alongside the code.
+When you work on a repository alone, a list in a text file is enough to remember what is left to do. Once several people, or several coding assistants, work on the same repository from different machines, two of them can start on the same task without knowing it, and a task finished on one laptop can still look open on another. Later, nobody can say for certain who changed which task, or when.
 
-The tracker gives a team one durable record of items, dependencies, ownership,
-status, and completion briefings. Git carries the record between clones and
-branches. There is no service to host, database to operate, or account to
-create.
+Pinax is a task list that lives inside the repository and reaches everyone through Git. Before you start a task you put your name on it with one command, and everyone else sees your name on it the next time they pull. Pinax calls that a claim. If someone else then tries to take the same task, Pinax refuses and tells them it is yours.
 
-## Install
+By default a claim lasts 24 hours, and after that someone else can take the task. When two people claim the same task within a few seconds of each other, the earlier claim wins, and the other person finds out at once or from the task list after their next pull. Pinax shares claims only by pushing straight to the repository's main branch, which Git calls the default branch, so it does not fit a repository where every change must go through a pull request. It cannot stop someone who starts work without claiming the task first.
 
-Pinax requires Python 3.10 or later and Git.
+## One task from start to finish
 
-```bash
-pipx install pinax-tracker
-pinax --help
-```
+You can install Pinax first, as described under [Requirements and install](#requirements-and-install). The steps below follow one task. Pinax calls each task an item. You see the task list as a Markdown file, `.ergon/board.md`, which Pinax calls the board. The board groups the items by their status, and each group is a lane.
 
-The same package installs with pip:
+1. Run `pinax init` once for the repository, in a clone whose remote holds at least one commit. A folder named `.ergon/` appears. It holds the log of every change in `.ergon/log/`, the board in `.ergon/board.md`, and a folder `.ergon/items/` for one page per item. It also holds `.ergon/.gitattributes` and `.ergon/.gitignore`, which tell Git how to treat the log.
+2. Commit that folder once, by hand, and push it.
+3. Run `pinax add --title "Write the install guide" --prefix app --actor alex@laptop`. The prefix starts every item id. `--actor` gives the name the change is recorded under, which Pinax calls the writer; a writer can be a person or an assistant. Pinax prints the new item's id, such as `app-4x56`.
+4. Look at what changed. A line appears in `.ergon/log/alex-laptop.jsonl`, and a row appears in the `## Queued` lane. A page appears at `.ergon/items/app-4x56.md`, and a commit named `pinax: item.created app-4x56` is pushed.
+5. Run `pinax claim app-4x56 --actor alex@laptop`. The item moves to the `## Building` lane with `alex@laptop` as its owner. Run `pinax board` to print the board in your terminal; every clone shows the same after a pull.
+6. Write a short note of what you did into `note.md`, and run `pinax done app-4x56 --briefing note.md --actor alex@laptop`. The item moves to the `## Done` lane, and its page shows your note under `## Briefing`.
+7. Run `pinax verify`. It prints `pinax verify: OK - projection matches log.` and exits 0. The projection is the board and the item pages together. Pinax rebuilds them from the log after every change, so they always show what the log says.
 
-```bash
-python -m pip install pinax-tracker
-```
+## How a change travels
 
-To work from a checkout:
+This section follows the item from step 3 through the system.
 
-```bash
-git clone https://github.com/antikas/pinax-tracker.git
-cd pinax-tracker
-python -m pip install -e .
-```
+**The line in the log.** Each change is one line of JSON in the log, which Pinax calls an event. It records the change, its time and its writer. A writer name has the form `role@host`. The role says who writes, such as `alex` for a person or `assistant1` for a coding assistant, and the host names the machine. Pinax writes the event to a file named after its writer, here `alex-laptop.jsonl`. To build that file name, it replaces `@`, `/`, `\` and spaces with `-`. Names that then differ only in letter case share one file. The event's id is a hash of its own contents and of the previous event that writer wrote. Each event also carries a number, one more than the highest number in the log when it was written, which Pinax calls the sequence number.
 
-## Start tracking a repository
+**The check against the remote.** Before it writes, Pinax fetches `origin`. It reads the events already on the remote's default branch together with your local ones. Pinax calls an event published once it is on the remote's default branch. When a command names an item that neither side holds, for example `pinax claim app-9zzz`, Pinax refuses it and appends nothing.
 
-Run `pinax init` at the root of the repository you want to track. It creates
-`.ergon/`, records the initial events, configures the log's merge attributes,
-and installs a pre-commit verification hook when Git allows it.
+**The pages.** Pinax reads every event and works out the current state of every item. It then rewrites `.ergon/board.md` and each item page from that state. The same log always gives the same pages, whatever the order of the lines and on any operating system.
 
-```bash
-pinax init --actor alex@laptop
-pinax add --title "Ship the widget" --actor alex@laptop
-pinax claim <item-id> --actor alex@laptop
-pinax done <item-id> --briefing completion.md --actor alex@laptop
-pinax status
-```
+**The commit.** Each write command commits its event in a commit of its own. When it retries a push after a merge, it may add a merge commit and a commit that rebuilds the projection. Pinax stages the file in `.ergon/log/` named after you, which it calls your shard, and the projection. It commits only those paths, here with the subject `pinax: item.created app-4x56`. Anything else you had staged stays staged and stays out of that commit. Git hooks run as usual, and Pinax never bypasses them.
 
-`completion.md` is a short work record. It stays with the item in the
-generated projection.
+**The push.** Pinax pushes when the branch you have checked out is the remote's default branch. If the remote has moved on, Pinax pulls, merges, rebuilds the projection and tries again, up to three attempts in total. It never rebases, force-pushes, resets or deletes branches. The push can still be rejected after three attempts, or the merge between attempts can fail to finish. Then the command exits 5, and the event stays committed only in your clone. A claim is the exception, because it cancels itself. [docs/sharing-and-sync.md](docs/sharing-and-sync.md) gives the recovery.
 
-## Everyday commands
+On any other branch, Pinax commits the event locally and prints `pinax: the push was refused because <branch> is not the origin default branch <default branch>; the event is committed locally and not published.` A claim made there is not shared with anyone, and `pinax claim` exits 4.
 
-```text
-pinax --version
-pinax add --title TEXT
-pinax claim ITEM_ID
-pinax done ITEM_ID --briefing FILE
-pinax block ITEM_ID --gate scope|decision|destructive|proposal [--owner-gate CLASS]
-pinax park ITEM_ID --reason TEXT
-pinax decide ITEM_ID --option KEY --label TEXT --effect release|park --reason TEXT
-pinax dep add FROM_ID --blocks TO_ID
-pinax ready [--under ITEM_ID]
-pinax next [--under ITEM_ID]
-pinax status [--json] [--under ITEM_ID]
-pinax board [--json]
-pinax report [--json]
-pinax release ITEM_ID --reason TEXT
-pinax policy claim-expiry --hours N
-pinax policy process --mode flow|strict
-pinax policy owner-gates --class TEXT [--class TEXT ...]
-pinax policy decision-actors --decider ROLE@HOST [--decider ROLE@HOST ...]
-pinax policy check [--json]
-pinax verify [--fix]
-pinax replay --at GIT_REF
-```
+**Another clone.** A colleague pulls. Git merges the log files line by line, because `.ergon/.gitattributes` tells it to keep the lines of both sides. Their Pinax reads the merged log and arrives at the same state you see. When they now run `pinax claim` on your item, the command exits 3 and appends no claim. Its message names you and the time of your claim, and the board keeps you as the owner. If they had a claim of their own waiting unpublished, the command cancels it in their log. When you run `pinax claim` again on an item you already hold, it exits 0 and appends nothing.
 
-`pinax verify` checks that every physical parsed event has a valid event hash
-unless it is covered by a valid tombstone, then compares the generated board
-and item pages with the committed projection. `--fix` regenerates only a
-drifted projection. It refuses invalid event history without changing the log
-or projection.
+**Two claims close together.** Each event's time comes from the clock of the machine that wrote it. When two people claim an item before either has seen the other's claim, both claims are recorded and the one with the earlier time wins. A machine whose clock runs a few seconds behind yours can therefore take an item you have just claimed, if it fetched before your claim was pushed. To limit that, `pinax claim` refuses with exit 6 when its time is more than five seconds behind the newest event on the remote that no annulment cancels. `PINAX_CLOCK_TOLERANCE_S` changes the five seconds. If your claim reaches the remote second and loses, `pinax claim` exits 3, and your claim stays in the log as superseded. If your claim reaches the remote first and has the later time, your command exits 0. The board then shows the other writer as the owner after your next pull, and lists that conflict under `## Claim conflicts (resolved)`.
 
-## Owner-gate classes
+## Rules you set
 
-A block with gate `decision` or `destructive` is a block for the owner: the
-item waits until the owner decides or approves. `scope` and `proposal` are
-not, and never need a class.
+You and the other people on the project set the rules that decide how work may move. Each rule is an event in the log like any other. You can read the rules on the history page of `pinax web`, a read-only view of one repository in your browser, or in `pinax board --json`. You change a rule with a `pinax policy` command.
 
-Each project chooses a process with `pinax policy process --mode flow|strict`.
-The last such event in the log is the one in force, and a log without one
-runs on `flow`.
-
-Before you set `strict`, upgrade every clone, and every older `pinax` on
-PATH that a pre-commit hook could run, to 0.4.0 or later.
-
-- `flow`: nothing is checked. `--owner-gate CLASS` on `pinax block` records
-  the class in the event and nowhere else, so the board and item files are
-  the same as an earlier Pinax writes for the same log. A block without the
-  option is the same event as before. A class that matches a listed one,
-  whatever its case and spacing, is stored in the list's spelling; any other
-  class is stored as given with its spaces collapsed.
-- `strict`: a block for the owner must name a class with `--owner-gate`,
-  and any class given must be on the project's list. A block with no class,
-  or with a class not on the list, is refused, nothing is appended, and the
-  command ends with exit 8. The check runs on the union with the remote, so
-  a process set on another clone already binds. With `--offline` there is no
-  remote check, so a strict process set on another clone and not yet pulled
-  does not bind. The refusal is one line that shows the list, for example:
-
-  ```text
-  pinax: strict process: 'because I said so' is not an owner-gate class. Give one of these with --owner-gate: production deployment; publication; ... Nothing was appended.
-  pinax: strict process: a block with gate decision needs an owner-gate class. Give one of these with --owner-gate: production deployment; publication; ... Nothing was appended.
-  ```
-
-Under strict, while the item is blocked, the class shows on its board line
-(`gate=decision · owner gate: publication`) and as `owner_gate:` in its
-item file. When the item leaves blocked, the class goes with the block.
-
-The list is project policy too: a project sets its own list with
-`pinax policy owner-gates --class TEXT [--class TEXT ...]`. Until it does,
-the list is:
+**Blocking.** When an item cannot go on, block it with `pinax block <id> --gate <gate>`. The gate is the reason, and you choose it from `scope`, `decision`, `destructive` and `proposal`. A blocked item can also wait for someone's approval. The kind of approval it waits for is called its owner gate. Here "owner" means the person who must approve, who is often a different person from the writer holding the claim. The default classes are:
 
 - production deployment
 - publication
@@ -129,261 +52,181 @@ the list is:
 - login-bound act or owner-held input
 - start signal for a material plan
 
-`pinax policy check` lists every blocked item for the owner with no class,
-or with a class not on the list. Under `flow` it only reports and exits 0.
-Under `strict` it exits 1 when it lists any item. It reads the local log
-and changes nothing, so pull before you run it.
+`pinax policy owner-gates --class TEXT` replaces that list with your own.
 
-## Decisions
+**Parking.** To set an item aside with a reason, park it with `pinax park <id> --reason TEXT`.
 
-`pinax decide ITEM_ID --option KEY --label TEXT --effect release|park
---reason TEXT` records a decision on an item as one `item.decided` event
-holding the option, its label, the effect and the reason; the actor and the
-time are the event's own. The option, label and reason must not be blank,
-and the effect is `release` or `park`; anything else ends with exit 2 and
-nothing appended. An item that does not exist ends with exit 1.
+**Decisions.** To record the answer to a blocked item, run `pinax decide`. It stores the option chosen, a label, an effect and a reason, and the item page shows the latest one. With `--effect release` the item's status does not change. With `--effect park` the item is also parked. The writers allowed to decide form the decision-actor policy, which you set with `pinax policy decision-actors --decider ROLE@HOST`.
 
-- `release`: only the decision is appended. The item's status, gate and
-  owner-gate class stay as they were, and the command says so, for example
-  `pinax: decision recorded on ITEM_ID; status unchanged: blocked (gate
-  scope)`. A decision does not release a claim; like any event, one
-  recorded past a claim's expiry deadline marks that claim expired.
-- `park`: the decision and an ordinary `item.parked` event with the same
-  reason are appended in one commit, decision first, so the item is parked
-  exactly as `pinax park` would park it.
+**The process.** The process is either `flow` or `strict`, and you set it with `pinax policy process --mode`. The default is `flow`, where any writer may decide and any class is accepted. Under `strict`, only listed writers may decide. A block with the gate `decision` or `destructive` must then also name a class on the list. Pinax refuses a block or a decision that breaks these rules with exit code 8 and appends nothing. A strict policy pushed from another clone binds your next write. Because any writer can switch strict back to flow, strict protects you from mistakes and gives no access control.
 
-A decision is never written as a note, so an item's newest note stays what
-it was. The item page shows the latest decision in a `## Decision` section,
-and `pinax status --json` carries it as a `decision` object on every row it
-prints for that item. `pinax status --json` prints no row for a queued or
-ready item without a live claim, so such an item's decision shows on its
-item page and in the fold state only. Decisions change nothing in how an
-item with no decision renders or serialises.
+**How long a claim holds.** A claim is live from the moment it is recorded until it is released, expires, or loses to a claim with an earlier time. Any writer may release any claim by running `pinax release <id> --reason TEXT`. A claim expires once its expiry time has passed and some later event, of any kind, has been recorded. In a log where nothing happens, it never expires. The default expiry is 24 hours. `pinax policy claim-expiry --hours N` changes it for claims made after that event.
 
-Running the same decision again is harmless, and it finishes what an
-earlier run left undone. When the latest decision on the item, in the
-local log together with the remote default branch, has the same option,
-label, effect, reason and actor (the actor's host compared in lower case),
-and for `park` the item is still parked, nothing is appended and the JSON
-says `"appended": false`. If the remote already has the decision, nothing
-is committed or pushed and the JSON says `"published": true` and
-`"sync_status": "already_published"`. Otherwise a decision left
-uncommitted by a refused commit is committed, and a decision left local by
-a rejected push is pushed, so a retry after a rejected push publishes the
-existing decision without appending a second copy. `published` then says
-whether it reached the remote.
+**What a note may point at.** A note may point at a path inside the repository, written from its root without `..`, or at a web page, and `pinax policy note-refs --prefix TEXT` adds other prefixes that its reference may start with.
 
-Under `flow` any actor may decide. Under `strict` only an actor on the
-project's decision-actor list may: set it with `pinax policy
-decision-actors --decider ROLE@HOST [--decider ROLE@HOST ...]`, where
-`--actor` stays the writer of the policy event. The last such event is in
-force. Under strict, a decision from an actor not on the list, or with no
-list set, ends with exit 8 and nothing appended.
+## Checks on the record
 
-Before the first decision is written, every clone, and every older `pinax`
-a pre-commit hook could run, must run this version. Every released Pinax
-before 0.4.0 predates version 2 events and reports each version 2 event
-that no tombstone names as an integrity violation. Decision events are
-version 2 events and are reported the same way.
+`pinax verify` reads the whole log and checks it. If any check fails, it exits 1.
 
-## Publishing a state change
+Each event must still match its own id, unless an annulment in effect names it. An annulment is an event, written by `pinax annul`, that cancels an earlier event while its line stays in the log. To undo an annulment, annul it in turn, and the event it cancelled counts again.
 
-Every command above that appends an event (add, claim, done, block, park,
-decide, release, the four policy setters, priority, dep, note, annul) runs
-the same publish sequence. It fetches the
-remote named `origin`, folds the union of the local log and the remote
-default branch's committed shards, appends the event, regenerates the
-board and item pages, commits the shard and the projection with the
-repository's hooks running, and pushes the remote default branch when that
-branch is checked out. This is what makes a claim or a completion visible
-to every other clone as soon as the command returns.
+Each event Pinax writes carries format version 2. When a version 2 event names a previous event, that event must still be in the log. So a deleted event is caught when a later version 2 event names it, as long as that later event is unchanged and not annulled.
 
-The commit carries the resolved tracker root in its environment, as
-`PINAX_ROOT`. The sequence gives a hook no arguments, so a hook that calls
-Pinax back, such as the pre-commit hook `pinax init` installs and the
-`pinax verify` it runs, checks the tracker the command resolved rather
-than whatever root the surrounding environment happened to name.
+The board and every item page must match a fresh rebuild from the log. A board or item page that no longer matches is called drift. Finally, the log must not be hidden from Git by a `.gitignore` rule.
 
-Every one of these commands also refuses an actor that is not written as
-`role@host`, before it appends anything.
+Git runs a script before each commit, called the pre-commit hook. `pinax init` installs one that runs `pinax verify`. When the hook cannot find Pinax, it lets the commit through with a warning.
 
-A write command is one of the commands that run the publish sequence. Given
-`--json`, a write command prints exactly one JSON object on standard output,
-whatever the exit code, and that JSON result carries `published` and
-`sync_status`. `published` is true only when this run's push to the remote
-default branch was accepted, or when the remote default branch already
-held the event when this run fetched it. `sync_status` names what the
-sequence did (for example
-`pushed`, `committed_local` or `remote_unreachable`). When the sequence
-fails, the result is the sequence's own report. Exit 0 also covers a commit
-that stayed local, so a caller which must know a write reached other
-machines reads `published`.
+`pinax verify --fix` rebuilds the board and pages when the log passes its checks. It never changes an event. While the log fails its checks, it refuses to touch the projection.
 
-A write command refused before the sequence runs prints a refusal result.
-Its `published` is false, and its `sync_status` names the refusal:
-`invalid_argument`, `not_a_tracker`, `root_mismatch`, `prefix_refused`,
-`invalid_dependency`, `unknown_target` or `internal_error`. Its `error`
-holds the refusal's message, and `exit_code` and `command` name the exit
-code and the subcommand. The exit code is the same with or without
-`--json`, and the message still goes to standard error. An interrupt
-prints a result whose `sync_status` is `interrupted`, unless the sequence
-had already printed its report, and then ends the process by the
-interrupt as before. A help or version request is the one exception: it
-prints its text unchanged and exits 0.
+Because nothing signs the events, `verify` cannot see several kinds of edit. It does not catch the deletion of the newest event of any writer, or of the newest event on either branch of a merge. A writer with access to the repository can add a forged event with a correct id. Such a writer can also rewrite an event and every event after it. A line that is not valid JSON is skipped with a warning. The skip itself does not fail `verify`, although a later check can fail because of what the line held. Sequence numbers that go backwards are not caught either. For everything `verify` cannot see, Git history is the only record.
 
-All of them except `claim` accept `--offline`, or the `PINAX_OFFLINE=1`
-environment variable, to skip the fetch and the push and commit locally
-only. A repository with no reachable `origin`, or no published default
-branch, behaves the same way on its own: the command commits locally and
-prints a warning naming the remote, instead of failing. A directory that
-is not a git repository at all falls back the same way, appending and
-regenerating the projection with a warning and no commit attempted, since
-there is nothing to commit into. `claim` is the one exception. Its whole
-purpose is telling every other machine an item is taken, so it always
-needs the remote: without a reachable `origin`, or without a git
-repository to fetch from, it ends without appending anything at all,
-rather than recording a claim nobody else can see.
+## Limits
 
-The exit codes these commands share are:
+Pinax has no lock between machines, because a claim is checked against what the remote holds when it runs. When another writer's live claim is already there, the command exits 3 and writes nothing. When two writers claim before either has seen the other's claim, the earlier time wins. A losing writer whose claim reaches the remote second is told by exit 3. When the losing claim reached the remote first, its command has already exited 0. That writer learns of the loss only from the board after the next pull.
 
-    0  the event is committed, and published when the remote default
-       branch is checked out
-    1  the command names an item that does not exist (an annulment: an
-       event that does not exist); nothing was appended
-    2  the actor is not written as role@host; nothing was appended
-    3  a published claim that the fold over the pushed remote state reports
-       superseded
-    4  claim needed the remote and could not reach or read it, or any
-       command's remote answered but its committed events could not be
-       read
-    5  the push was rejected on every attempt
-    6  a claim's timestamp is behind published history, or cannot be read;
-       nothing was appended
-    7  the shard and the projection could not be staged, or the commit
-       was refused; the appended event stays uncommitted either way
-    8  the project's policy refuses the event: under the strict process,
-       a block for the owner without a listed owner-gate class, or a
-       decide from an actor not on the decision-actor list or with no
-       list set; nothing was appended
+Pinax cannot stop someone who starts work without claiming it. It cannot stop someone who works on a branch other than the remote's default branch either, because claims made there are not shared.
 
-A hook that refuses the commit is never worked around. The command prints
-the hook's output, names the shard and the event id, leaves the appended
-event uncommitted, and ends with exit 7; fix what the hook objected to and
-commit the shard and the projection. A `.gitignore` rule that swallows
-`.ergon/log/` is one of these refusals: the installed hook's `pinax verify`
-fails while the log is ignored, so a state-changing command ends with exit
-7 instead of committing an event the repository would silently keep to
-itself. Run `pinax init` again to reinstall the `.ergon/.gitignore`
-negation, or fix the repository's own `.gitignore`, then commit the shard.
+Pinax has no access control. Any writer may claim any item, release a claim, decide under `flow`, and change any policy.
 
-`registry`, `reconcile`, and `init` do not run this sequence. They keep
-their own local behaviour: `registry` records and lists remote
-repositories for `pinax overview --remote`, `reconcile` imports
-already-completed offline work from a text file into ordinary events, and
-`init` creates `.ergon/` itself. None of the three needs cross-machine
-visibility the moment it runs, so none of them fetches or pushes.
+Pinax has no rules about the order of statuses. The command `pinax status <id> <state>` sets any status from any status, including back from done. These are the statuses:
 
-`pinax doctor` reports two separate things a git-native tracker can be
-behind on: shards committed to `HEAD` but not yet on the remote default
-branch (unsynced, a normal state for offline work waiting to be pushed),
-and events appended to the working tree but not yet committed at all
-(uncommitted, an orphaned trail worth investigating). They are listed in
-distinct sections because they call for different next steps: push one,
-commit the other.
+| Status | Meaning |
+|---|---|
+| `queued` | Set by `pinax add`. Pinax offers the item as ready to take. |
+| `ready` | Set by you. Pinax offers the item as ready to take. |
+| `building` | A working status. When you claim an item, the board shows it in this lane. |
+| `blind-verify`, `adjudicate` | Two more working statuses, which `pinax status` lists with `building`. |
+| `done`, `blocked`, `parked` | Finished, blocked and parked items. |
 
-## Storage model
+Pinax runs only when you call it. The one exception is `pinax web`, which serves one repository read-only on `127.0.0.1` with no sign-in.
 
-```text
-.ergon/
-  log/*.jsonl       append-only event shards
-  board.md           generated project board
-  items/<id>.md      generated item pages
+Some commands write events without committing or pushing them. [docs/commands.md](docs/commands.md) lists them under "Commands that never push" and describes each one.
+
+| Command | What it does |
+|---|---|
+| `pinax init` | Sets up the tracker. |
+| `pinax status <id> <state>` | Sets an item's status. |
+| `pinax dispatch --claim` | Claims the ready items it lists, all at once. |
+| `pinax registry add`, `pinax registry rm` | Record other repositories for the portfolio view. |
+| `pinax reconcile` | Imports done and park lines from a text file. |
+| `pinax doctor --reconcile` | Walks you through repairing incomplete records. |
+
+Their events reach other clones only once a commit includes the shard they went into. That commit can be your own `git add .ergon` and commit, or the next write command by that shard's writer.
+
+Without a reachable remote, Pinax sees only your local log. A policy or a claim set on the remote stays invisible until you pull.
+
+## For engineers
+
+### Requirements and install
+
+You need Python 3.10 or later and Git on your `PATH`. Pinax runs on POSIX systems and on Windows. It has no other runtime dependencies, and it is released under the MIT licence.
+
+```
+python -m pip install pinax-tracker
+pinax --version
 ```
 
-Each event has a content-derived identifier. The fold sorts events by
-`(seq, ts, actor, id)`, deduplicates by identifier, and applies the resulting
-stream deterministically. Git's union merge driver preserves concurrent JSONL
-appends; a duplicated line is a no-op in the fold.
+The second command prints the installed version. [docs/commands.md](docs/commands.md) lists every command with its exit codes.
 
-Claims resolve during the fold. If two claims name one item, the earliest
-`(ts, actor, id)` claim wins and the other becomes a reported supersession.
-Dependency edges drive `ready` and `next`.
+### Track your first item without a remote
 
-A live claim also makes its item ineligible for `ready` and `next`, on
-every clone, from the moment the claim reaches that clone's log - a claim
-and a status change are two different events, so a claimed item can still
-show status `queued`. `pinax status` renders such an item in its building
-list with the owner and how many hours ago the claim was made, labelled by
-the claim itself rather than the item's creation time, even before its
-status field ever moves to `building`. A held claim ends when it is
-released with `pinax release ITEM_ID --reason TEXT`, or when it expires:
-the policy in force is the last `pinax policy claim-expiry --hours N`
-event at or before the claim, and twenty-four hours by default when the
-log carries none before it. A quiet log - one that records nothing after
-the claim - never expires it, so a claim only ends when the log itself
-records the release or a later event past the deadline.
+`pinax claim` needs a remote. In a repository with no remote, you add items and finish them without claiming. Start in a Git repository with at least one commit and no `origin`, and run these commands from its root:
 
-`--under ITEM_ID` on `ready`, `next`, and `status` restricts the view to
-the transitive `parent-child` descendants of that item - the ancestor's
-own row is never included, only its descendants; an id that names no item
-in the log is refused, nothing is appended. `status --under` requires
-repo scope; it is refused together with `--portfolio` and with the
-two-argument setter form. It scopes the building/shipped/parked lists and
-the next/queue_depth figures; the repo-wide claim-reconciliation notice
-count is unaffected.
+```
+pinax init
+git add .ergon
+git commit -m "Add the Pinax tracker"
+pinax add --title "Write the install guide" --prefix app --actor alex@laptop
+```
 
-`next --json` and `status --json` are JSON objects with an `under` key:
-the ancestor id, or `null` when `--under` is not given. `ready --json` is
-a bare array of item ids when `--under` is not given; with `--under` it is
-`{"ready": [...], "under": "<id>"}`. `ready --json --all-branches` is an
-object that also carries the `under` key.
+`pinax init` prints `pinax: initialised .ergon/ in <root>` and `pinax: emitted ergon.created + phase.opened (actor=operator@<host>)`. It commits nothing, which is why you commit `.ergon/` yourself. The hook then prints `pinax verify: OK - projection matches log.`
 
-An item with at least one `parent-child` child carries a derived
-`rollup` value beside its own `status` - `done`, `building`, `blocked`,
-or `queued` - summarising its children without ever changing the
-item's own status or its eligibility for `ready`/`next`. `pinax board`
-and `pinax status` render it alongside the status wherever it is
-present; the rule the fold applies is in [DESIGN.md](DESIGN.md).
+`pinax add` prints `pinax: created item <id> - "Write the install guide" in <root>/.ergon`. A second line gives the event id, the sequence number and the writer. It also prints `pinax: origin could not be reached; the event is recorded locally and not published.` It exits 0, with the item committed locally.
 
-Each new event's identifier covers the event before it in its chain.
-`pinax verify` fails when a hashed field of such an event (`seq`, `ts`,
-`actor`, `type`, `payload`, `prev`, `v`) is changed and the event keeps its
-recorded identifier. It also fails when a new event that a later new event names as its
-predecessor is deleted, repointed, or edited with a recomputed identifier, while
-that later event stays as it was and is not annulled, even when the later events
-are moved into another shard file. These are not covered by the checks:
-deleting, or editing with a recomputed identifier, an event no later event
-names as its predecessor, which includes the newest events of a chain and,
-after two clones wrote to the same chain, the newest event of each branch;
-deleting an event whose successor is annulled; the content of an annulled
-event, of which only the identifier is checked; a rewrite that recomputes an
-event and every later event of its chain; deleting, or editing with a
-recomputed identifier, an event followed by one an earlier Pinax wrote; any
-edit to the predecessor field of an event an earlier Pinax wrote; and a field
-added to an event beside the hashed fields, which the fold does not read. Git
-history is the anchor for them.
-Events written by an earlier
-Pinax have no version field and keep verifying under the rule they were written
-with. There are no signatures and no outside anchor: Git history is the record
-of a rewrite the log cannot show on its own. [DESIGN.md](DESIGN.md) lists what
-each rule catches.
+Write a few lines about the finished work into `note.md`. Then run these commands, with your item's id in place of `<id>`:
 
-An earlier Pinax checks every event under the old rule, so it reports each
-newly written event that no tombstone names as an integrity violation, its
-`pinax verify` fails, and its pre-commit hook refuses commits. Every clone, and every older `pinax` on
-PATH that a pre-commit hook could run, must run this version before the first
-version 2 event is written.
+```
+pinax done <id> --briefing note.md --actor alex@laptop
+pinax verify
+```
 
-Decisions follow the same order: every clone, and every older `pinax` a
-pre-commit hook could run, must run this version before the first decision
-is written. The Decisions section above says what an earlier Pinax does
-with a log that holds them.
+`pinax done` prints `pinax: item <id> marked done by alex@laptop in <root>/.ergon`. A second line gives the briefing length, the event id and the sequence number, and the same warning about `origin` follows. It exits 0. `pinax done` needs no claim. Pinax stores the full text of `note.md` in the event and does not commit the file itself. `pinax verify` prints `pinax verify: OK - projection matches log.` and exits 0.
 
-The event envelope, integrity rules, and projection model are described in
-[DESIGN.md](DESIGN.md). The executable event handlers and renderers are the
-authoritative implementation details.
-Architecture decisions are in [docs/decisions](docs/decisions).
+If you run `pinax claim <id> --actor alex@laptop` here, it prints `pinax: origin could not be reached, so nothing was appended.` and exits 4. To skip the fetch and the push on purpose, pass `--offline` or set `PINAX_OFFLINE=1`. This works for every write command except `pinax claim`.
 
-## Licence
+### Track your first item with a remote
 
-Pinax is available under the [MIT License](LICENSE).
+Start in a clone whose remote is named `origin`, with its default branch checked out and at least one commit already pushed. Run these commands from its root, once for the repository:
+
+```
+pinax init
+git add .ergon
+git commit -m "Add the Pinax tracker"
+git push
+pinax add --title "Write the install guide" --prefix app --actor alex@laptop --json
+```
+
+`pinax add --json` prints one line: `{"actor": "alex@laptop", "event_id": "<event id>", "item_id": "<id>", "prefix": "app", "published": true, "root": "<root>/.ergon", "seq": 2, "status": "queued", "sync_status": "pushed", "title": "Write the install guide", "ts": "<time>"}`. A write can exit 0 without reaching the remote, so check `published`. It is true only when this run's push was accepted or the event was already published. `pinax claim`, `pinax done` and the other write commands accept `--json` too.
+
+Now claim the item:
+
+```
+pinax claim <id> --actor alex@laptop
+```
+
+`pinax claim` prints `pinax: claimed item <id> by alex@laptop in <root>/.ergon`. A second line gives the event id and the sequence number, and it exits 0. When it exits 3 instead, another writer's claim holds the item.
+
+To pick another item, run `pinax ready`. It lists the items that are queued or ready, have no live claim and are not waiting on another item. `pinax next` prints the one item to take first. It chooses by priority, then by the length of the chain of items waiting on it, then by age. An item waits on another when someone has run `pinax dep add <other> --blocks <item>`. It stays out of `pinax ready` until the other item is done.
+
+Before you start work, confirm the claim:
+
+```
+git pull --no-rebase
+pinax board
+```
+
+A claim with an earlier time from another machine can still reach the remote after yours, so exit 0 alone does not prove the item is yours. Check that the item's row under `## Building` names `alex@laptop`.
+
+Then write a few lines about the finished work into `note.md`. Finish the item and check the log:
+
+```
+pinax done <id> --briefing note.md --actor alex@laptop
+pinax verify
+```
+
+`pinax done` prints `pinax: item <id> marked done by alex@laptop in <root>/.ergon`. A second line gives the briefing length, the event id and the sequence number, and it exits 0 with the event pushed. `pinax verify` prints `pinax verify: OK - projection matches log.` and exits 0.
+
+### Set up every further clone
+
+Each colleague or assistant with its own clone installs Pinax, clones or pulls the repository, and runs `pinax init` in it. The `.ergon/` folder is the tracker. When it already exists, `pinax init` prints `pinax: .ergon already initialised (idempotent - skipped event emit).` It appends nothing and installs the pre-commit hook. The hook lives inside each clone's own Git directory, so it does not travel with the repository. Each writer then passes its own `--actor` name on every command.
+
+### Add a remote later
+
+Add the remote and push the branch once by hand, for example with `git remote add origin <url>` and `git push -u origin main`. Until that first push, write commands print `pinax: origin was reached and publishes no default branch; the event is recorded locally and not published.` They exit 0, and `pinax claim` exits 4. After the first push, the next write command pushes, and the items you added while there was no remote are published with it. From then on you can claim them like any other item.
+
+### Writers and prefixes
+
+When you leave out `--actor`, Pinax records `operator@<your host name>`, so your machine's host name is pushed with the log. Every writer on that machine then shares that one name, and no setting changes the default. Give each person and each coding assistant its own writer name, and pass it with `--actor` on every command.
+
+The write commands that fetch, commit and push, such as `add`, `claim` and `done`, check the name. They refuse a name that is not `role@host` with exactly one `@`, and exit 2. `pinax init` and the commands in the table under "Limits" skip that check. Any name of that form is accepted, in any directory.
+
+`--prefix app` gives ids such as `app-4x56`, and the default prefix is `pnx`. Once a tracker has items, `pinax add` refuses a prefix it has not seen before unless you also pass `--allow-new-prefix`. Repeat `--prefix app` on every later `add`.
+
+### Repair the board and pages
+
+When `pinax verify` reports drift, the hook refuses every commit in that clone, yours included. Run `pinax verify --fix`, and stage the result with `git add .ergon`. If the drift came from your own hand edit that you had not committed, the pages now match the last commit, and there is nothing left to commit. The next write command also rebuilds the pages.
+
+The log files merge line by line, and the board and item pages do not. When `git pull --no-rebase` stops on a conflict in `.ergon/board.md` or an item page, run `pinax verify --fix`, `git add .ergon`, `git commit -m "Rebuild the Pinax pages after a merge"` and `git push`.
+
+### Upgrading
+
+Before any clone writes, make sure every clone, and every hook's `PATH`, runs 0.5.0 or later. The hook runs the first `pinax` it finds on `PATH`. An older `pinax` there is the one that checks every commit in that clone, whatever you have installed elsewhere. While clones run different releases, one of them may report an item page as drift. After you upgrade that clone, `pinax verify --fix` rebuilds the page, and you commit it. An item that stayed cancelled under 0.4.0 after you annulled its annulment is in effect again under 0.5.0, and annulling its `item.created` event again cancels it.
+
+### The other documents
+
+| Document | The question it answers |
+|---|---|
+| [docs/commands.md](docs/commands.md) | What does each command take, print, return as JSON, and exit with? |
+| [docs/sharing-and-sync.md](docs/sharing-and-sync.md) | What happens on another machine when I write, and how do I recover when a write does not publish? |
+| [docs/data-model-and-integrity.md](docs/data-model-and-integrity.md) | What is stored, how is state derived, and what can `verify` prove? |
+| [docs/portfolio-and-web.md](docs/portfolio-and-web.md) | How do I see several repositories, or browse one in a browser? |

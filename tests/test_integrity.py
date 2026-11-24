@@ -1,5 +1,5 @@
 """
-tests/test_integrity.py — ADR-001 tamper-evidence: id-verification and prev-chain detection.
+tests/test_integrity.py — tamper-evidence: id-verification and prev-chain detection.
 
 These tests prove that:
 1. A tampered payload (stored id does not match recomputed hash) is DETECTED with a WARNING.
@@ -8,8 +8,8 @@ These tests prove that:
 In both cases the fold still applies the events (detection is the guarantee, not rejection).
 This exercises the Test path: real JSONL bytes on disk, read through read_events.
 
-ADR-001: "Each event carries the id of the prior event, making the log tamper-evident.
-A broken chain link is detectable on replay."
+Each event carries the id of the prior event, making the log tamper-evident.
+A broken chain link is detectable on replay.
 """
 
 from __future__ import annotations
@@ -242,3 +242,48 @@ def test_id_warning_does_not_abort_fold(caplog):
     # Fold completed; items and other state are still present.
     assert "items" in state, "Fold state missing 'items' after integrity warning"
     assert "pnx-aaa1" in state["items"], "Fold state missing pnx-aaa1 after integrity warning"
+
+
+# ---------------------------------------------------------------------------
+# 5. A tampered event is checked again once its annulment is annulled
+# ---------------------------------------------------------------------------
+
+def test_tampered_event_is_checked_again_when_its_annulment_is_annulled(tmp_path, capsys, caplog):
+    from pinax.commands.verify import run as verify_run
+    from pinax.projection import regenerate
+
+    created = mint_event(
+        0, "2026-01-01T00:00:00Z", "a@h", "item.created", {"item_id": "pnx-x", "title": "X"}
+    )
+    altered = mint_event(
+        1, "2026-01-01T00:00:01Z", "a@h", "item.status_changed",
+        {"item_id": "pnx-x", "status": "queued"}, prev=created["id"],
+    )
+    altered["payload"]["status"] = "blocked"
+    annulment = mint_event(
+        2, "2026-01-01T00:00:02Z", "a@h", "event.annulled",
+        {"target_id": altered["id"], "reason": "junk"}, prev=altered["id"],
+    )
+    undo = mint_event(
+        3, "2026-01-01T00:00:03Z", "a@h", "event.annulled",
+        {"target_id": annulment["id"], "reason": "mistake"}, prev=annulment["id"],
+    )
+    log_dir = tmp_path / ".ergon" / "log"
+    log_dir.mkdir(parents=True)
+
+    _write_events_to_tmpdir([created, altered, annulment], str(log_dir))
+    regenerate(str(tmp_path))
+    with caplog.at_level(logging.WARNING, logger="pinax.fold"):
+        verify_run(str(tmp_path))
+    assert "OK" in capsys.readouterr().out
+    assert not [r for r in caplog.records if altered["id"] in r.getMessage()]
+
+    _write_events_to_tmpdir([created, altered, annulment, undo], str(log_dir))
+    with caplog.at_level(logging.WARNING, logger="pinax.fold"):
+        read_events(str(log_dir))
+    assert [r for r in caplog.records
+            if "Integrity violation" in r.getMessage() and altered["id"] in r.getMessage()]
+    with pytest.raises(SystemExit) as exited:
+        verify_run(str(tmp_path))
+    assert exited.value.code == 1
+    assert altered["id"] in capsys.readouterr().err

@@ -554,6 +554,18 @@ def test_a_claim_made_while_another_is_live_is_still_superseded(repo):
     assert superseded[0]["winner_actor"] == OWNER
 
 
+def test_a_repeat_by_the_holder_does_not_extend_the_claim(repo):
+    _claim(repo, 4, _at(1, 10, 0, 0), ITEM, OWNER)
+    _policy(repo, 5, _at(1, 8, 0, 0), 2.0)
+    _item(repo, 6, _at(1, 11, 30, 0), "pnx-e5f6", "Past the first claim's deadline")
+
+    state = _fold(repo)
+
+    assert "owner" not in state["items"][ITEM]
+    assert [entry["claimed_at"] for entry in state["claim_expired"]] == [_at(1, 9, 0, 3)]
+    assert state["claim_superseded"] == []
+
+
 def test_a_released_item_is_ready_again_through_the_command(repo, capsys):
     _release(repo, 4, _at(1, 9, 0, 4), ITEM, "the builder stopped")
 

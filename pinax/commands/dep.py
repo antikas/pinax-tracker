@@ -43,7 +43,7 @@ from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
 
 
 # ---------------------------------------------------------------------------
-# Closed enum of valid edge types (enforced at write-time — ADR-001).
+# Closed enum of valid edge types (enforced at write-time).
 # ---------------------------------------------------------------------------
 
 VALID_EDGE_TYPES = frozenset({

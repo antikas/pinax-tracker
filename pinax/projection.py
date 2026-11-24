@@ -1,7 +1,7 @@
 """
 pinax.projection — byte-deterministic Markdown projection.
 
-ADR-002 compliance:
+Projection rules:
 - Regenerated atomically with every state-changing command.
 - Byte-deterministic: regenerate twice from the same log → byte-identical.
 - Never hand-edited: the drift lint enforces this.
@@ -10,11 +10,11 @@ ADR-002 compliance:
   keeps Git from converting the projection on checkout.
 - No wall-clock in rendered output (no "generated at <timestamp>" headers).
 
-Projection layout (DESIGN.md):
+Projection layout (docs/data-model-and-integrity.md):
   .ergon/board.md          — all items grouped by status lane
   .ergon/items/<id>.md     — per-item file (frontmatter + briefing + audit trail)
 
-Ordering (DESIGN.md):
+Ordering (docs/data-model-and-integrity.md):
   board.md: phase order (by opened_seq, then opened_at, then opened_by),
   then `next` order (compute_next priority), then id.
   A "## Parked / needs human" section lists gate-blocked + parked items.
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 from . import owner_gates
 from .commands.dep import VALID_EDGE_TYPES
@@ -162,33 +163,8 @@ def _board_item_sort_key(item_id: str, item: dict, phases: dict,
 # board.md renderer
 # ---------------------------------------------------------------------------
 
-def render_board(state: dict, item_sources: dict | None = None) -> str:
-    """
-    Render .ergon/board.md from the folded state.
-
-    Byte-deterministic: no wall-clock, no RNG, no PYTHONHASHSEED dependence.
-    Output is LF-terminated (b'\\n' joins), returned as a str.
-
-    Layout:
-      # Board
-      ## <Status Lane>
-      - <id> · <title> · <status> · <owner|—> · <blockers|—>
-      - <id> · <title> · <status> · rollup:<bucket> · <owner|—> · <blockers|—>
-        (the "rollup:<bucket>" segment appears only for an item that has
-        children through a parent-child edge; every other line is
-        byte-identical to the layout above)
-      ...
-      ## Parked / needs human
-      - <id> · <title> · <reason|gate>
-        (under the strict process, a blocked item with a recorded
-         owner-gate class gains " · owner gate: <class>" after its gate)
-
-    `item_sources` (`--all-branches` only): optional {item_id: [branch
-    names]} map — when an item id is a key, its line gets a trailing
-    " [from: branch1, branch2]" marker. Defaults to None, which reproduces the
-    same output byte-for-byte (the committed .ergon/board.md
-    projection and the plain `pinax board` path never pass this argument).
-    """
+def board_sections(state: dict, item_sources: dict | None = None) -> list[tuple[str, list[tuple[str, str, str]]]]:
+    """Ordered board headings and their (item ID, title, detail) rows."""
     items = state.get("items", {})
     phases = state.get("phases", {})
     deps = state.get("deps", set())
@@ -219,14 +195,14 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
         status = _shown_status(items[iid])
         lanes.setdefault(status, []).append(iid)
 
-    lines: list[str] = ["# Board", ""]
+    sections = []
 
     # Emit non-parked, non-blocked lanes first (in lane order), then parked/blocked.
     parked_blocked_items: list[str] = []
     main_lanes = [s for s in _LANE_ORDER if s not in ("blocked", "parked")]
     extra_statuses = sorted(set(lanes.keys()) - set(_LANE_ORDER))
 
-    def _item_line(iid: str) -> str:
+    def _item_row(iid: str) -> tuple[str, str, str]:
         item = items[iid]
         owner = item.get("owner", item.get("created_by", "—")) or "—"
         blockers = blockers_of.get(iid, [])
@@ -240,20 +216,14 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
         source_marker = ""
         if item_sources and iid in item_sources:
             source_marker = f" [from: {', '.join(item_sources[iid])}]"
-        return (
-            f"- {iid} · {item.get('title', '')} · {status}{marker}{rollup_str} · "
-            f"{owner} · {blocker_str}{source_marker}"
-        )
+        detail = f"{status}{marker}{rollup_str} · {owner} · {blocker_str}{source_marker}"
+        return iid, item.get("title", ""), detail
 
     for status in main_lanes + extra_statuses:
         if status not in lanes:
             continue
         heading = status.capitalize().replace("-", " ").replace("_", " ")
-        lines.append(f"## {heading}")
-        lines.append("")
-        for iid in lanes[status]:
-            lines.append(_item_line(iid))
-        lines.append("")
+        sections.append((heading, [_item_row(iid) for iid in lanes[status]]))
 
     # Parked / needs human section.
     for status in ("blocked", "parked"):
@@ -262,8 +232,7 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
 
     if parked_blocked_items:
         shows_class = _shows_owner_gate(state)
-        lines.append("## Parked / needs human")
-        lines.append("")
+        rows = []
         for iid in parked_blocked_items:
             item = items[iid]
             status = item.get("status", "")
@@ -273,30 +242,90 @@ def render_board(state: dict, item_sources: dict | None = None) -> str:
                     detail += f" · owner gate: {item['owner_gate']}"
             else:
                 detail = item.get("park_reason", item.get("gate", "—"))
-            lines.append(f"- {iid} · {item.get('title', '')} · {detail}")
+            rows.append((iid, item.get("title", ""), detail))
+        sections.append(("Parked / needs human", rows))
+
+    return sections
+
+
+def resolved_claims(state: dict) -> list[str]:
+    """Display text for the reconciled claims listed after the board lanes."""
+    return [
+        f"{claim['item_id']}: {claim['superseded_actor']} superseded by {claim['winner_actor']}"
+        for claim in state.get("claim_superseded", [])
+    ]
+
+
+def render_board(state: dict, item_sources: dict | None = None) -> str:
+    """
+    Render .ergon/board.md from the folded state.
+
+    Byte-deterministic: no wall-clock, no RNG, no PYTHONHASHSEED dependence.
+    Output is LF-terminated (b'\\n' joins), returned as a str.
+
+    Layout:
+      # Board
+      ## <Status Lane>
+      - <id> · <title> · <status> · <owner|—> · <blockers|—>
+      - <id> · <title> · <status> · rollup:<bucket> · <owner|—> · <blockers|—>
+        (the "rollup:<bucket>" segment appears only for an item that has
+        children through a parent-child edge; every other line is
+        byte-identical to the layout above)
+      ...
+      ## Parked / needs human
+      - <id> · <title> · <reason|gate>
+        (under the strict process, a blocked item with a recorded
+         owner-gate class gains " · owner gate: <class>" after its gate)
+
+    `item_sources` (`--all-branches` only): optional {item_id: [branch
+    names]} map — when an item id is a key, its line gets a trailing
+    " [from: branch1, branch2]" marker. Defaults to None, which reproduces the
+    same output byte-for-byte (the committed .ergon/board.md
+    projection and the plain `pinax board` path never pass this argument).
+    """
+    lines = ["# Board", ""]
+    for heading, rows in board_sections(state, item_sources):
+        lines.extend((f"## {heading}", ""))
+        lines.extend(f"- {iid} · {title} · {detail}" for iid, title, detail in rows)
         lines.append("")
 
     # Superseded claims warning section.
-    superseded = state.get("claim_superseded", [])
-    if superseded:
-        lines.append("## Claim conflicts (resolved)")
-        lines.append("")
-        for sup in superseded:
-            lines.append(
-                f"- {sup['item_id']}: {sup['superseded_actor']} superseded by "
-                f"{sup['winner_actor']}"
-            )
+    conflicts = resolved_claims(state)
+    if conflicts:
+        lines.extend(("## Claim conflicts (resolved)", ""))
+        lines.extend(f"- {conflict}" for conflict in conflicts)
         lines.append("")
 
     # Ensure trailing newline but no double-blank at end.
     content = "\n".join(lines)
     if not content.endswith("\n"):
         content += "\n"
-    return content
+    return _encodable(content)
 
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+
+_LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def _encodable(text: str) -> str:
+    """text with each character UTF-8 cannot encode written as U+FFFD."""
+    return _LONE_SURROGATE_RE.sub("\ufffd", text)
+
+
+def projection_pages(state: dict) -> dict[str, str]:
+    """
+    The content of every item page, by file name without its .md ending.
+
+    Two ids that differ only in characters UTF-8 cannot encode share a page,
+    which then shows the one that sorts last.
+    """
+    return {
+        _encodable(item_id): render_item(item_id, item, state)
+        for item_id, item in sorted(state.get("items", {}).items())
+    }
+
 
 def _render_repo_sections(sorted_reports: list[dict]) -> tuple[list[str], list[str]]:
     """
@@ -334,6 +363,9 @@ def _render_repo_sections(sorted_reports: list[dict]) -> tuple[list[str], list[s
     Local reports never carry these keys, so their rendering is byte-for-byte
     unchanged.
 
+    A report of either kind carries "damaged" ({"file", "line", "reason"})
+    instead of the summary fields when its log holds a damaged line.
+
     Returns (body_lines, needs_attention_lines):
       - body_lines: the `## <repo_id>` sections, one per repo, in order.
       - needs_attention_lines: the flat cross-repo parked/blocked rollup,
@@ -353,6 +385,14 @@ def _render_repo_sections(sorted_reports: list[dict]) -> tuple[list[str], list[s
             needs_attention.append(
                 f"- {repo_id} · unreachable remote: {report.get('url', '(no url)')}"
             )
+            continue
+
+        if "damaged" in report:
+            damaged = report["damaged"]
+            where = f"{damaged['file']} line {damaged['line']}: {damaged['reason']}"
+            lines.append(f"- status: damaged · {where}")
+            lines.append("")
+            needs_attention.append(f"- {repo_id} · damaged log: {where}")
             continue
 
         if "url" in report:
@@ -445,7 +485,7 @@ def render_overview(repo_reports: list[dict]) -> str:
 def render_overview_markdown(repo_reports: list[dict], stamp: dict) -> str:
     """
     Render the committed PORTFOLIO.md projection — rung 2 of the view ladder
-    (docs/portfolio-views.md). Renders the same
+    (docs/portfolio-and-web.md). Renders the same
     per-repo body `render_overview` renders (SSOT via `_render_repo_sections`
     above), plus a stamp footer that bounds and makes visible how stale the
     committed file is.
@@ -486,7 +526,7 @@ def render_overview_markdown(repo_reports: list[dict], stamp: dict) -> str:
         lines.append("(none)")
     lines.append("")
 
-    # Stamp footer (docs/portfolio-views.md): bounds
+    # Stamp footer (docs/portfolio-and-web.md): bounds
     # staleness and makes it visible, never silently trusted.
     lines.append("---")
     lines.append("")
@@ -502,7 +542,7 @@ def render_overview_markdown(repo_reports: list[dict], stamp: dict) -> str:
     content = "\n".join(lines)
     if not content.endswith("\n"):
         content += "\n"
-    return content
+    return _encodable(content)
 
 
 # ---------------------------------------------------------------------------
@@ -688,7 +728,7 @@ def render_item(item_id: str, item: dict, state: dict) -> str:
     content = "\n".join(lines)
     if not content.endswith("\n"):
         content += "\n"
-    return content
+    return _encodable(content)
 
 
 # ---------------------------------------------------------------------------
@@ -724,8 +764,6 @@ def regenerate(repo_root: str) -> None:
     events = read_events(log_dir)
     state = fold_events(events)
 
-    items = state.get("items", {})
-
     # Ensure items/ directory exists.
     os.makedirs(items_dir, exist_ok=True)
 
@@ -736,9 +774,9 @@ def regenerate(repo_root: str) -> None:
         fh.write(board_content)
 
     # Write per-item files with LF line endings.
-    for item_id, item in items.items():
-        item_path = os.path.join(items_dir, f"{item_id}.md")
-        item_content = render_item(item_id, item, state)
+    pages = projection_pages(state)
+    for page, item_content in pages.items():
+        item_path = os.path.join(items_dir, f"{page}.md")
         with open(item_path, "w", newline="", encoding="utf-8") as fh:
             fh.write(item_content)
 
@@ -749,5 +787,5 @@ def regenerate(repo_root: str) -> None:
         for fname in os.listdir(items_dir):
             if fname.endswith(".md"):
                 item_id_from_file = fname[:-3]
-                if item_id_from_file not in items:
+                if item_id_from_file not in pages:
                     os.remove(os.path.join(items_dir, fname))

@@ -27,7 +27,8 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 
-from ..fold import fold, fold_events, compute_next
+from ..event import DamagedLogLine
+from ..fold import compute_next, fold, fold_events, registry_from_usable_lines
 from ..projection import render_overview, render_overview_markdown
 
 # Bounded-depth scan: enough to reach a repo nested one extra level under its
@@ -53,14 +54,20 @@ _NOISE_DIRNAMES = {
 def _summarise_repo(repo_id: str, repo_path: str) -> dict:
     """
     Pure read: fold repo_path's .ergon/log (if present) into a portfolio
-    summary dict.  Never writes anything, in this repo or any other.
+    summary dict.  Never writes anything, in this repo or any other.  A log
+    with a damaged line is reported as damaged instead of summarised.
     """
     log_dir = os.path.join(repo_path, ".ergon", "log")
 
     if not os.path.isdir(log_dir):
         return {"id": repo_id, "path": repo_path, "initialised": False}
 
-    summary = _summarise_state(repo_id, fold(log_dir))
+    try:
+        summary = _summarise_state(repo_id, fold(log_dir))
+    except DamagedLogLine as exc:
+        return {
+            "id": repo_id, "path": repo_path, "initialised": True, "damaged": exc.facts(),
+        }
     summary["path"] = repo_path
     return summary
 
@@ -151,6 +158,8 @@ def _summarise_remote(repo_id: str, url: str, scratch_dir: str, fetcher=None) ->
         fetched = _fetch(url, scratch_dir)
     except RemoteFetchError as exc:
         return {"id": repo_id, "url": url, "error": str(exc)}
+    except DamagedLogLine as exc:
+        return {"id": repo_id, "url": url, "initialised": True, "damaged": exc.facts()}
 
     if not fetched.get("has_log"):
         return {
@@ -531,14 +540,14 @@ def run(
     `as_json` composes with `remote`; `as_json` is checked first and wins
     over `as_markdown`; `remote` + `as_markdown` is REJECTED with exit 1 —
     PORTFOLIO.md is the committed local-fold projection
-    (docs/portfolio-views.md), and
+    (docs/portfolio-and-web.md), and
     silently re-pointing it at remote state would change what the committed
     file means.
     """
     if remote and as_markdown:
         print(
             "pinax: --remote cannot be combined with --markdown - PORTFOLIO.md "
-            "is the committed local-fold projection (docs/portfolio-views.md); the "
+            "is the committed local-fold projection (docs/portfolio-and-web.md); the "
             "remote fold renders to stdout (plain or --json) only.",
             file=sys.stderr,
         )
@@ -552,8 +561,12 @@ def run(
         )
         sys.exit(1)
 
-    hub_state = fold(log_dir)
-    registry: dict = hub_state.get("registry", {})
+    # The remote view reports no local log, so it has nowhere to show that the
+    # hub's own is damaged: there the command refuses.
+    registry: dict = (
+        fold(log_dir).get("registry", {}) if remote
+        else registry_from_usable_lines(log_dir)
+    )
 
     if remote:
         manifest = _remote_manifest(registry)

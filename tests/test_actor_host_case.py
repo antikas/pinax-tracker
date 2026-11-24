@@ -550,7 +550,7 @@ def test_replay_of_mixed_case_log_is_unchanged(tmp_path):
 _SUBCOMMANDS = {
     "init", "add", "claim", "status", "done", "block", "park", "decide", "release", "policy",
     "priority", "annul", "dep", "ready", "next", "verify", "note", "metrics", "report",
-    "dispatch", "replay", "board", "overview", "registry", "reconcile", "doctor",
+    "dispatch", "replay", "board", "web", "overview", "registry", "reconcile", "doctor",
 }
 
 

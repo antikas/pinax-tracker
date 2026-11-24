@@ -46,7 +46,7 @@ _TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 # The threshold a repository whose log sets no expiry policy falls back to.
 # The same number the fold expires a claim on, from its one owner there, so
 # a claim this module calls stale is a claim the fold would have expired had
-# the log carried any event to expire it against (ADR-007).
+# the log carried any event to expire it against.
 DEFAULT_STALE_HOURS = DEFAULT_CLAIM_EXPIRY_HOURS
 
 # Statuses that mean the claim trail is NOT dangling:
@@ -571,7 +571,7 @@ def diagnose(
     and what the command passes unless the operator gave one), it is the
     expiry policy the log folds to, and DEFAULT_STALE_HOURS when the log
     sets none - so the threshold and the fold's own expiry read the same
-    number (ADR-007). An explicit value still wins.
+    number. An explicit value still wins.
 
     `legacy_board`: explicit path (file or dir) enables class 3; when None,
     the conventional frozen legacy location `<repo_root>/board` is checked

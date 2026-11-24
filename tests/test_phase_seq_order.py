@@ -202,7 +202,7 @@ def test_phase_seq_order_opposite_ts_order():
         assert nxt == "item-y", (
             f"Expected compute_next='item-y' (phase-Y seq=2 < phase-X seq=10). "
             f"Got: {nxt!r}. If compute_next uses ts-order, phase-X (ts=:01) would "
-            f"come first, returning item-x — wrong (violates ADR-001)."
+            f"come first, returning item-x — wrong: timestamps are metadata, never the sort key."
         )
     finally:
         shutil.rmtree(parent, ignore_errors=True)

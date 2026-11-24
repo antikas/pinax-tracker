@@ -287,7 +287,7 @@ def _reconcile_stale_claims(
 
     Release is the answer for a claim in a quiet log: the fold expires a
     claim only against a later event, so a log that has recorded nothing
-    since the claim never expires it on its own (ADR-007) and this is the
+    since the claim never expires it on its own and this is the
     way out. Done and park settle the work as well as the claim; release
     ends the claim alone and leaves the item's status where it stands.
     """

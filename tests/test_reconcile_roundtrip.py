@@ -124,7 +124,7 @@ def _resolve_projection_conflict_if_any(repo: str, merge_result: subprocess.Comp
     If the merge conflicted, it must ONLY be the projection (board.md /
     items/*.md) -- a JSONL shard conflict would mean the per-actor-session
     shard key failed.  Resolve by accepting ours then regenerating from the
-    merged log (never a hand-edited conflict -- ADR-002), same pattern as
+    merged log (never a hand-edited conflict), same pattern as
     tests/test_merge_safety.py.
     """
     if merge_result.returncode == 0:
@@ -180,7 +180,7 @@ def test_offline_reconcile_two_clone_roundtrip():
 
         # No follow-up commit here: 'add' runs the publish sequence
         # (pinax/sync.py), which commits the shard and the projection
-        # itself (ADR-006); each call is already committed by the time it
+        # itself; each call is already committed by the time it
         # returns.
         _pinax(repo_a, "add", "--title", "Item X", "--prefix", "pnx", "--actor", "operator@example.test")
         _pinax(repo_a, "add", "--title", "Item Y", "--prefix", "pnx", "--actor", "operator@example.test")
@@ -203,7 +203,7 @@ def test_offline_reconcile_two_clone_roundtrip():
         _commit_all(repo_b, "laptop (no CLI): log offline completions in BACKLOG-OFFLINE.md")
 
         # --- 3. repo_a diverges (a real merge, not a fast-forward) ---
-        # No follow-up commit here: 'add' already commits itself (ADR-006).
+        # No follow-up commit here: 'add' already commits itself.
         _pinax(repo_a, "add", "--title", "Item Z", "--prefix", "pnx", "--actor", "operator@example.test")
 
         # --- 4. repo_a pulls repo_b's commit: a real two-clone merge ---

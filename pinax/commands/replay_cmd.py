@@ -5,8 +5,8 @@ Time-travel fold: reconstruct Pinax state exactly as it existed at
 any git reference (a branch, tag, or commit sha) — NOT the current working
 tree, which may have advanced past <ref>.
 
-ADR-001 / DESIGN.md: "Replay = fold the event log up to a git ref; no
-secondary state store is needed."  The shard bytes are sourced from the git
+Replay folds the event log up to a git ref; no secondary state store is
+needed.  The shard bytes are sourced from the git
 object store as committed at <ref>, then folded with the identical
 determinism layer (pinax.fold.finalise_events / fold_events) every other
 command uses — see pinax.replay for the sourcing half.

@@ -56,7 +56,7 @@ ITEM = "pnx-a1b2"
 OTHER = "pnx-c3d4"
 GHOST = "zzz-"          # a bare prefix: the shape of id most easily mistyped
 GHOST_2 = "pnx-nope"
-NOTE_REF = "docs/some-note.md"
+NOTE_REF = "https://example.org/some-note"
 
 
 @pytest.fixture()
@@ -363,6 +363,7 @@ _EXEMPT = {
     "policy.process_set": "repository-level",
     "policy.owner_gate_classes_set": "repository-level",
     "policy.decision_actors_set": "repository-level",
+    "policy.note_ref_prefixes_set": "repository-level",
     "registry.repo_added": "names a repository, not an item",
     "registry.repo_removed": "names a repository, not an item",
 }

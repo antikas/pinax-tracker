@@ -10,7 +10,8 @@ a bare hub, clones beside it, one item, and two machines that reach for it.
 Covered here:
 1.  A claim the fold reports superseded after its push ends with exit 3,
     and its report names the winning event and actor; the winner ends with
-    exit 0 and no command checks ownership before it appends.
+    exit 0. A claim on an item another writer is already known to hold ends
+    with exit 3 and writes nothing; a writer's own repeat appends nothing.
 2.  A claim whose timestamp sits behind published history by more than the
     tolerance ends with exit 6 before anything is minted; the tolerance can
     be raised for one crossing; an annulled future-dated event no longer
@@ -31,17 +32,21 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
 from pinax.append import append_event
 from pinax.event import mint_event
-from pinax.fold import fold_events, read_events
+from pinax.fold import finalise_events, fold_events, read_events, read_raw_events
 from pinax.projection import regenerate
 from pinax.sync import GitResult
 from tests.test_sync_sequence import FakeGit, _log_dir, _seed, _shard_events
 
+from pinax.commands.add import run as add_run
+from pinax.commands.annul import run as annul_run
 from pinax.commands.claim import run as claim_run
+from pinax.commands.decide import run as decide_run
 from pinax.commands.done import run as done_run
 
 
@@ -81,8 +86,26 @@ def repo(tmp_path):
 @pytest.fixture()
 def at_a_fixed_moment(monkeypatch):
     """Pin the timestamp a command mints, at its one owner."""
-    monkeypatch.setattr("pinax.doctor.utc_now_iso", lambda: MINTED_TS)
+    for module in ("pinax.doctor", "pinax.commands.add", "pinax.commands.decide"):
+        monkeypatch.setattr(module + ".utc_now_iso", lambda: MINTED_TS)
     return MINTED_TS
+
+
+class RacingGit(FakeGit):
+    """A remote another machine's events reach between the fetch and the push."""
+
+    def __init__(self, *, arriving: list[dict], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.arriving = arriving
+
+    def run(self, *args, env=None):
+        if args[0] == "push":
+            self.remote_events = list(self.remote_events or []) + self.arriving
+            self.arriving = []
+        if args[0] == "rev-list":
+            self.calls.append(args)
+            return GitResult(returncode=0, stdout="1\n")
+        return super().run(*args, env=env)
 
 
 def _remote_claim(ts: str, actor: str = RIVAL) -> dict:
@@ -120,14 +143,14 @@ def _tombstone(target: dict, ts: str, actor: str = RIVAL) -> dict:
 
 def test_a_superseded_claim_exits_three_naming_the_winner(repo, at_a_fixed_moment, capsys):
     """
-    The claim is appended, committed and pushed with no ownership check of
-    any kind. The fold over the pushed remote state finds an earlier claim,
+    The rival's claim reaches the remote after this command's fetch, so this
+    one is appended, committed and pushed. The fold over the pushed remote state finds an earlier claim,
     and that fold, not the push, ends the command.
     """
     # The winner sits inside the claim expiry policy window, so the subject
     # here stays supersession rather than a claim the fold has expired.
     winner = _remote_claim("2026-09-02T09:30:00Z")
-    git = FakeGit(remote_events=[winner])
+    git = RacingGit(arriving=[winner])
 
     with pytest.raises(SystemExit) as exited:
         claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
@@ -147,20 +170,20 @@ def test_a_superseded_claim_exits_three_naming_the_winner(repo, at_a_fixed_momen
     assert report["superseded_event_id"] == appended[0]["id"]
     assert report["superseded_actor"] == ACTOR
     assert report["pushed"] is True
+    assert report["published"] is True
     assert RIVAL in captured.err
 
 
 def test_a_fold_warning_reaches_the_operator_once(repo, at_a_fixed_moment, capsys):
     """
-    A rejected push makes the sequence fold three times over one log:
-    before the append, again after the pull, and once more over the
-    pushed remote state. The warning those folds keep raising is one line
+    A rejected push makes the sequence fold again after the pull, and once
+    more over the pushed remote state. The warning those folds keep raising is one line
     for the operator to read, not one line per fold.
     """
     # The winner sits inside the claim expiry policy window, so the subject
     # here stays supersession rather than a claim the fold has expired.
     winner = _remote_claim("2026-09-02T09:30:00Z")
-    git = FakeGit(pushes=[_fail("rejected: fetch first"), _OK], remote_events=[winner])
+    git = RacingGit(arriving=[winner], pushes=[_fail("rejected: fetch first"), _OK])
 
     with pytest.raises(SystemExit) as exited:
         claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
@@ -180,7 +203,7 @@ def test_the_earlier_claim_wins_and_ends_with_zero(repo, at_a_fixed_moment, caps
     tolerance, so the clock rule has nothing to say about it.
     """
     later = _remote_claim("2026-09-02T10:00:03Z")
-    git = FakeGit(remote_events=[later])
+    git = RacingGit(arriving=[later])
 
     claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
 
@@ -195,8 +218,8 @@ def test_a_completion_is_not_ended_by_someone_elses_superseded_claim(
 ):
     """
     Only the sequence's own event decides its exit. A superseded claim
-    belonging to another actor is a fold warning, never this command's
-    outcome.
+    belonging to another actor is never this command's outcome, and this
+    command does not repeat its warning.
     """
     briefing = tmp_path / "briefing.md"
     briefing.write_text("the work record", encoding="utf-8")
@@ -208,7 +231,470 @@ def test_a_completion_is_not_ended_by_someone_elses_superseded_claim(
 
     assert git.named("push")
     assert [event["type"] for event in _shard_events(repo, ACTOR)] == ["item.completed"]
-    assert "claim.superseded" in capsys.readouterr().err
+    assert "claim.superseded" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("held_at", ["2026-09-02T09:30:00Z", "2026-09-02T10:00:03Z"])
+def test_a_claim_on_a_held_item_is_refused_and_appends_nothing(
+    repo, at_a_fixed_moment, capsys, held_at
+):
+    holder = _remote_claim(held_at)
+    git = FakeGit(remote_events=[holder])
+
+    with pytest.raises(SystemExit) as exited:
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert exited.value.code == 3
+    assert _shard_events(repo, ACTOR) == []
+    assert not git.named("commit")
+    assert not git.named("push")
+    report = _last_json(capsys.readouterr().out)
+    assert report["sync_status"] == report["status"] == "claim_held"
+    assert report["published"] is report["appended"] is False
+    assert report["holder_actor"] == RIVAL
+    assert report["holder_event_id"] == holder["id"]
+    assert report["claimed_at"] == held_at
+    assert report["message"] == (
+        f"item {ITEM_ID} is already claimed by {RIVAL} since {held_at}, "
+        "so nothing was appended"
+    )
+
+
+def test_the_holder_is_named_before_the_clock_rule(repo, at_a_fixed_moment, capsys):
+    git = FakeGit(remote_events=[_remote_claim("2026-09-02T11:00:00Z")])
+
+    with pytest.raises(SystemExit) as exited:
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert exited.value.code == 3
+    assert _last_json(capsys.readouterr().out)["status"] == "claim_held"
+
+
+def test_a_claim_held_only_in_the_local_log_is_refused(repo, at_a_fixed_moment, capsys):
+    _seed(repo, 1, "2026-09-02T09:30:00Z", RIVAL, "item.claimed", {"item_id": ITEM_ID})
+    git = FakeGit(remote_events=[])
+
+    with pytest.raises(SystemExit) as exited:
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert exited.value.code == 3
+    assert not git.named("commit")
+    assert _last_json(capsys.readouterr().out)["status"] == "claim_held"
+
+
+@pytest.mark.parametrize("holder", [RIVAL, ACTOR])
+def test_a_claim_past_the_holders_deadline_is_a_fresh_claim(
+    repo, at_a_fixed_moment, capsys, holder
+):
+    """No event is past the deadline until this claim is: it ends the old one."""
+    git = FakeGit(remote_events=[_remote_claim("2026-09-01T09:30:00Z", actor=holder)])
+
+    claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert _last_json(capsys.readouterr().out)["sync_status"] == "pushed"
+    assert [event["type"] for event in _shard_events(repo, ACTOR)] == ["item.claimed"]
+
+
+@pytest.mark.parametrize("held_by", [ACTOR, "builder@Alpha"])
+def test_a_repeat_of_a_published_claim_appends_nothing(
+    repo, at_a_fixed_moment, capsys, held_by
+):
+    held = _remote_claim("2026-09-02T09:30:00Z", actor=held_by)
+    git = FakeGit(remote_events=[*_shard_events(repo, RIVAL), held])
+
+    claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    result = _last_json(capsys.readouterr().out)
+    assert result["sync_status"] == "already_claimed"
+    assert result["published"] is True
+    assert result["appended"] is False
+    assert (result["event_id"], result["ts"]) == (held["id"], held["ts"])
+    assert _shard_events(repo, ACTOR) == []
+    assert not git.named("commit")
+    assert not git.named("push")
+
+
+def test_a_waiting_claim_that_lost_meanwhile_exits_three(repo, at_a_fixed_moment, capsys):
+    waiting = _seed(
+        repo, 1, "2026-09-02T09:40:00Z", ACTOR, "item.claimed", {"item_id": ITEM_ID}
+    )
+    winner = _remote_claim("2026-09-02T09:30:00Z")
+    git = RacingGit(arriving=[winner])
+
+    with pytest.raises(SystemExit) as exited:
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert exited.value.code == 3
+    captured = capsys.readouterr()
+    report = _last_json(captured.out)
+    assert report["status"] == "claim_superseded"
+    assert report["published"] is True
+    assert report["winner_actor"] == RIVAL
+    _waiting, annulment, fresh = _shard_events(repo, ACTOR)
+    assert annulment["payload"]["target_id"] == waiting["id"]
+    assert report["annulled"]["target_id"] == waiting["id"]
+    assert report["superseded_event_id"] == fresh["id"]
+    assert captured.err.count("claim.superseded:") == 1
+
+
+def test_a_waiting_claim_released_and_retaken_meanwhile_exits_three(
+    repo, at_a_fixed_moment, capsys
+):
+    _seed(repo, 1, "2026-09-02T09:30:00Z", ACTOR, "item.claimed", {"item_id": ITEM_ID})
+    release = mint_event(
+        seq=2, ts="2026-09-02T09:40:00Z", actor=RIVAL, etype="item.claim_released",
+        payload={"item_id": ITEM_ID, "reason": "retaken"},
+    )
+    retaken = _remote_claim("2026-09-02T09:50:00Z")
+    git = RacingGit(arriving=[release, retaken])
+
+    with pytest.raises(SystemExit) as exited:
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert exited.value.code == 3
+    report = _last_json(capsys.readouterr().out)
+    assert report["status"] == "claim_superseded"
+    assert report["winner_event_id"] == retaken["id"]
+
+
+def test_a_waiting_claim_off_the_default_branch_exits_four(
+    repo, at_a_fixed_moment, capsys
+):
+    _seed(repo, 1, "2026-09-02T09:30:00Z", ACTOR, "item.claimed", {"item_id": ITEM_ID})
+    git = FakeGit(remote_events=[], head_branch="feature")
+
+    with pytest.raises(SystemExit) as exited:
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert exited.value.code == 4
+    assert _last_json(capsys.readouterr().out)["published"] is False
+    assert [event["type"] for event in _shard_events(repo, ACTOR)] == [
+        "item.claimed", "event.annulled", "item.claimed",
+    ]
+
+
+WAITING_TS = "2026-09-02T09:30:00Z"
+RIVAL_TS = "2026-09-02T09:40:00Z"
+
+
+def _waiting_claim(repo: str, item_id: str = ITEM_ID) -> dict:
+    return _seed(repo, 1, WAITING_TS, ACTOR, "item.claimed", {"item_id": item_id})
+
+
+def _annulled_by(events: list[dict]) -> list[str]:
+    return [
+        event["payload"]["target_id"] for event in events
+        if event["type"] == "event.annulled"
+    ]
+
+
+def _hub_state(repo: str, git: FakeGit) -> dict:
+    return fold_events(finalise_events(
+        read_raw_events(_log_dir(repo)) + [dict(event) for event in git.remote_events]
+    ))
+
+
+def _annulled_line(claim: dict, holder: str = RIVAL) -> str:
+    return (
+        f"pinax: the waiting claim {claim['id']} on {ITEM_ID} was annulled, "
+        f"because {holder} already holds the item on the remote"
+    )
+
+
+def test_a_claim_does_not_take_a_held_item_with_a_waiting_claim(
+    repo, at_a_fixed_moment, capsys
+):
+    waiting = _waiting_claim(repo)
+    rival = _remote_claim(RIVAL_TS)
+    git = RacingGit(arriving=[], remote_events=[rival])
+
+    with pytest.raises(SystemExit) as exited:
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert exited.value.code == 3
+    assert not git.named("push")
+    assert not git.named("commit")
+    shard = _shard_events(repo, ACTOR)
+    assert [event["type"] for event in shard] == ["item.claimed", "event.annulled"]
+    assert shard[1]["payload"] == {
+        "target_id": waiting["id"],
+        "reason": "the event could not be published, so it never took effect",
+    }
+    captured = capsys.readouterr()
+    report = _last_json(captured.out)
+    assert report["status"] == report["sync_status"] == "claim_held"
+    assert report["published"] is False
+    assert report["holder_actor"] == RIVAL
+    assert report["holder_event_id"] == rival["id"]
+    assert report["annulled"]["target_id"] == waiting["id"]
+    assert report["annulled"]["target_ids"] == [waiting["id"]]
+    assert report["message"] == (
+        f"item {ITEM_ID} is already claimed by {RIVAL} since {RIVAL_TS}, so no "
+        f"claim was appended; the waiting claim {waiting['id']} was annulled"
+    )
+    assert _annulled_line(waiting) in captured.err.splitlines()
+
+
+def test_the_annulment_of_a_waiting_claim_cannot_be_annulled(
+    repo, at_a_fixed_moment, capsys
+):
+    waiting = _seed(
+        repo, 1, WAITING_TS, "builder@Alpha", "item.claimed", {"item_id": ITEM_ID}
+    )
+    git = RacingGit(arriving=[], remote_events=[_remote_claim(RIVAL_TS)])
+    with pytest.raises(SystemExit):
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+    annulment = next(
+        event for event in read_events(_log_dir(repo)) if event["type"] == "event.annulled"
+    )
+    assert annulment["payload"]["target_id"] == waiting["id"]
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        annul_run(repo, annulment["id"], "undo it", actor=RIVAL, as_json=True, runner=git)
+
+    assert exited.value.code == 1
+    assert _last_json(capsys.readouterr().out)["status"] == "final_annulment"
+
+
+def test_a_clock_refusal_names_the_waiting_claim_it_annulled(
+    repo, at_a_fixed_moment, capsys
+):
+    waiting = _waiting_claim(repo)
+    git = RacingGit(arriving=[], remote_events=[_remote_creation("2026-09-02T11:00:00Z", "pnx-c3d4")])
+
+    with pytest.raises(SystemExit) as exited:
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert exited.value.code == 6
+    report = _last_json(capsys.readouterr().out)
+    assert report["annulled"]["target_id"] == waiting["id"]
+    assert "no claim was appended" in report["message"]
+    assert _annulled_by(_shard_events(repo, ACTOR)) == [waiting["id"]]
+
+
+def test_a_published_claim_is_a_repeat_beside_a_waiting_one(
+    repo, at_a_fixed_moment, capsys
+):
+    waiting = _waiting_claim(repo)
+    held = _remote_claim(RIVAL_TS, actor=ACTOR)
+    git = RacingGit(arriving=[], remote_events=[*_shard_events(repo, RIVAL), held])
+
+    claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    result = _last_json(capsys.readouterr().out)
+    assert result["sync_status"] == "already_claimed"
+    assert result["event_id"] == held["id"]
+    assert result["annulled"]["target_id"] == waiting["id"]
+    assert not git.named("push")
+
+
+def test_another_write_does_not_take_a_held_item_with_a_waiting_claim(
+    repo, at_a_fixed_moment, capsys
+):
+    waiting = _waiting_claim(repo)
+    git = FakeGit(remote_events=[_remote_claim(RIVAL_TS)])
+
+    add_run(repo, "T", actor=ACTOR, as_json=True, runner=git)
+
+    captured = capsys.readouterr()
+    assert _last_json(captured.out)["sync_status"] == "pushed"
+    assert len(git.named("commit")) == len(git.named("push")) == 1
+    assert _annulled_by(_shard_events(repo, ACTOR)) == [waiting["id"]]
+    assert captured.err.splitlines().count(_annulled_line(waiting)) == 1
+    state = _hub_state(repo, git)
+    assert state["items"][ITEM_ID]["owner"] == RIVAL
+    assert state["claim_superseded"] == []
+
+
+def test_a_rival_arriving_at_the_first_push_keeps_the_item(
+    repo, at_a_fixed_moment, capsys
+):
+    waiting = _waiting_claim(repo)
+    git = RacingGit(
+        arriving=[_remote_claim(RIVAL_TS)],
+        remote_events=[],
+        pushes=[_fail("rejected: fetch first"), _OK],
+    )
+
+    add_run(repo, "T", actor=ACTOR, as_json=True, runner=git)
+
+    captured = capsys.readouterr()
+    assert _last_json(captured.out)["sync_status"] == "pushed"
+    order = [call[0] for call in git.calls if call[0] in ("commit", "push", "merge")]
+    assert order == ["commit", "push", "merge", "commit", "push"]
+    assert _annulled_by(_shard_events(repo, ACTOR)) == [waiting["id"]]
+    assert captured.err.splitlines().count(_annulled_line(waiting)) == 1
+    state = _hub_state(repo, git)
+    assert state["items"][ITEM_ID]["owner"] == RIVAL
+    assert state["claim_superseded"] == []
+
+
+def test_a_claim_annuls_a_waiting_claim_on_another_held_item(
+    repo, at_a_fixed_moment, capsys
+):
+    _seed(
+        repo, 1, "2026-09-01T09:01:00Z", RIVAL, "item.created",
+        {"item_id": "pnx-c3d4", "title": "Free", "prefix": "pnx"},
+    )
+    waiting = _waiting_claim(repo)
+    git = FakeGit(remote_events=[_remote_claim(RIVAL_TS)])
+
+    claim_run(repo, "pnx-c3d4", actor=ACTOR, as_json=True, runner=git)
+
+    captured = capsys.readouterr()
+    result = _last_json(captured.out)
+    assert result["sync_status"] == "pushed"
+    assert "annulled" not in result
+    assert _annulled_line(waiting) in captured.err.splitlines()
+    assert _hub_state(repo, git)["items"][ITEM_ID]["owner"] == RIVAL
+
+
+@pytest.mark.parametrize("remote", ["free", "ended", "feature"])
+def test_another_write_leaves_a_waiting_claim_that_takes_nothing(
+    repo, at_a_fixed_moment, capsys, remote
+):
+    waiting = _waiting_claim(repo)
+    events = {
+        "free": [],
+        "ended": [
+            _remote_claim("2026-09-01T09:30:00Z"),
+            _remote_creation("2026-09-02T09:31:00Z", "pnx-c3d4"),
+        ],
+        "feature": [_remote_claim(RIVAL_TS)],
+    }[remote]
+    git = FakeGit(
+        remote_events=events, head_branch="feature" if remote == "feature" else "main"
+    )
+
+    add_run(repo, "T", actor=ACTOR, as_json=True, runner=git)
+
+    assert _annulled_by(_shard_events(repo, ACTOR)) == []
+    assert waiting["id"] not in capsys.readouterr().err
+
+
+class SeparateHead(RacingGit):
+    """A runner whose HEAD holds its own events, ahead of the remote's."""
+
+    def __init__(self, *, head_events: list[dict], **kwargs) -> None:
+        super().__init__(arriving=[], **kwargs)
+        self.head_events = head_events
+
+    def raw_events_at_ref(self, ref: str):
+        if ref == "HEAD":
+            return [dict(event) for event in self.head_events]
+        return super().raw_events_at_ref(ref)
+
+
+def test_a_repeat_commits_an_annulment_head_lacks_before_it_pushes(
+    repo, at_a_fixed_moment, capsys
+):
+    waiting = _waiting_claim(repo)
+    _seed(
+        repo, 2, "2026-09-02T09:35:00Z", ACTOR, "item.decided",
+        {"item_id": ITEM_ID, "option": "a", "label": "A", "effect": "release", "reason": "r"},
+    )
+    head = read_events(_log_dir(repo))
+    _seed(
+        repo, 3, "2026-09-02T09:50:00Z", ACTOR, "event.annulled",
+        {"target_id": waiting["id"],
+         "reason": "the event could not be published, so it never took effect"},
+    )
+    git = SeparateHead(head_events=head, remote_events=[_remote_claim(RIVAL_TS)])
+
+    decide_run(
+        repo, ITEM_ID, option="a", label="A", effect="release", reason="r",
+        actor=ACTOR, as_json=True, runner=git,
+    )
+
+    assert _last_json(capsys.readouterr().out)["appended"] is False
+    order = [call[0] for call in git.calls if call[0] in ("commit", "push")]
+    assert order == ["commit", "push"]
+    assert _annulled_by(_shard_events(repo, ACTOR)) == [waiting["id"]]
+
+
+def test_a_waiting_claim_ended_meanwhile_leaves_the_fresh_one_holding(
+    repo, at_a_fixed_moment, capsys
+):
+    waiting = _waiting_claim(repo)
+    rival = _remote_claim("2026-09-02T09:50:00Z")
+    release = mint_event(
+        seq=2, ts="2026-09-02T09:55:00Z", actor=RIVAL, etype="item.claim_released",
+        payload={"item_id": ITEM_ID, "reason": "not now"},
+    )
+    git = RacingGit(
+        arriving=[rival, release],
+        remote_events=[],
+        pushes=[_fail("rejected: fetch first"), _OK],
+    )
+
+    claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    result = _last_json(capsys.readouterr().out)
+    assert result["sync_status"] == "pushed"
+    assert result["event_id"] != waiting["id"]
+    item = _hub_state(repo, git)["items"][ITEM_ID]
+    assert item["owner"] == ACTOR
+    assert item["claim_event_id"] == result["event_id"]
+
+
+def test_a_claim_released_while_it_is_published_exits_three(
+    repo, at_a_fixed_moment, capsys
+):
+    release = mint_event(
+        seq=2, ts="2026-09-02T10:00:02Z", actor=RIVAL, etype="item.claim_released",
+        payload={"item_id": ITEM_ID, "reason": "not now"},
+    )
+    git = RacingGit(arriving=[release], remote_events=[])
+
+    with pytest.raises(SystemExit) as exited:
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert exited.value.code == 3
+    report = _last_json(capsys.readouterr().out)
+    assert report["status"] == "claim_superseded"
+    assert report["published"] is True
+    assert report["winner_actor"] is report["winner_event_id"] is None
+    assert "nobody holds the item" in report["message"]
+
+
+def test_a_claim_absorbed_by_the_writers_other_claim_exits_three(
+    repo, at_a_fixed_moment, capsys
+):
+    other = _remote_claim(RIVAL_TS, actor=ACTOR)
+    git = RacingGit(arriving=[other], remote_events=[])
+
+    with pytest.raises(SystemExit) as exited:
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert exited.value.code == 3
+    report = _last_json(capsys.readouterr().out)
+    assert report["winner_event_id"] == other["id"]
+    assert report["message"] == (
+        f"the claim on {ITEM_ID} does not hold it, because another claim by "
+        f"{ACTOR} already does"
+    )
+
+
+def test_a_rejected_claim_annuls_every_claim_it_tried_to_publish(
+    repo, at_a_fixed_moment, capsys
+):
+    waiting = _waiting_claim(repo)
+    git = RacingGit(
+        arriving=[], remote_events=[], pushes=[_fail("rejected")] * 3
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert exited.value.code == 5
+    shard = _shard_events(repo, ACTOR)
+    claims = [event["id"] for event in shard if event["type"] == "item.claimed"]
+    assert len(claims) == 2 and claims[0] == waiting["id"]
+    assert _annulled_by(shard) == claims
+    report = _last_json(capsys.readouterr().out)
+    assert report["annulled"]["target_id"] == claims[1]
+    assert report["annulled"]["target_ids"] == claims
 
 
 # ---------------------------------------------------------------------------
@@ -244,9 +730,23 @@ def test_a_claim_behind_published_history_exits_six_before_minting(repo, capsys)
     assert FAR_AHEAD_TS in captured.err
 
 
-def test_the_tolerance_can_be_raised_for_one_crossing(repo, monkeypatch):
+def test_a_claim_the_remote_has_already_expired_exits_three(repo, monkeypatch, capsys):
     monkeypatch.setenv("PINAX_CLOCK_TOLERANCE_S", "999999999")
+    monkeypatch.setattr("pinax.doctor.utc_now_iso", lambda: MINTED_TS)
     git = FakeGit(remote_events=[_remote_creation(FAR_AHEAD_TS, "pnx-c3d4")])
+
+    with pytest.raises(SystemExit) as exited:
+        claim_run(repo, ITEM_ID, actor=ACTOR, as_json=True, runner=git)
+
+    assert exited.value.code == 3
+    assert "nobody holds the item" in _last_json(capsys.readouterr().out)["message"]
+
+
+def test_the_tolerance_can_be_raised_for_one_crossing(
+    repo, at_a_fixed_moment, monkeypatch
+):
+    monkeypatch.setenv("PINAX_CLOCK_TOLERANCE_S", "999999999")
+    git = FakeGit(remote_events=[_remote_creation("2026-09-02T22:00:00Z", "pnx-c3d4")])
 
     claim_run(repo, ITEM_ID, actor=ACTOR, runner=git)
 
@@ -578,13 +1078,221 @@ def _publish_an_item_and_an_event_from_a_clock_that_ran_ahead(
     return item_id, ahead["id"]
 
 
+def _race(alpha: str, beta: str, item_id: str) -> tuple[str, subprocess.CompletedProcess]:
+    """
+    WINNER's claim waits unpublished in alpha and reaches the hub from
+    beta's pre-commit hook, so after LOSER's command has fetched and
+    appended, and before it pushes.
+    """
+    _pinax(alpha, "dispatch", "--claim", "--actor", WINNER)
+    _commit_all(alpha, "claim waiting for a push")
+    winning = [
+        event["id"]
+        for event in read_events(os.path.join(alpha, ".ergon", "log"))
+        if event["type"] == "item.claimed" and event["payload"]["item_id"] == item_id
+    ]
+    assert len(winning) == 1
+    hooks = os.path.join(beta, _git(beta, "rev-parse", "--git-path", "hooks").stdout.strip())
+    os.makedirs(hooks, exist_ok=True)
+    hook = os.path.join(hooks, "pre-commit")
+    with open(hook, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(
+            "#!/bin/sh\nunset $(git rev-parse --local-env-vars)\n"
+            f"cd '{alpha}' && git push -q origin main\n"
+        )
+    os.chmod(hook, 0o755)
+    try:
+        lost = _pinax(beta, "claim", item_id, "--actor", LOSER, "--json", check=False)
+    finally:
+        os.remove(hook)
+    return winning[0], lost
+
+
+@requires_git
+def test_a_claim_held_on_the_hub_changes_no_clone_and_no_hub(
+    clone_wired_to_hub, clone_of_hub
+):
+    alpha = clone_wired_to_hub(
+        init_repo=_init_repo, git=_git, pinax=_pinax, commit_all=_commit_all,
+        actor=WINNER, name="alpha",
+    )
+    item_id = _seed_one_item(alpha, WINNER)
+    beta = clone_of_hub(
+        git=_git, name="beta", config=_CHECKOUT_CONFIG, configure=_configure
+    )
+    _pinax(alpha, "claim", item_id, "--actor", WINNER)
+
+    def snapshot() -> tuple:
+        log_dir = os.path.join(beta, ".ergon", "log")
+        shards = {}
+        for name in sorted(os.listdir(log_dir)):
+            with open(os.path.join(log_dir, name), "rb") as fh:
+                shards[name] = fh.read()
+        return (
+            shards,
+            _git(beta, "log", "--format=%H").stdout,
+            _git(beta, "ls-remote", "origin", "refs/heads/main").stdout,
+            _git(beta, "status", "--porcelain").stdout,
+        )
+
+    before = snapshot()
+    for _attempt in range(2):
+        lost = _pinax(beta, "claim", item_id, "--actor", LOSER, "--json", check=False)
+        assert lost.returncode == 3, lost.stdout + lost.stderr
+        report = json.loads(lost.stdout)
+        assert report["sync_status"] == "claim_held"
+        assert report["published"] is False
+        assert report["holder_actor"] == WINNER
+        assert snapshot() == before
+        _git(beta, "pull", "--no-rebase", "-q", "origin", "main")
+        before = snapshot()
+    for root in (alpha, beta):
+        assert "## Claim conflicts (resolved)" not in _pinax(root, "board").stdout
+
+
+@requires_git
+def test_three_claims_by_one_writer_record_one(clone_wired_to_hub):
+    root = clone_wired_to_hub(
+        init_repo=_init_repo, git=_git, pinax=_pinax, commit_all=_commit_all,
+        actor=WINNER, name="alpha",
+    )
+    item_id = _seed_one_item(root, WINNER)
+
+    runs = [_pinax(root, "claim", item_id, "--actor", WINNER) for _ in range(3)]
+
+    claims = [
+        event for event in read_events(os.path.join(root, ".ergon", "log"))
+        if event["type"] == "item.claimed"
+    ]
+    assert len(claims) == 1
+    for repeat in runs[1:]:
+        assert repeat.stdout == (
+            f"pinax: item {item_id} is already claimed by {WINNER} since "
+            f"{claims[0]['ts']}; nothing was appended\n"
+        )
+        assert "claim.superseded" not in repeat.stderr
+    assert "## Claim conflicts (resolved)" not in _pinax(root, "board").stdout
+
+
+@requires_git
+def test_a_claim_after_dispatch_replaces_the_dispatched_claim(clone_wired_to_hub):
+    root = clone_wired_to_hub(
+        init_repo=_init_repo, git=_git, pinax=_pinax, commit_all=_commit_all,
+        actor=WINNER, name="alpha",
+    )
+    item_id = _seed_one_item(root, WINNER)
+    _pinax(root, "dispatch", "--claim", "--actor", WINNER)
+
+    result = json.loads(
+        _pinax(root, "claim", item_id, "--actor", WINNER, "--json").stdout
+    )
+
+    dispatched, annulment, fresh = [
+        event for event in read_events(os.path.join(root, ".ergon", "log"))
+        if event["type"] in ("item.claimed", "event.annulled")
+    ]
+    assert annulment["payload"]["target_id"] == dispatched["id"]
+    assert fresh["id"] == result["event_id"]
+    assert fresh["ts"] == result["ts"]
+    assert result["sync_status"] == "pushed"
+    assert result["published"] is True
+    assert result["annulled"]["target_id"] == dispatched["id"]
+    assert _git(root, "status", "--porcelain").stdout == ""
+    _git(root, "fetch", "origin")
+    assert result["event_id"] in _git(
+        root, "show", "origin/main:.ergon/log/operator-alpha.jsonl"
+    ).stdout
+    board = _pinax(root, "board").stdout
+    assert f"· {WINNER} ·" in board
+    assert "## Claim conflicts (resolved)" not in board
+
+
+@requires_git
+def test_a_claim_after_dispatch_says_so_in_plain_output(clone_wired_to_hub):
+    root = clone_wired_to_hub(
+        init_repo=_init_repo, git=_git, pinax=_pinax, commit_all=_commit_all,
+        actor=WINNER, name="alpha",
+    )
+    item_id = _seed_one_item(root, WINNER)
+    _pinax(root, "dispatch", "--claim", "--actor", WINNER)
+    dispatched = _fold_repo(root)["items"][item_id]["claim_event_id"]
+
+    claimed = _pinax(root, "claim", item_id, "--actor", WINNER)
+
+    assert claimed.stdout.startswith(f"pinax: claimed item {item_id} by {WINNER} ")
+    assert claimed.stdout.endswith(f"pinax: the waiting claim {dispatched} was annulled\n")
+
+
+@requires_git
+def test_a_dispatched_claim_does_not_take_an_item_claimed_since(
+    clone_wired_to_hub, clone_of_hub
+):
+    alex, sam = "alex@laptop", "sam@desktop"
+    laptop = clone_wired_to_hub(
+        init_repo=_init_repo, git=_git, pinax=_pinax, commit_all=_commit_all,
+        actor=alex, name="laptop",
+    )
+    item_id = _seed_one_item(laptop, alex)
+    desktop = clone_of_hub(
+        git=_git, name="desktop", config=_CHECKOUT_CONFIG, configure=_configure
+    )
+    _pinax(desktop, "dispatch", "--claim", "--actor", sam)
+    # Timestamps hold whole seconds, and a tie would go to alex by name.
+    time.sleep(1.1)
+    _pinax(laptop, "claim", item_id, "--actor", alex)
+
+    lost = _pinax(desktop, "claim", item_id, "--actor", sam, "--json", check=False)
+
+    assert lost.returncode == 3, lost.stdout + lost.stderr
+    assert json.loads(lost.stdout)["sync_status"] == "claim_held"
+    for root in (laptop, desktop):
+        _git(root, "pull", "--no-rebase", "-q", "origin", "main")
+        board = _pinax(root, "board").stdout
+        assert f"· {alex} ·" in board
+        assert sam not in board
+        assert "## Claim conflicts (resolved)" not in board
+    _pinax(desktop, "add", "--title", "Later", "--prefix", "pnx", "--actor", sam)
+    _git(laptop, "pull", "--no-rebase", "-q", "origin", "main")
+    for root in (laptop, desktop):
+        assert _fold_repo(root)["items"][item_id]["owner"] == alex
+        assert "## Claim conflicts (resolved)" not in _pinax(root, "board").stdout
+        assert _pinax(root, "verify", check=False).returncode == 0
+
+
+@requires_git
+def test_a_resolved_conflict_is_not_repeated_by_a_later_write(
+    clone_wired_to_hub, clone_of_hub
+):
+    alpha = clone_wired_to_hub(
+        init_repo=_init_repo, git=_git, pinax=_pinax, commit_all=_commit_all,
+        actor=WINNER, name="alpha",
+    )
+    item_id = _seed_one_item(alpha, WINNER)
+    beta = clone_of_hub(
+        git=_git, name="beta", config=_CHECKOUT_CONFIG, configure=_configure
+    )
+    _winning, lost = _race(alpha, beta, item_id)
+    assert lost.returncode == 3, lost.stdout + lost.stderr
+    assert json.loads(lost.stdout)["status"] == "claim_superseded"
+    assert "claim.superseded:" in lost.stderr
+
+    for root, actor in ((beta, LOSER), (alpha, WINNER)):
+        _git(root, "pull", "--no-rebase", "-q", "origin", "main")
+        added = _pinax(
+            root, "add", "--title", "Later work", "--prefix", "pnx",
+            "--actor", actor, "--json",
+        )
+        assert "claim.superseded" not in added.stderr
+        assert f"- {item_id}: {LOSER} superseded by {WINNER}" in _pinax(root, "board").stdout
+
+
 @pytest.mark.deep
 @requires_git
 def test_two_clones_claim_one_item_and_the_loser_exits_three(
     clone_wired_to_hub, clone_of_hub
 ):
     """
-    Two machines, one item, no lock. Each appends and commits its own claim
+    Two machines, one item, no lock, and neither has seen the other. Each appends and commits its own claim
     in its own repository. The second push is rejected, its command pulls,
     resolves the generated Markdown by regenerating it from the merged log,
     pushes, and the fold over the pushed state tells it that the earlier
@@ -599,10 +1307,7 @@ def test_two_clones_claim_one_item_and_the_loser_exits_three(
         git=_git, name="beta", config=_CHECKOUT_CONFIG, configure=_configure
     )
 
-    won = _pinax(alpha, "claim", item_id, "--actor", WINNER, "--json")
-    winning_event = json.loads(won.stdout)["event_id"]
-
-    lost = _pinax(beta, "claim", item_id, "--actor", LOSER, "--json", check=False)
+    winning_event, lost = _race(alpha, beta, item_id)
     assert lost.returncode == 3, (
         "the second claim did not end from the fold over the pushed state:\n"
         f"stdout: {lost.stdout}\nstderr: {lost.stderr}"

@@ -1,50 +1,48 @@
-"""The README's owner-gate section gives the upgrade order before strict.
-
-No run exercises an earlier Pinax under strict, so the section states only
-the instruction and none of that client's behaviour.
-"""
+"""The README gives the upgrade order before any clone writes, and every place names one release."""
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
-README = Path(__file__).resolve().parent.parent / "README.md"
+from pinax.commands.policy import STRICT_UPGRADE_WARNING
+
+ROOT = Path(__file__).resolve().parent.parent
+README = ROOT / "README.md"
+COMMANDS = ROOT / "docs" / "commands.md"
+SHARING = ROOT / "docs" / "sharing-and-sync.md"
 
 UPGRADE_ORDER = (
-    "Before you set `strict`, upgrade every clone, and every older `pinax` on "
-    "PATH that a pre-commit hook could run, to 0.4.0 or later."
+    "Before any clone writes, make sure every clone, and every hook's `PATH`, "
+    "runs 0.5.0 or later."
 )
-UNEXERCISED = (
-    "which an earlier Pinax does not write",
-    "an earlier Pinax reports drift",
-    "Its own tracker commands are not refused under strict",
-    "still append and commit",
-    "every clone that already runs 0.4.0 or later also reports drift",
-    "run `pinax verify --fix` on each of those clones",
-    "The command prints the same warning when it sets strict.",
-)
+OR_LATER = r"(\d+\.\d+\.\d+) or later"
+BEFORE = r"release before (\d+\.\d+\.\d+)"
 
 
-def _owner_gate_section() -> str:
-    text = README.read_text(encoding="utf-8")
-    start = text.index("## Owner-gate classes")
-    rest = text[start + len("## Owner-gate classes"):]
-    end = rest.find("\n## ")
-    section = rest if end == -1 else rest[:end]
-    return re.sub(r"\s+", " ", section)
+def test_the_readme_gives_the_upgrade_order():
+    assert UPGRADE_ORDER in README.read_text(encoding="utf-8")
 
 
-def test_the_section_gives_the_upgrade_order_before_strict():
-    assert UPGRADE_ORDER in _owner_gate_section()
+def test_every_statement_of_the_upgrade_rule_names_one_release():
+    sharing = SHARING.read_text(encoding="utf-8")
+    # The README, the message, the page's own sentence, its copy of the message,
+    # and its two sentences about an older release.
+    stated = {
+        "README.md": re.findall(OR_LATER, README.read_text(encoding="utf-8")),
+        "STRICT_UPGRADE_WARNING": re.findall(OR_LATER, STRICT_UPGRADE_WARNING),
+        "docs/sharing-and-sync.md, or later": re.findall(OR_LATER, sharing),
+        "docs/sharing-and-sync.md, release before": re.findall(BEFORE, sharing),
+    }
+    assert {place: len(found) for place, found in stated.items()} == {
+        "README.md": 1,
+        "STRICT_UPGRADE_WARNING": 1,
+        "docs/sharing-and-sync.md, or later": 2,
+        "docs/sharing-and-sync.md, release before": 2,
+    }
+    assert len({release for found in stated.values() for release in found}) == 1, stated
 
 
-def test_the_section_states_no_unexercised_earlier_pinax_behaviour():
-    section = _owner_gate_section()
-    for phrase in UNEXERCISED:
-        assert phrase not in section, phrase
-
-
-def test_hook_refuses_every_commit_phrase_is_gone():
-    section = _owner_gate_section()
-    assert "its pre-commit hook refuses every commit" not in section
+def test_the_pages_quote_the_message_as_printed():
+    for page in (COMMANDS, SHARING):
+        assert STRICT_UPGRADE_WARNING in page.read_text(encoding="utf-8").splitlines(), page.name

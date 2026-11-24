@@ -6,35 +6,82 @@ a note.added event, then fetch (unless offline), fold, append, commit and
 push. Refuses an actor handle that is not role@host before minting
 anything; see pinax.sync for the exit codes and offline rules.
 
-ADR-004 / DESIGN.md enforcement (hard error at CLI write-time, not warning):
-- ref MUST match ^(koine://|~/knowledge/|projects/|docs/) — it is a pointer to a
-  knowledge-plane document, never knowledge content itself.
-- caption is optional; if provided it MUST be <= 200 characters.
+Enforcement (hard error at CLI write-time, not warning):
+- ref MUST be a repository-relative path, an http or https address, or start
+  with a prefix set by 'pinax policy note-refs' (see ref_refusal). It is read
+  on the pre-append union fold; a refusal ends with exit 8 (policy_refused).
+- caption is optional; if provided it MUST be <= 200 characters, else exit 1.
 
-Rejection is a hard error: sys.exit(1) with a clear message.  A direct JSONL
-append bypasses this check (by construction — the log is append-only); this is
-the CLI-enforced boundary.
+A direct JSONL append bypasses this check (by construction — the log is
+append-only); this is the CLI-enforced boundary.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
-import sys
+from urllib.parse import urlsplit
 
 from .. import refusal
 from ..doctor import default_actor, utc_now_iso, warn_if_log_ignored
+from ..fold import _is_file_name
 
 # pinax.sync imports pinax.projection, which imports pinax.commands.dep at
 # its own top level; deferred to run() below rather than imported here, to
 # stay clear of that chain the way pinax.commands.dep itself now must.
 
-# ADR-004: the typed ref pattern — pointer to a knowledge-plane document.
-_REF_PATTERN = re.compile(r"^(koine://|~/knowledge/|projects/|docs/)")
-
-# ADR-004 / DESIGN.md: caption cap.
+# The caption cap (docs/commands.md, "pinax note add").
 _CAPTION_MAX = 200
+
+
+def _is_repository_path(ref: str) -> bool:
+    """
+    True for a repository-relative path, whether or not a file is there.
+
+    Empty and "." segments are allowed beside at least one that is a file
+    name. The file name rule is the one for item ids, and it refuses "..",
+    a backslash and a drive letter's colon.
+    """
+    if ref.startswith("/"):
+        return False
+    segments = [segment for segment in ref.split("/") if segment not in ("", ".")]
+    return bool(segments) and all(_is_file_name(segment) for segment in segments)
+
+
+def _is_web_address(ref: str) -> bool:
+    """True for a URL with scheme http or https and a host."""
+    # urlsplit silently drops tabs, newlines and leading spaces.
+    if any(char.isspace() or not char.isprintable() for char in ref):
+        return False
+    try:
+        parts = urlsplit(ref)
+        parts.port  # raises ValueError when the port is not a number
+        return parts.scheme in ("http", "https") and bool(parts.hostname)
+    except ValueError:
+        return False
+
+
+def ref_refusal(state: dict, ref: str) -> str | None:
+    """
+    None when a note may carry ref, else the refusal message.
+
+    state is the pre-append union fold, which holds the prefixes the
+    repository accepts (event.declared_note_ref_prefixes). The process,
+    flow or strict, does not change the rule.
+    """
+    prefixes = (state.get("note_ref_policy") or {}).get("prefixes", [])
+    if (
+        ref.startswith(tuple(prefixes))
+        or _is_web_address(ref)
+        or _is_repository_path(ref)
+    ):
+        return None
+    return (
+        f"pinax note add: the reference '{ref}' is not a repository-relative path, "
+        "not an http or https address, and does not start with a prefix the "
+        f"repository accepts ({', '.join(prefixes) or 'none set'}; "
+        "see 'pinax policy note-refs')"
+    )
 
 
 def run(
@@ -51,8 +98,8 @@ def run(
     Execute pinax note add in repo_root.
 
     Hard-rejects at the CLI:
-    - ref that does not match the typed-ref pattern (ADR-004)
-    - caption that exceeds 200 characters (ADR-004 / DESIGN.md)
+    - ref that ref_refusal refuses, through the sequence's policy_check
+    - caption that exceeds 200 characters (docs/commands.md, "pinax note add")
 
     On success: hands a note.added event to the publish sequence, which
     refuses an item that does not exist before appending anything
@@ -65,14 +112,7 @@ def run(
 
     refusal.require_tracker(log_dir)
 
-    # --- HARD VALIDATION (ADR-004 / DESIGN.md) ---
-
-    if not _REF_PATTERN.match(ref):
-        refusal.refuse(
-            f"pinax note add: REJECTED - ref must match "
-            f"^(koine://|~/knowledge/|projects/|docs/), got: {ref!r}",
-            refusal.INVALID_ARGUMENT,
-        )
+    # --- HARD VALIDATION ---
 
     if caption is not None and len(caption) > _CAPTION_MAX:
         refusal.refuse(
@@ -99,6 +139,7 @@ def run(
         ts=utc_now_iso(),
         item_id=item_id,
         offline=offline,
+        policy_check=lambda state: ref_refusal(state, ref),
         runner=runner,
     )
     sync.conclude(outcome)

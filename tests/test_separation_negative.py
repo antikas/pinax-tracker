@@ -23,11 +23,14 @@ from pinax.separation import (
 
 
 # ---------------------------------------------------------------------------
-# 1. Pattern coverage test — all four ADR-004 path classes
+# 1. Pattern coverage test — all four path classes
 # ---------------------------------------------------------------------------
 
 class TestExclusionPatterns:
-    """The EXCLUSION_PATTERNS constant covers all four ADR-004 path classes."""
+    """
+    The EXCLUSION_PATTERNS constant covers all four path classes: the event
+    log, the committed projection, the operational board and the work records.
+    """
 
     def test_ergon_log_pattern_present(self):
         """Pattern covering .ergon/** is in EXCLUSION_PATTERNS."""
@@ -54,7 +57,7 @@ class TestExclusionPatterns:
         )
 
     def test_pattern_count(self):
-        """All four ADR-004 path classes are covered by at least one pattern."""
+        """All four path classes are covered by at least one pattern."""
         # The three unique top-level path classes:
         # 1. .ergon/** (log + projection)
         # 2. board/**  (bootstrap tracker)
@@ -62,7 +65,7 @@ class TestExclusionPatterns:
         # Note: the committed projection (.ergon/board.md, .ergon/items/) is
         # a SUBSET of .ergon/**, so covered by the first pattern.
         assert len(EXCLUSION_PATTERNS) >= 3, (
-            f"Expected >= 3 exclusion patterns (one per ADR-004 path class), "
+            f"Expected >= 3 exclusion patterns (one per path class), "
             f"got {len(EXCLUSION_PATTERNS)}: {EXCLUSION_PATTERNS}"
         )
 
@@ -72,7 +75,7 @@ class TestExclusionPatterns:
 # ---------------------------------------------------------------------------
 
 class TestPathClassifier:
-    """is_excluded_path() correctly classifies all ADR-004 example paths."""
+    """is_excluded_path() correctly classifies all example paths."""
 
     def test_all_examples_from_oracle(self):
         """all_patterns_match_examples() oracle is fully consistent with is_excluded_path."""
@@ -124,15 +127,15 @@ class TestPathClassifier:
 
     @pytest.mark.parametrize("path", [
         "CLAUDE.md",
-        "DESIGN.md",
-        "docs/decisions/ADR-001-event-log-ssot-deterministic-fold.md",
-        "docs/decisions/ADR-004-separation-enforcement.md",
+        "README.md",
+        "docs/guide.md",
+        "docs/reference/commands.md",
         "pinax/__main__.py",
         "tests/test_fold_determinism.py",
-        "docs/architecture/overview.md",
+        "docs/handbook/overview.md",
     ])
     def test_knowledge_paths_not_excluded(self, path: str):
-        """CLAUDE.md, DESIGN.md, ADRs, and code are NOT excluded."""
+        """CLAUDE.md, README.md, the docs, and code are NOT excluded."""
         assert not is_excluded_path(path), (
             f"Path {path!r} should NOT be excluded (legitimate knowledge/code path)"
         )
@@ -154,8 +157,8 @@ class TestZeroChunksFromExcludedPaths:
     - board/.md                     (bootstrap board — EXCLUDED)
     -   (work-record — EXCLUDED)
     - CLAUDE.md                           (knowledge — NOT excluded)
-    - DESIGN.md                           (knowledge — NOT excluded)
-    - docs/decisions/ADR-001.md           (knowledge — NOT excluded)
+    - README.md                           (knowledge — NOT excluded)
+    - docs/guide.md                       (knowledge — NOT excluded)
 
     We simulate the indexer by listing all files in the repo and checking
     each against the classifier.  The test asserts that ALL files under the
@@ -185,8 +188,8 @@ class TestZeroChunksFromExcludedPaths:
             ),
             # --- NOT EXCLUDED paths ---
             "CLAUDE.md": "# Pinax\n\nKnowledge doc.\n",
-            "DESIGN.md": "# DESIGN\n\nKnowledge doc.\n",
-            "docs/decisions/ADR-001.md": "# ADR-001\n\nKnowledge doc.\n",
+            "README.md": "# README\n\nKnowledge doc.\n",
+            "docs/guide.md": "# Guide\n\nKnowledge doc.\n",
         }
         created: list[str] = []
         for rel_path, content in files.items():
@@ -214,7 +217,7 @@ class TestZeroChunksFromExcludedPaths:
         Seeded repo: zero files from excluded path classes escape the classifier.
 
         MECHANISM-ASSERT: this proves that is_excluded_path() correctly blocks
-        all four ADR-004 path classes for a realistic repo structure.
+        all four path classes for a realistic repo structure.
         The live koine-memory indexer is not invoked (not available in test env);
         the classifier IS the production mechanism that the indexer calls.
         """
@@ -247,13 +250,13 @@ class TestZeroChunksFromExcludedPaths:
                 f"ZERO-CHUNK ASSERTION FAILED: {len(leaked)} path(s) from excluded "
                 f"classes escaped the classifier:\n"
                 + "\n".join(f"  {p}" for p in leaked)
-                + "\n\nThese represent chunks that would appear in the recall index "
-                "in violation of ADR-004."
+                + "\n\nThese represent chunks that would appear in the recall index, "
+                "which must hold no operational record."
             )
 
     def test_knowledge_files_not_classified_as_excluded(self):
         """
-        Knowledge docs (CLAUDE.md, DESIGN.md, ADRs) are NOT blocked by the classifier.
+        Knowledge docs (CLAUDE.md, README.md, the docs) are NOT blocked by the classifier.
 
         This is the complementary test: over-exclusion would hide legitimate
         knowledge docs from the recall index.
@@ -281,7 +284,7 @@ class TestZeroChunksFromExcludedPaths:
 # ---------------------------------------------------------------------------
 
 class TestSourcesTomlStanza:
-    """The generated sources.toml stanza covers the four ADR-004 exclusion classes."""
+    """The generated sources.toml stanza covers the four exclusion classes."""
 
     def test_stanza_contains_ergon_exclude(self):
         stanza = generate_sources_toml_stanza("pinax", "/workspace/pinax")
@@ -306,7 +309,7 @@ class TestSourcesTomlStanza:
 
     def test_existing_sources_toml_covers_all_four_classes(self):
         """
-        The live sources.toml for the pinax source covers all four ADR-004 path classes.
+        The live sources.toml for the pinax source covers all four path classes.
 
         Reads the actual koine-memory sources.toml and verifies the pinax source
         entry's exclude list covers all four classes.

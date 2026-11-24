@@ -62,13 +62,20 @@ def _count_event_types(log_dir: str) -> dict[str, int]:
             if event is None:
                 continue
             etype = event.get("type", "")
+            payload = event.get("payload", {})
+            if not isinstance(etype, str) or not isinstance(payload, dict):
+                continue
             counts[etype] = counts.get(etype, 0) + 1
             # Gate counts (from item.blocked events).
             if etype == "item.blocked":
-                gate = event.get("payload", {}).get("gate", "unknown")
+                gate = payload.get("gate", "unknown")
+                if not isinstance(gate, str):
+                    continue
                 gate_counts[gate] = gate_counts.get(gate, 0) + 1
             if etype == "item.audit_result":
-                verdict = event.get("payload", {}).get("verdict", "unknown")
+                verdict = payload.get("verdict", "unknown")
+                if not isinstance(verdict, str):
+                    continue
                 audit_verdicts[verdict] = audit_verdicts.get(verdict, 0) + 1
 
     return {

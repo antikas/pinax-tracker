@@ -8,7 +8,7 @@ instead of warning about the blind spot, it FOLDS the union of the current
 working-tree log plus every unmerged local branch's committed .ergon shards at
 its tip, rendering the whole repo-wide picture in one pass.
 
-Sourcing (ADR-001 / pinax.replay's documented pattern — "one fold
+Sourcing (pinax.replay's documented pattern — "one fold
 implementation, a second byte source"): this module adds a THIRD byte source
 alongside the filesystem (pinax.fold.read_raw_events) and the single-ref
 git-blob reader (pinax.replay.read_raw_events_at_ref) — a UNION of the
@@ -126,7 +126,7 @@ def compute_all_branches_fold(
             continue
         event_sources[eid] = branches
         item_id = event.get("payload", {}).get("item_id")
-        if item_id:
+        if item_id and isinstance(item_id, str):
             item_sources.setdefault(item_id, set()).update(branches)
 
     return {

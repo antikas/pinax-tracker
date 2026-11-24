@@ -3,8 +3,8 @@ pinax metrics [--json]
 
 Read-only fold over the event log that emits build-flywheel metrics.
 
-ADR-004 / DESIGN.md: this command never writes any metric value into
-~/knowledge/, current-focus.md, sources.toml, or any knowledge-plane file.
+This command never writes any metric value into current-focus.md,
+sources.toml, or any other knowledge-plane file.
 It folds and prints; nothing else.
 
 Output (human-readable by default, --json for agents):

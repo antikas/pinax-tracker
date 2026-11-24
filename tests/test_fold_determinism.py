@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import random
@@ -10,7 +11,8 @@ import tempfile
 
 import pytest
 
-from pinax.fold import fold_events, fold_prefix, read_events
+from pinax.event import mint_event
+from pinax.fold import _annulments_in_effect, fold_events, fold_prefix, read_events
 
 
 # ---------------------------------------------------------------------------
@@ -391,3 +393,97 @@ def test_tampered_twin_fold_deterministic():
     # DOCUMENTATION: log which body won so a test failure message is informative.
     # (Not an assertion — just context if the primary assertion fires above.)
     _ = winning_status  # consumed above
+
+
+# ---------------------------------------------------------------------------
+# Annulments of annulments
+# ---------------------------------------------------------------------------
+
+_CREATED = mint_event(
+    0, "2026-01-01T00:00:00Z", "a@h", "item.created", {"item_id": "pnx-x", "title": "X"}
+)
+
+
+def _annulment(seq: int, target: dict, reason: str = "r") -> dict:
+    return mint_event(
+        seq, f"2026-01-01T00:00:{seq:02d}Z", "a@h", "event.annulled",
+        {"target_id": target["id"], "reason": reason},
+    )
+
+
+_A0 = _annulment(1, _CREATED, "a0")
+_B0 = _annulment(2, _CREATED, "b0")
+_A1 = _annulment(3, _A0)
+_A2 = _annulment(4, _A1)
+_A3 = _annulment(5, _A2)
+
+
+@pytest.mark.parametrize(
+    "events, live, recorded",
+    [
+        ([_CREATED, _A0], False, {_CREATED["id"]}),
+        ([_CREATED, _A0, _A1], True, {_A0["id"]}),
+        ([_CREATED, _A0, _A1, _A2], False, {_CREATED["id"], _A1["id"]}),
+        ([_CREATED, _A0, _A1, _A2, _A3], True, {_A0["id"], _A2["id"]}),
+        ([_CREATED, _A0, _B0], False, {_CREATED["id"]}),
+        ([_CREATED, _A0, _B0, _A1], False, {_CREATED["id"], _A0["id"]}),
+    ],
+    ids=["annulled", "depth-1", "depth-2", "depth-3", "two", "two-one-undone"],
+)
+def test_annulment_chain_resolves_the_same_in_every_order(events, live, recorded):
+    states = [fold_events(list(order)) for order in itertools.permutations(events)]
+    for state in states:
+        assert ("pnx-x" in state.get("items", {})) is live
+        assert set(state.get("annulled", {})) == recorded
+
+
+def test_an_undone_annulment_leaves_the_other_one_recorded():
+    state = fold_events([_CREATED, _B0, _A0, _A1])
+    assert state["annulled"][_CREATED["id"]]["event_id"] == _B0["id"]
+
+
+@pytest.mark.parametrize("length", [2, 3])
+def test_annulments_on_a_cycle_are_not_in_effect(monkeypatch, length):
+    monkeypatch.setattr("pinax.fold.valid_annulment", lambda e: e["type"] == "event.annulled")
+    ring = [
+        dict(_annulment(1 + n, _CREATED), id=f"ring-{n}",
+             payload={"target_id": f"ring-{(n + 1) % length}", "reason": "r"})
+        for n in range(length)
+    ]
+    outside = dict(_annulment(9, _CREATED), id="outside",
+                   payload={"target_id": "ring-0", "reason": "r"})
+    assert _annulments_in_effect([_CREATED, *ring]) == {}
+    assert _annulments_in_effect([_CREATED, *ring, outside]) == {"outside": "ring-0"}
+    for order in itertools.permutations([_CREATED, *ring]):
+        state = fold_events(list(order))
+        assert "pnx-x" in state["items"]
+        assert "annulled" not in state
+    for order in itertools.permutations([_CREATED, *ring, outside]):
+        state = fold_events(list(order))
+        assert "pnx-x" in state["items"]
+        assert set(state["annulled"]) == {"ring-0"}
+
+
+def test_an_annulment_not_in_effect_does_not_expire_a_claim():
+    claim = mint_event(1, "2026-01-01T00:00:01Z", "a@h", "item.claimed", {"item_id": "pnx-x"})
+    late = mint_event(
+        2, "2026-01-05T00:00:00Z", "a@h", "event.annulled",
+        {"target_id": "absent", "reason": "r"},
+    )
+    undo = mint_event(
+        3, "2026-01-01T00:00:03Z", "a@h", "event.annulled",
+        {"target_id": late["id"], "reason": "r"},
+    )
+    assert fold_events([_CREATED, claim, late])["claim_expired"]
+    assert not fold_events([_CREATED, claim, late, undo]).get("claim_expired")
+
+
+def test_an_annulled_invalid_annulment_still_warns(caplog):
+    invalid = mint_event(
+        1, "2026-01-01T00:00:01Z", "a@h", "event.annulled",
+        {"target_id": _CREATED["id"], "reason": ""},
+    )
+    with caplog.at_level("WARNING", logger="pinax.fold"):
+        state = fold_events([_CREATED, invalid, _annulment(2, invalid)])
+    assert "pnx-x" in state["items"]
+    assert any("invalid event.annulled" in r.getMessage() for r in caplog.records)

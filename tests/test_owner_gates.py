@@ -30,7 +30,7 @@ OTHER = "pnx-c3d4"
 INVENTED = "because the moon is full"
 DEFAULT_CLASS = "production deployment"
 STRICT_WARNING = (
-    "pinax: every clone, and every older pinax on PATH, must run 0.4.0 or later "
+    "pinax: every clone, and every older pinax on PATH, must run 0.5.0 or later "
     "before this is used; an older client will report drift, and after "
     "upgrading, pinax verify --fix repairs it."
 )

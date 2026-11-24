@@ -92,14 +92,14 @@ def all_patterns_match_examples() -> dict[str, bool]:
         "docs/cycles/PNX-05/reports/cycle-1-report.md": True,
         # NOT excluded — knowledge docs
         "CLAUDE.md": False,
-        "DESIGN.md": False,
-        "docs/decisions/ADR-001-event-log-ssot-deterministic-fold.md": False,
-        "docs/decisions/ADR-004-separation-enforcement.md": False,
+        "README.md": False,
+        "docs/guide.md": False,
+        "docs/reference/commands.md": False,
         # NOT excluded — code
         "pinax/__main__.py": False,
         "tests/test_fold_determinism.py": False,
         # NOT excluded — top-level docs
-        "docs/architecture/overview.md": False,
+        "docs/handbook/overview.md": False,
     }
 
 

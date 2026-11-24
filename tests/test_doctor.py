@@ -227,16 +227,16 @@ def _append_uncommitted_item(repo_root: str, title: str, actor: str = "t@h") -> 
     orphaned-trail shape doctor's class 1 (uncommitted shard events)
     detects.
 
-    Before ADR-006, every mutating command appended and regenerated the
-    projection, and only ever left the commit itself for later; a session
-    that ended before that commit left exactly this shape behind. Now that
-    the CLI's own 'add' runs the publish sequence and commits itself
+    Before write commands committed their own change, each one appended
+    and regenerated the projection, and only ever left the commit itself
+    for later; a session that ended before that commit left exactly this
+    shape behind. Now that the CLI's own 'add' runs the publish sequence and commits itself
     (pinax/sync.py), this helper reproduces the shape directly through the
     same primitives 'add' calls, bypassing the CLI so the appended event
     and its projection stay uncommitted on purpose. Regenerating matters:
     a commit here still runs the repository's pre-commit hook (never
     bypassed), and that hook's own 'pinax verify' refuses a commit whose
-    projection has drifted from the log (ADR-002), so a helper that only
+    projection has drifted from the log, so a helper that only
     appended without regenerating would make every guided-reconcile commit
     fail on drift rather than on the orphaned trail this helper exists to
     construct.
@@ -267,8 +267,8 @@ def _append_uncommitted_item(repo_root: str, title: str, actor: str = "t@h") -> 
 @requires_git
 def test_clean_repo_no_findings(repo):
     # No follow-up commit here: 'add' now runs the publish sequence
-    # (pinax/sync.py), which commits the shard and the projection itself
-    # (ADR-006); the working tree is already clean by the time it returns.
+    # (pinax/sync.py), which commits the shard and the projection itself;
+    # the working tree is already clean by the time it returns.
     _add_item(repo, "committed item")
 
     result = _pinax(repo, "doctor", "--json", "--now", _FAR_FUTURE,
@@ -289,7 +289,7 @@ def test_clean_repo_no_findings(repo):
 
 @requires_git
 def test_uncommitted_shard_events_detected(repo):
-    # 'add' now commits itself (ADR-006), so an orphaned (appended, never
+    # 'add' now commits itself, so an orphaned (appended, never
     # committed) trail is built directly through the primitives 'add'
     # calls rather than through the CLI; see _append_uncommitted_item.
     item_id = _append_uncommitted_item(repo, "orphaned item")  # NOT committed
@@ -443,7 +443,7 @@ def test_legacy_skipped_when_absent(repo):
 
 @requires_git
 def test_reconcile_commits_orphaned_shards_without_touching_bytes(repo):
-    # 'add' now commits itself (ADR-006); build the orphaned trail
+    # 'add' now commits itself; build the orphaned trail
     # directly so it stays genuinely uncommitted (see
     # _append_uncommitted_item).
     _append_uncommitted_item(repo, "orphaned trail")  # uncommitted
@@ -467,7 +467,7 @@ def test_reconcile_commits_orphaned_shards_without_touching_bytes(repo):
 
 @requires_git
 def test_reconcile_declined_leaves_everything_in_place(repo):
-    # 'add' now commits itself (ADR-006); build the orphaned trail
+    # 'add' now commits itself; build the orphaned trail
     # directly so it stays genuinely uncommitted (see
     # _append_uncommitted_item).
     _append_uncommitted_item(repo, "orphaned trail")
@@ -685,8 +685,8 @@ def test_init_heals_preexisting_blanket_jsonl_gitignore_on_reinit(tmp_path):
 @requires_git
 def test_doctor_and_verify_fail_loudly_when_log_ignored(repo):
     # No follow-up commit here: 'add' now runs the publish sequence
-    # (pinax/sync.py), which commits the shard and the projection itself
-    # (ADR-006); the working tree is already clean by the time it returns.
+    # (pinax/sync.py), which commits the shard and the projection itself;
+    # the working tree is already clean by the time it returns.
     _add_item(repo, "an item")
 
     # Sanity: clean, tracked repo passes both before we break it.
@@ -801,7 +801,7 @@ def test_state_changing_commands_exit_seven_when_the_hook_refuses_a_swallowed_lo
     # rule or not. Seeding keeps every append below a modification to an
     # already-tracked shard, so this test exercises the refused commit
     # itself rather than the unrelated staging refusal a never-before-
-    # committed shard would hit under ADR-006's own commit.
+    # committed shard would hit in the command's own commit.
     _add_item(repo, "seeds the a@h shard before the swallow", actor="a@h")
     _add_item(repo, "seeds the t@h shard before the swallow")
 

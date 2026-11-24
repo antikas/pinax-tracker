@@ -228,6 +228,14 @@ class TestFixClearsDrift:
 # (c) plain drift message names a command that genuinely works
 # ---------------------------------------------------------------------------
 
+def test_the_drift_message_ends_with_the_rule_in_plain_words(repo):
+    with open(os.path.join(repo, ".ergon", "board.md"), "a", newline="\n", encoding="utf-8") as fh:
+        fh.write("\n<!-- HAND EDIT -->\n")
+    result = _run_cli(repo, "verify")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stderr.splitlines()[-1] == "  The projection must never be hand-edited."
+
+
 class TestDriftMessageNamesWorkingCommand:
     def test_message_mentions_fix_flag_that_actually_works(self, repo):
         """
